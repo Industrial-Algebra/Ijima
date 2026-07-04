@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-commit hook to run cargo fmt, clippy, and tests
+
+# Run cargo fmt check
+if ! cargo fmt -- --check; then
+  echo "cargo fmt failed"
+  exit 1
+fi
+
+# Run cargo clippy
+if ! cargo clippy -- -D warnings; then
+  echo "cargo clippy failed"
+  exit 1
+fi
+
+# Run cargo test
+if ! cargo test --quiet; then
+  echo "cargo test failed"
+  exit 1
+fi
+
+exit 0
