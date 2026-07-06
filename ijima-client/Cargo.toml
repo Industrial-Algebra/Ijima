@@ -14,7 +14,7 @@ description = "Thin HTTP client and harness-adapter crate for the Ijima centrali
 default = ["std", "remote"]
 std = []
 # Remote HTTP client (reqwest). Disable for an in-process/embedded stub.
-remote = ["dep:reqwest", "dep:tokio", "dep:tracing"]
+remote = ["dep:reqwest", "dep:tokio", "dep:tracing", "ijima-core/serde"]
 
 [dependencies]
 ijima-core = { workspace = true }
