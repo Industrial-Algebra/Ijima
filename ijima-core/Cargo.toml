@@ -1,0 +1,25 @@
+[package]
+name = "ijima-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+description = "Core schema, stores, error types, and API contract for the Ijima centralized agentic memory backend"
+
+[features]
+default = ["std"]
+std = []
+# Serialize/Deserialize impls for all domain types. Required by the
+# store backends (SurrealDB, Postgres) and the HTTP API.
+serde = ["dep:serde"]
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true, optional = true }
+async-trait = "0.1"
+
+[dev-dependencies]

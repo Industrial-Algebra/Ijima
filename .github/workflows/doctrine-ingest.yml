@@ -1,0 +1,35 @@
+# Doctrine Ingest
+
+On merge to `main` touching `doctrine/**`, this workflow ingests the
+# seed-pack markdown into the running Ijima daemon.
+
+name: Ingest doctrine
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'doctrine/**'
+      - '.github/workflows/doctrine-ingest.yml'
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build ijima
+        run: cargo build --release --features http,server-auth,backend-surreal,cli --bin ijima
+
+      - name: Ingest doctrine
+        env:
+          IJIMA_URL: ${{ secrets.IJIMA_URL }}
+          IJIMA_ADMIN_TOKEN: ${{ secrets.IJIMA_ADMIN_TOKEN }}
+        run: |
+          ./target/release/ijima doctrine ingest \
+            --dir doctrine \
+            --url "$IJIMA_URL" \
+            --token "$IJIMA_ADMIN_TOKEN"

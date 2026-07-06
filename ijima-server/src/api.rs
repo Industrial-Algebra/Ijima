@@ -1,0 +1,785 @@
+// Copyright (C) 2026 Industrial Algebra
+// SPDX-License-Identifier: Apache-2.0
+
+//! HTTP/JSON API surface — the REST endpoints harnesses speak.
+//!
+//! Maps the core [`Store`] trait methods onto axum routes, each guarded
+//! by a Schubert capability check via [`AuthPrincipal`]. Every request
+//! is scoped to the authenticated principal's personal namespace
+//! (`ns_<principal>_private`); shared/global namespaces land with the
+//! `memory_promote` endpoint.
+//!
+//! ## Routes
+//!
+//! | Method | Path | Capability | Store method |
+//! |---|---|---|---|
+//! | GET | `/health` | (none) | — |
+//! | POST | `/memories` | `memory:write` | `store_memory` |
+//! | GET | `/memories/:id` | `memory:read` | `recall_memory` |
+//! | DELETE | `/memories/:id` | `memory:write` | `delete_memory` |
+//! | POST | `/memories/search` | `memory:read` | `search_memories` |
+//! | POST | `/sessions/:session_id/turns` | `session:ingest` | `ingest_turn` |
+//! | GET | `/sessions/:session_id/turns` | `memory:read` | `session_turns` |
+
+use std::sync::Arc;
+
+use axum::{
+    Extension, Json, Router,
+    extract::{Path, Query},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use serde::{Deserialize, Serialize};
+
+use ijima_core::{
+    Embedder, Memory, MemoryId, SessionId, SessionTurn, Store,
+    capabilities::{MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
+};
+
+use crate::extractor::AuthPrincipal;
+use crate::redaction::Redactor;
+
+/// Builds the Ijima HTTP application router.
+///
+/// `auth` and `store` are shared via axum's [`Extension`] layer; the
+/// [`AuthPrincipal`] extractor reads `auth` to verify bearer tokens.
+pub fn app(
+    auth: Arc<crate::IjimaAuth>,
+    store: Arc<dyn Store>,
+    embedder: Option<Arc<dyn Embedder>>,
+    redactor: Arc<Redactor>,
+) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/memories", post(store_memory))
+        .route("/memories/search", post(search_memories))
+        .route("/memories/:id", get(recall_memory).delete(delete_memory))
+        .route("/memories/:id/promote", post(promote_memory))
+        .route("/doctrine", post(ingest_doctrine))
+        .route(
+            "/sessions/:session_id/turns",
+            post(ingest_turn).get(session_turns),
+        )
+        .layer(Extension(auth))
+        .layer(Extension(store))
+        .layer(Extension(embedder))
+        .layer(Extension(redactor))
+}
+
+// ---------- errors ----------
+
+/// API-level error mapping to HTTP status codes.
+#[derive(Debug)]
+pub enum ApiError {
+    /// Capability check failed (principal's token lacks the required cap).
+    Forbidden,
+    /// Resource absent (or in a different namespace).
+    NotFound,
+    /// Malformed request body or parameters.
+    BadRequest(String),
+    /// Store / internal failure.
+    Internal(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, msg): (StatusCode, String) = match self {
+            ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        };
+        (status, msg).into_response()
+    }
+}
+
+fn internal(e: ijima_core::IjimaError) -> ApiError {
+    ApiError::Internal(e.to_string())
+}
+
+/// Query params carrying an optional namespace override + limit.
+#[derive(Deserialize, Default)]
+struct NsQuery {
+    /// Override the default personal namespace. Personal namespaces
+    /// (`ns_<name>_private`) belonging to *other* principals are
+    /// rejected with 403; shared/global namespaces are allowed.
+    namespace: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Resolves the effective namespace for a request: the caller's
+/// personal namespace by default, or the requested one if authorized.
+///
+/// Authorization (v0, naming-convention based):
+/// - `ns_<this_principal>_private` → allowed (own personal).
+/// - any other `ns_*_private` → **403** (someone else's personal).
+/// - anything else → allowed (shared / global).
+fn resolve_ns(
+    principal: &AuthPrincipal,
+    requested: Option<&str>,
+) -> Result<ijima_core::NamespaceId, ApiError> {
+    let own = format!("ns_{}_private", principal.0.principal.as_str());
+    match requested {
+        None => Ok(ijima_core::NamespaceId::new(own)),
+        Some(ns) if ns == own => Ok(ijima_core::NamespaceId::new(ns)),
+        Some(ns) if ns.ends_with("_private") => Err(ApiError::Forbidden),
+        Some(ns) => Ok(ijima_core::NamespaceId::new(ns)),
+    }
+}
+
+// ---------- handlers ----------
+
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+#[derive(Serialize)]
+struct IdResponse {
+    id: String,
+}
+
+async fn store_memory(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(memory): Json<Memory>,
+) -> Result<Json<IdResponse>, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    let id = store.store_memory(&ns, memory).await.map_err(internal)?;
+    Ok(Json(IdResponse { id: id.0 }))
+}
+
+async fn recall_memory(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<Memory>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    match store
+        .recall_memory(&ns, &MemoryId(id))
+        .await
+        .map_err(internal)?
+    {
+        Some(memory) => Ok(Json(memory)),
+        None => Err(ApiError::NotFound),
+    }
+}
+
+async fn delete_memory(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    store
+        .delete_memory(&ns, &MemoryId(id))
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SearchRequest {
+    /// The query text. The daemon embeds this centrally with its own
+    /// embedder (D9 §5: "the service owns the model"), guaranteeing
+    /// vector compatibility with stored memories.
+    text: String,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SearchResponse {
+    memories: Vec<Memory>,
+}
+
+async fn search_memories(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(embedder): Extension<Option<Arc<dyn Embedder>>>,
+    Query(q): Query<NsQuery>,
+    Json(req): Json<SearchRequest>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let embedder = embedder
+        .ok_or_else(|| ApiError::Internal("search unavailable: daemon has no embedder".into()))?;
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let query = embedder.embed(&req.text).map_err(internal)?;
+    let hits = store
+        .search_memories(&ns, &query, req.limit.unwrap_or(10))
+        .await
+        .map_err(internal)?;
+    Ok(Json(SearchResponse { memories: hits }))
+}
+
+// ---------- promotion (personal → shared, D9 §2) ----------
+
+#[derive(Deserialize)]
+struct PromoteRequest {
+    /// The shared/team namespace to promote into
+    /// (e.g. `ns_team_default`).
+    target_namespace: String,
+    /// Optional id for the promoted copy. Defaults to
+    /// `<original_id>__shared`.
+    new_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PromoteResponse {
+    id: String,
+    original_id: String,
+    target_namespace: String,
+    redactions: Vec<crate::redaction::Redaction>,
+}
+
+/// Promotes a memory from the caller's personal namespace to a shared
+/// namespace, running the [redaction filter](crate::redaction) at the
+/// boundary. The original stays verbatim in personal scope; a scrubbed
+/// copy lands in the target namespace.
+async fn promote_memory(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(redactor): Extension<Arc<Redactor>>,
+    Path(id): Path<String>,
+    Json(req): Json<PromoteRequest>,
+) -> Result<Json<PromoteResponse>, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let personal_ns = principal.0.personal_namespace();
+
+    // Read from the caller's personal namespace.
+    let memory = store
+        .recall_memory(&personal_ns, &MemoryId(id.clone()))
+        .await
+        .map_err(internal)?
+        .ok_or(ApiError::NotFound)?;
+
+    // Scrub at the boundary (D9 §2 — the one place filtering happens).
+    let scrubbed = redactor.redact(&memory.content);
+
+    // Write the redacted copy to the shared namespace.
+    let new_id = req
+        .new_id
+        .clone()
+        .unwrap_or_else(|| format!("{id}__shared"));
+    let promoted = Memory {
+        id: MemoryId(new_id.clone()),
+        content: scrubbed.text,
+        project: memory.project,
+        topic: memory.topic,
+        source: ijima_core::memory::MemorySource::Explicit,
+        harness: memory.harness,
+        // Provenance back-reference to the original personal memory.
+        session_id: Some(id.clone()),
+    };
+    let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
+    store
+        .store_memory(&target_ns, promoted)
+        .await
+        .map_err(internal)?;
+
+    Ok(Json(PromoteResponse {
+        id: new_id,
+        original_id: id,
+        target_namespace: req.target_namespace,
+        redactions: scrubbed.redactions,
+    }))
+}
+
+// ---------- doctrine ingest (D9) ----------
+
+#[derive(Deserialize)]
+struct DoctrineRequest {
+    id: String,
+    content: String,
+    project: String,
+    topic: String,
+}
+
+/// Ingests a curated doctrine entry into the global `ns_doctrine`
+/// namespace. Admin-gated — doctrine is PR-reviewed in Git and never
+/// written by agents. Idempotent (delete-then-store) so re-ingests
+/// upsert cleanly. No redaction (doctrine is pre-reviewed).
+async fn ingest_doctrine(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(req): Json<DoctrineRequest>,
+) -> Result<Json<IdResponse>, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
+    // Idempotent upsert: remove any existing entry, then store.
+    store
+        .delete_memory(&ns, &MemoryId(req.id.clone()))
+        .await
+        .map_err(internal)?;
+    let memory = Memory {
+        id: MemoryId(req.id.clone()),
+        content: req.content,
+        project: req.project,
+        topic: req.topic,
+        source: ijima_core::memory::MemorySource::Doctrine,
+        harness: ijima_core::harness::Harness::Other,
+        session_id: None,
+    };
+    store.store_memory(&ns, memory).await.map_err(internal)?;
+    Ok(Json(IdResponse { id: req.id }))
+}
+
+async fn ingest_turn(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(session_id): Path<String>,
+    Json(mut turn): Json<SessionTurn>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(SESSION_INGEST) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    turn.session_id = SessionId::new(session_id);
+    store.ingest_turn(&ns, turn).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// TurnsQuery is unified into NsQuery above.
+
+#[derive(Serialize)]
+struct TurnsResponse {
+    turns: Vec<SessionTurn>,
+}
+
+async fn session_turns(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<TurnsResponse>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let turns = store
+        .session_turns(&ns, &SessionId::new(session_id), q.limit.unwrap_or(50))
+        .await
+        .map_err(internal)?;
+    Ok(Json(TurnsResponse { turns }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::IjimaAuth;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use ijima_core::{harness::Harness, memory::MemorySource};
+    use tower::ServiceExt;
+
+    async fn app_with_store() -> (Router, Arc<IjimaAuth>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store: Arc<dyn Store> =
+            Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        (
+            app(
+                auth.clone(),
+                store,
+                None,
+                Arc::new(crate::redaction::Redactor::new()),
+            ),
+            auth,
+        )
+    }
+
+    fn bearer(auth: &IjimaAuth, principal: &str, cap: &str) -> String {
+        format!(
+            "Bearer {}",
+            auth.issue_bearer(principal, cap).expect("issue")
+        )
+    }
+
+    fn sample_memory_json(id: &str) -> String {
+        serde_json::json!({
+            "id": id,
+            "content": "decided to wire the daemon",
+            "project": "ijima",
+            "topic": "api",
+            "source": "Explicit",
+            "harness": "Pi",
+            "session_id": "sess_1",
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn health_is_public() {
+        let (app, _) = app_with_store().await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn recall_without_auth_is_401() {
+        let (app, _) = app_with_store().await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn store_then_recall_round_trips() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // POST /memories
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_memory_json("mem_1")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /memories/mem_1
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_1")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let mem: Memory = serde_json::from_slice(&body).unwrap();
+        assert_eq!(mem.content, "decided to wire the daemon");
+        assert_eq!(mem.harness, Harness::Pi);
+        assert_eq!(mem.source, MemorySource::Explicit);
+    }
+
+    #[tokio::test]
+    async fn store_with_read_only_token_is_403() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_memory_json("mem_x")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn namespace_isolation_across_principals() {
+        let (app, auth) = app_with_store().await;
+        // alice stores
+        let alice_write = bearer(&auth, "alice", MEMORY_WRITE);
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &alice_write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(sample_memory_json("mem_a")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // bob cannot recall alice's memory
+        let bob_read = bearer(&auth, "bob", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_a")
+                    .header("authorization", &bob_read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn promote_redacts_secrets_and_leaves_original_intact() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // Store a personal memory containing a secret.
+        let body = serde_json::json!({
+            "id": "mem_secret",
+            "content": "deploy key sk-abcdefghijklmnopqrstuvwxyz1234567890 contact ops@test.com",
+            "project": "ijima",
+            "topic": "ops",
+            "source": "Explicit",
+            "harness": "Pi",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Promote to a shared namespace.
+        let promote_body = serde_json::json!({
+            "target_namespace": "ns_team_shared",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/mem_secret/promote")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(promote_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let resp: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let new_id = resp["id"].as_str().unwrap();
+        assert_eq!(new_id, "mem_secret__shared");
+        let cats: Vec<&str> = resp["redactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["category"].as_str().unwrap())
+            .collect();
+        assert!(cats.contains(&"api_key"));
+        assert!(cats.contains(&"email"));
+
+        // The original personal memory is untouched (verbatim).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_secret")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let orig: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(orig.content.contains("sk-abcdef"));
+        assert!(orig.content.contains("ops@test.com"));
+
+        // The promoted shared copy is readable via ?namespace= and has
+        // secrets scrubbed.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_secret__shared?namespace=ns_team_shared")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let shared: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(shared.content.contains("[REDACTED:api_key]"));
+        assert!(shared.content.contains("[REDACTED:email]"));
+        assert!(!shared.content.contains("sk-abcdef"));
+        assert!(!shared.content.contains("ops@test.com"));
+        // Provenance back-reference.
+        assert_eq!(shared.session_id.as_deref(), Some("mem_secret"));
+    }
+
+    #[tokio::test]
+    async fn cross_principal_personal_namespace_is_forbidden() {
+        let (app, auth) = app_with_store().await;
+        // Alice stores a memory.
+        let alice_write = bearer(&auth, "alice", MEMORY_WRITE);
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &alice_write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "mem_a",
+                            "content": "alice only",
+                            "project": "x",
+                            "topic": "x",
+                            "source": "Explicit",
+                            "harness": "Pi",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Bob tries to read alice's personal namespace explicitly.
+        let bob_read = bearer(&auth, "bob", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_a?namespace=ns_alice_private")
+                    .header("authorization", &bob_read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_requires_admin_and_is_readable_shared() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let read = bearer(&auth, "anyone", MEMORY_READ);
+
+        // Non-admin cannot ingest doctrine.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "d1",
+                            "content": "doctrine body",
+                            "project": "ijima",
+                            "topic": "arch",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin ingests.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "d1",
+                            "content": "doctrine body",
+                            "project": "ijima",
+                            "topic": "arch",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Any read-capable principal can recall doctrine from ns_doctrine.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d1?namespace=ns_doctrine")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mem: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mem.content, "doctrine body");
+        assert_eq!(mem.source, ijima_core::memory::MemorySource::Doctrine);
+    }
+}

@@ -1,10 +1,40 @@
-[package]
-name = "Ijima"
+[workspace]
+members = [
+    "ijima-core",
+    "ijima-server",
+    "ijima-miner",
+    "ijima-client",
+]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/Industrial-Algebra/Ijima"
+homepage = "https://github.com/Industrial-Algebra/Ijima"
+keywords = ["memory", "agent-memory", "knowledge-graph", "llm", "embeddings"]
+categories = ["database", "api-bindings", "development-tools"]
+readme = "README.md"
 
-[dependencies]
-rayon = "1.8"
-wgpu = "0.19"
-bytemb = "1.7"
-futures-intrusive = "0.5"
+[workspace.dependencies]
+# Internal crates
+ijima-core = { version = "0.1.0", path = "ijima-core" }
+ijima-server = { version = "0.1.0", path = "ijima-server" }
+ijima-miner = { version = "0.1.0", path = "ijima-miner" }
+ijima-client = { version = "0.1.0", path = "ijima-client" }
+
+# Shared external dependencies
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
