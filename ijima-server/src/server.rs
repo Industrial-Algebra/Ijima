@@ -54,11 +54,27 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     #[cfg(not(feature = "embeddings-candle"))]
     let embedder: Option<Arc<dyn ijima_core::Embedder>> = None;
 
+    // Persistent on disk by default (SurrealKv). The data dir is
+    // $IJIMA_DIR (default ~/.ijima); the store lives at ijima.db.
+    let data_dir = std::env::var("IJIMA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".ijima"))
+                .ok_or_else(|| {
+                    ijima_core::IjimaError::invalid_input(
+                        "cannot resolve data dir: set IJIMA_DIR or HOME",
+                    )
+                })
+        })?;
+    let db_path = data_dir.join("ijima.db");
+
     #[cfg(feature = "embeddings-candle")]
-    let store: Arc<dyn Store> =
-        { Arc::new(crate::SurrealStore::open_embedded_with(embedder.clone().unwrap()).await?) };
+    let store: Arc<dyn Store> = Arc::new(
+        crate::SurrealStore::open_persistent_with(&db_path, embedder.clone().unwrap()).await?,
+    );
     #[cfg(not(feature = "embeddings-candle"))]
-    let store: Arc<dyn Store> = Arc::new(crate::SurrealStore::open_embedded().await?);
+    let store: Arc<dyn Store> = Arc::new(crate::SurrealStore::open_persistent(&db_path).await?);
 
     let app = api::app(
         auth,
