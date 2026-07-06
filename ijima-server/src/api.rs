@@ -57,6 +57,7 @@ pub fn app(
         .route("/memories/:id", get(recall_memory).delete(delete_memory))
         .route("/memories/:id/promote", post(promote_memory))
         .route("/doctrine", post(ingest_doctrine))
+        .route("/wakeup", get(wakeup))
         .route(
             "/sessions/:session_id/turns",
             post(ingest_turn).get(session_turns),
@@ -148,6 +149,13 @@ async fn store_memory(
         return Err(ApiError::Forbidden);
     }
     let ns = principal.0.personal_namespace();
+    let mut memory = memory;
+    if memory.created_at.is_empty() {
+        memory.created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+    }
     let id = store.store_memory(&ns, memory).await.map_err(internal)?;
     Ok(Json(IdResponse { id: id.0 }))
 }
@@ -284,6 +292,8 @@ async fn promote_memory(
         harness: memory.harness,
         // Provenance back-reference to the original personal memory.
         session_id: Some(id.clone()),
+        importance: memory.importance,
+        created_at: memory.created_at.clone(),
     };
     let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
     store
@@ -335,9 +345,56 @@ async fn ingest_doctrine(
         source: ijima_core::memory::MemorySource::Doctrine,
         harness: ijima_core::harness::Harness::Other,
         session_id: None,
+        importance: 1.0,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default(),
     };
     store.store_memory(&ns, memory).await.map_err(internal)?;
     Ok(Json(IdResponse { id: req.id }))
+}
+
+// ---------- wake-up composition (D9 §4) ----------
+
+/// How many personal essentials to include in a wake-up response.
+const WAKEUP_PERSONAL_LIMIT: usize = 20;
+/// How many doctrine entries to include.
+const WAKEUP_DOCTRINE_LIMIT: usize = 50;
+
+#[derive(Serialize)]
+struct WakeupResponse {
+    /// L0: the authenticated principal's identity.
+    identity: serde_json::Value,
+    /// L1a: the caller's personal essentials (top-N by importance + recency).
+    personal_essentials: Vec<Memory>,
+    /// L1b: the shared team doctrine baseline (identical across the team).
+    doctrine: Vec<Memory>,
+}
+
+/// Composes the session-start context: L0 identity + L1a personal
+/// essentials + L1b team doctrine. This is the "shared brain" — L1b is
+/// identical across the team, L1a is the individual's personal brain.
+async fn wakeup(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+) -> Result<Json<WakeupResponse>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let personal_ns = principal.0.personal_namespace();
+    let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
+
+    let (personal_essentials, doctrine) = tokio::join!(
+        store.list_memories(&personal_ns, WAKEUP_PERSONAL_LIMIT),
+        store.list_memories(&doctrine_ns, WAKEUP_DOCTRINE_LIMIT),
+    );
+
+    Ok(Json(WakeupResponse {
+        identity: serde_json::json!({ "principal": principal.0.principal.as_str() }),
+        personal_essentials: personal_essentials.map_err(internal)?,
+        doctrine: doctrine.map_err(internal)?,
+    }))
 }
 
 async fn ingest_turn(
@@ -419,6 +476,8 @@ mod tests {
             "source": "Explicit",
             "harness": "Pi",
             "session_id": "sess_1",
+            "importance": 0.5,
+            "created_at": "0",
         })
         .to_string()
     }
@@ -781,5 +840,89 @@ mod tests {
         .unwrap();
         assert_eq!(mem.content, "doctrine body");
         assert_eq!(mem.source, ijima_core::memory::MemorySource::Doctrine);
+    }
+
+    #[tokio::test]
+    async fn wakeup_composes_personal_and_doctrine() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let admin = bearer(&auth, "ci", "admin");
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // Store a personal memory.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "mem_p",
+                            "content": "personal essential",
+                            "project": "ijima",
+                            "topic": "x",
+                            "source": "Explicit",
+                            "harness": "Pi",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Ingest doctrine.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "doc_1",
+                            "content": "doctrine baseline",
+                            "project": "ijima",
+                            "topic": "arch",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Wake-up composes both.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["identity"]["principal"], "elliott");
+        assert_eq!(body["personal_essentials"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["personal_essentials"][0]["content"],
+            "personal essential"
+        );
+        assert_eq!(body["doctrine"].as_array().unwrap().len(), 1);
+        assert_eq!(body["doctrine"][0]["content"], "doctrine baseline");
+        assert_eq!(body["doctrine"][0]["source"], "Doctrine");
     }
 }

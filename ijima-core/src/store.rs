@@ -36,6 +36,11 @@ pub trait Store: Send + Sync {
     /// Deletes a memory by id within `ns`.
     async fn delete_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<()>;
 
+    /// Lists up to `limit` memories in `ns`, ranked by importance DESC
+    /// then recency DESC. Powers wake-up composition (L1a personal
+    /// essentials, L1b doctrine baseline).
+    async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
     /// Semantic search over memories in `ns` by nearest embedding.
     ///
     /// Implementations back this with a vector index (SurrealDB MTREE,

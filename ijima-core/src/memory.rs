@@ -40,6 +40,19 @@ pub struct Memory {
     pub harness: Harness,
     /// Provenance: the originating session, when known.
     pub session_id: Option<String>,
+    /// Importance score (0.0–1.0). Used for wake-up ranking
+    /// (top-N by importance × recency). Defaults to 0.5, matching
+    /// pi-mempalace.
+    #[cfg_attr(feature = "serde", serde(default = "default_importance"))]
+    pub importance: f32,
+    /// Creation timestamp. v0: Unix epoch seconds as a string (monotonic
+    /// for DESC ordering). Future: ISO-8601 when a time crate lands.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub created_at: String,
+}
+
+fn default_importance() -> f32 {
+    0.5
 }
 
 /// How a [`Memory`] entered the palace.
@@ -72,10 +85,14 @@ mod tests {
             source: MemorySource::Mined,
             harness: Harness::Pi,
             session_id: Some("sess_7".into()),
+            importance: 0.8,
+            created_at: "123".into(),
         };
         assert_eq!(m.id.0, "mem_01");
         assert_eq!(m.source, MemorySource::Mined);
         assert_eq!(m.harness, Harness::Pi);
+        assert_eq!(m.importance, 0.8);
+        assert_eq!(m.created_at, "123");
         assert_eq!(m.session_id.as_deref(), Some("sess_7"));
     }
 

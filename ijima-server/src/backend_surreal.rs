@@ -107,11 +107,19 @@ struct MemoryRecord {
     harness: Harness,
     session_id: Option<String>,
     namespace: String,
+    #[serde(default = "default_record_importance")]
+    importance: f32,
+    #[serde(default)]
+    created_at: String,
     /// Embedding vector (present when the store was opened with an
     /// [`Embedder`]). `#[serde(default)]` so namespace-filtered selects
     /// that omit it still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     embedding: Option<Vec<f32>>,
+}
+
+fn default_record_importance() -> f32 {
+    0.5
 }
 
 impl MemoryRecord {
@@ -125,6 +133,8 @@ impl MemoryRecord {
             harness: memory.harness,
             session_id: memory.session_id.clone(),
             namespace: ns.as_str().to_string(),
+            importance: memory.importance,
+            created_at: memory.created_at.clone(),
             embedding,
         }
     }
@@ -138,6 +148,8 @@ impl MemoryRecord {
             source: self.source,
             harness: self.harness,
             session_id: self.session_id,
+            importance: self.importance,
+            created_at: self.created_at,
         }
     }
 }
@@ -204,6 +216,24 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         Ok(())
+    }
+
+    async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace, importance, created_at
+                 FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns
+                 ORDER BY importance DESC, created_at DESC
+                 LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
+        Ok(records.into_iter().map(|r| r.into_memory()).collect())
     }
 
     async fn search_memories(
@@ -311,6 +341,8 @@ mod tests {
             source: MemorySource::Explicit,
             harness: Harness::Pi,
             session_id: Some("sess_1".into()),
+            importance: 0.5,
+            created_at: "0".into(),
         }
     }
 
@@ -531,5 +563,32 @@ mod tests {
             hits.is_empty(),
             "namespace isolation must hide alice's memory"
         );
+    }
+
+    #[tokio::test]
+    async fn list_memories_ranks_by_importance_then_recency() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_test");
+        // Three memories with varying importance + recency.
+        let mut hi = sample_memory("hi", "important");
+        hi.importance = 0.9;
+        hi.created_at = "100".into();
+        let mut mid = sample_memory("mid", "medium");
+        mid.importance = 0.5;
+        mid.created_at = "200".into(); // newer but lower importance
+        let mut lo = sample_memory("lo", "low");
+        lo.importance = 0.9;
+        lo.created_at = "300".into(); // same importance as hi, newer
+        store.store_memory(&ns, hi).await.unwrap();
+        store.store_memory(&ns, mid).await.unwrap();
+        store.store_memory(&ns, lo).await.unwrap();
+
+        let list = store.list_memories(&ns, 10).await.expect("list");
+        // importance DESC first: the two 0.9s before the 0.5.
+        // Among the 0.9s, created_at DESC: lo (300) before hi (100).
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].id.0, "lo"); // 0.9, 300
+        assert_eq!(list[1].id.0, "hi"); // 0.9, 100
+        assert_eq!(list[2].id.0, "mid"); // 0.5
     }
 }
