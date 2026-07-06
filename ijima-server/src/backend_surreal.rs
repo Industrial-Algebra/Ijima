@@ -28,8 +28,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    Embedding, IjimaError, Memory, MemoryId, NamespaceId, Result, SessionId, SessionTurn, Store,
-    embeddings::Embedder, harness::Harness, memory::MemorySource,
+    Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph, Memory,
+    MemoryId, NamespaceId, Result, SessionId, SessionTurn, Store, Triple, embeddings::Embedder,
+    harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -41,6 +42,10 @@ const SURREAL_DB: &str = "core";
 
 const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
+/// Entity nodes (knowledge-graph).
+const ENTITIES_TABLE: &str = "entities";
+/// Triple edges (knowledge-graph).
+const TRIPLES_TABLE: &str = "triples";
 
 /// A SurrealDB-backed [`Store`].
 pub struct SurrealStore {
@@ -321,6 +326,259 @@ impl Store for SurrealStore {
     }
 }
 
+// ---------- knowledge graph ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EntityRecord_ {
+    name: String,
+    entity_type: String,
+    namespace: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TripleRecord {
+    /// Deterministic id: `<subject>:<predicate>:<object>`.
+    triple_id: String,
+    subject: String,
+    predicate: String,
+    object: String,
+    #[serde(default)]
+    valid_from: Option<String>,
+    #[serde(default)]
+    valid_to: Option<String>,
+    #[serde(default = "default_record_importance")]
+    confidence: f32,
+    namespace: String,
+    #[serde(default)]
+    source_memory_id: Option<String>,
+}
+
+impl TripleRecord {
+    fn into_triple(self) -> Triple {
+        Triple {
+            id: self.triple_id,
+            subject: EntityId(self.subject),
+            predicate: self.predicate,
+            object: EntityId(self.object),
+            valid_from: self.valid_from,
+            valid_to: self.valid_to,
+            confidence: self.confidence,
+            namespace: self.namespace,
+            source_memory_id: self.source_memory_id,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KnowledgeGraph for SurrealStore {
+    async fn add_triple(
+        &self,
+        ns: &NamespaceId,
+        subject: EntityId,
+        predicate: &str,
+        object: EntityId,
+        valid_from: Option<&str>,
+        confidence: f32,
+        source_memory_id: Option<&str>,
+    ) -> Result<Triple> {
+        let ns_str = ns.as_str().to_string();
+        let subj = subject.0.clone();
+        let obj = object.0.clone();
+        // Create both entity nodes (idempotent — ignore already-exists).
+        for eid in [&subj, &obj] {
+            let record = EntityRecord_ {
+                name: eid.clone(),
+                entity_type: "unknown".into(),
+                namespace: ns_str.clone(),
+            };
+            let _: std::result::Result<Option<EntityRecord_>, _> = self
+                .db
+                .create((ENTITIES_TABLE, eid.clone()))
+                .content(record)
+                .await;
+            // Ignore errors (record already exists from a prior triple).
+        }
+        // Store the triple as a record (keyed by deterministic triple_id).
+        // Native graph edges (RELATE) are a future optimization for
+        // multi-hop traversal; v0 queries via subject/object fields.
+        let triple_id = format!("{subj}:{predicate}:{obj}");
+        let record = TripleRecord {
+            triple_id: triple_id.clone(),
+            subject: subj.clone(),
+            predicate: predicate.to_string(),
+            object: obj.clone(),
+            valid_from: valid_from.map(str::to_string),
+            valid_to: None,
+            confidence,
+            namespace: ns_str.clone(),
+            source_memory_id: source_memory_id.map(str::to_string),
+        };
+        let _: Option<TripleRecord> = self
+            .db
+            .create((TRIPLES_TABLE, triple_id.clone()))
+            .content(record)
+            .await
+            .map_err(store_err)?;
+        Ok(Triple {
+            id: triple_id,
+            subject: EntityId(subj),
+            predicate: predicate.to_string(),
+            object: EntityId(obj),
+            valid_from: valid_from.map(str::to_string),
+            valid_to: None,
+            confidence,
+            namespace: ns_str,
+            source_memory_id: source_memory_id.map(str::to_string),
+        })
+    }
+
+    async fn query_entity(&self, ns: &NamespaceId, entity: &EntityId) -> Result<EntityRecord> {
+        let eid = entity.0.clone();
+        let ent: Option<EntityRecord_> = self
+            .db
+            .select((ENTITIES_TABLE, eid.clone()))
+            .await
+            .map_err(store_err)?;
+        let entity_node = ent.and_then(|r| {
+            if r.namespace == ns.as_str() {
+                Some(Entity {
+                    id: entity.clone(),
+                    name: r.name,
+                    entity_type: r.entity_type,
+                    namespace: r.namespace,
+                })
+            } else {
+                None
+            }
+        });
+        let mut res = self
+            .db
+            .query(format!(
+                "SELECT triple_id, subject, predicate, object, valid_from, valid_to, confidence, namespace, source_memory_id
+                 FROM {TRIPLES_TABLE}
+                 WHERE namespace = $ns AND (subject = $eid OR object = $eid)"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("eid", eid))
+            .await
+            .map_err(store_err)?;
+        let triples: Vec<TripleRecord> = res.take(0).map_err(store_err)?;
+        let requested = entity.0.as_str();
+        let mut outgoing = Vec::new();
+        let mut incoming = Vec::new();
+        for t in triples {
+            if t.subject == requested {
+                outgoing.push(t.into_triple());
+            } else {
+                incoming.push(t.into_triple());
+            }
+        }
+        Ok(EntityRecord {
+            entity: entity_node,
+            outgoing,
+            incoming,
+        })
+    }
+
+    async fn invalidate_triple(&self, ns: &NamespaceId, triple_id: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+        let _ = self
+            .db
+            .query(format!(
+                "UPDATE {TRIPLES_TABLE} SET valid_to = $now
+                 WHERE triple_id = $tid AND namespace = $ns"
+            ))
+            .bind(("now", now))
+            .bind(("tid", triple_id.to_string()))
+            .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn find_triples(
+        &self,
+        ns: &NamespaceId,
+        subject: Option<&EntityId>,
+        predicate: Option<&str>,
+        object: Option<&EntityId>,
+    ) -> Result<Vec<Triple>> {
+        let mut conditions = vec!["namespace = $ns".to_string()];
+        if subject.is_some() {
+            conditions.push("subject = $subj".into());
+        }
+        if predicate.is_some() {
+            conditions.push("predicate = $pred".into());
+        }
+        if object.is_some() {
+            conditions.push("object = $obj".into());
+        }
+        let where_ = conditions.join(" AND ");
+        let mut q = self
+            .db
+            .query(format!(
+                "SELECT triple_id, subject, predicate, object, valid_from, valid_to, confidence, namespace, source_memory_id
+                 FROM {TRIPLES_TABLE} WHERE {where_} LIMIT 100"
+            ))
+            .bind(("ns", ns.as_str().to_string()));
+        if let Some(s) = subject {
+            q = q.bind(("subj", s.0.clone()));
+        }
+        if let Some(p) = predicate {
+            q = q.bind(("pred", p.to_string()));
+        }
+        if let Some(o) = object {
+            q = q.bind(("obj", o.0.clone()));
+        }
+        let mut res = q.await.map_err(store_err)?;
+        let triples: Vec<TripleRecord> = res.take(0).map_err(store_err)?;
+        Ok(triples.into_iter().map(TripleRecord::into_triple).collect())
+    }
+
+    async fn kg_timeline(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Triple>> {
+        let mut res = self
+            .db
+            .query(format!(
+                "SELECT triple_id, subject, predicate, object, valid_from, valid_to, confidence, namespace, source_memory_id
+                 FROM {TRIPLES_TABLE}
+                 WHERE namespace = $ns
+                 ORDER BY valid_from DESC LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        let triples: Vec<TripleRecord> = res.take(0).map_err(store_err)?;
+        Ok(triples.into_iter().map(TripleRecord::into_triple).collect())
+    }
+
+    async fn knowledge_stats(&self, ns: &NamespaceId) -> Result<KgStats> {
+        let mut res = self
+            .db
+            .query(format!(
+                "SELECT namespace FROM {ENTITIES_TABLE} WHERE namespace = $ns;
+                 SELECT namespace FROM {TRIPLES_TABLE} WHERE namespace = $ns;"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        #[derive(Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            namespace: String,
+        }
+        let entities: Vec<Row> = res.take(0).map_err(store_err)?;
+        let triples: Vec<Row> = res.take(1).map_err(store_err)?;
+        Ok(KgStats {
+            entities: entities.len(),
+            triples: triples.len(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +848,134 @@ mod tests {
         assert_eq!(list[0].id.0, "lo"); // 0.9, 300
         assert_eq!(list[1].id.0, "hi"); // 0.9, 100
         assert_eq!(list[2].id.0, "mid"); // 0.5
+    }
+
+    // ===== knowledge graph =====
+
+    #[tokio::test]
+    async fn add_triple_then_query_entity() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_kg");
+        let t = store
+            .add_triple(
+                &ns,
+                EntityId::new("Ijima"),
+                "depends_on",
+                EntityId::new("SurrealDB"),
+                Some("100"),
+                1.0,
+                None,
+            )
+            .await
+            .expect("add_triple");
+        assert_eq!(t.subject.as_str(), "Ijima");
+        assert_eq!(t.predicate, "depends_on");
+        assert_eq!(t.object.as_str(), "SurrealDB");
+        assert!(t.valid_to.is_none()); // current
+
+        let rec = store
+            .query_entity(&ns, &EntityId::new("Ijima"))
+            .await
+            .expect("query");
+        assert!(rec.entity.is_some());
+        assert_eq!(rec.outgoing.len(), 1);
+        assert_eq!(rec.outgoing[0].object.as_str(), "SurrealDB");
+        assert!(rec.incoming.is_empty());
+
+        // From the object's side, it's incoming.
+        let rec = store
+            .query_entity(&ns, &EntityId::new("SurrealDB"))
+            .await
+            .expect("query");
+        assert_eq!(rec.incoming.len(), 1);
+        assert!(rec.outgoing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalidate_triple_sets_valid_to() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_kg");
+        store
+            .add_triple(
+                &ns,
+                EntityId::new("a"),
+                "uses",
+                EntityId::new("b"),
+                Some("100"),
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .invalidate_triple(&ns, "a:uses:b")
+            .await
+            .expect("invalidate");
+        let found = store
+            .find_triples(&ns, None, Some("uses"), None)
+            .await
+            .expect("find");
+        assert_eq!(found.len(), 1);
+        assert!(found[0].valid_to.is_some(), "valid_to must be set");
+    }
+
+    #[tokio::test]
+    async fn knowledge_stats_counts_entities_and_triples() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_kg");
+        store
+            .add_triple(
+                &ns,
+                EntityId::new("a"),
+                "x",
+                EntityId::new("b"),
+                None,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        store
+            .add_triple(
+                &ns,
+                EntityId::new("a"),
+                "y",
+                EntityId::new("c"),
+                None,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        let stats = store.knowledge_stats(&ns).await.expect("stats");
+        assert_eq!(stats.entities, 3); // a, b, c
+        assert_eq!(stats.triples, 2);
+    }
+
+    #[tokio::test]
+    async fn kg_namespace_isolation() {
+        let store = fresh().await;
+        let a = NamespaceId::new("ns_a");
+        let b = NamespaceId::new("ns_b");
+        store
+            .add_triple(
+                &a,
+                EntityId::new("x"),
+                "uses",
+                EntityId::new("y"),
+                None,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap();
+        // b sees nothing.
+        let stats = store.knowledge_stats(&b).await.expect("stats");
+        assert_eq!(stats.triples, 0);
+        let rec = store
+            .query_entity(&b, &EntityId::new("x"))
+            .await
+            .expect("query");
+        assert!(rec.outgoing.is_empty());
     }
 }

@@ -55,14 +55,17 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let embedder: Option<Arc<dyn ijima_core::Embedder>> = None;
 
     #[cfg(feature = "embeddings-candle")]
-    let store: Arc<dyn Store> =
-        { Arc::new(crate::SurrealStore::open_embedded_with(embedder.clone().unwrap()).await?) };
+    let store_inner =
+        Arc::new(crate::SurrealStore::open_embedded_with(embedder.clone().unwrap()).await?);
     #[cfg(not(feature = "embeddings-candle"))]
-    let store: Arc<dyn Store> = Arc::new(crate::SurrealStore::open_embedded().await?);
+    let store_inner = Arc::new(crate::SurrealStore::open_embedded().await?);
+    let store: Arc<dyn Store> = store_inner.clone();
+    let kg: Arc<dyn ijima_core::KnowledgeGraph> = store_inner;
 
     let app = api::app(
         auth,
         store,
+        kg,
         embedder,
         std::sync::Arc::new(crate::redaction::Redactor::new()),
     );
