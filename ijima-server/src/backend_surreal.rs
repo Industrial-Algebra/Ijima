@@ -34,7 +34,7 @@ use ijima_core::{
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
-use surrealdb::engine::local::{Db, Mem};
+use surrealdb::engine::local::{Db, Mem, SurrealKv};
 
 /// The SurrealDB namespace/database the Ijima instance lives in.
 const SURREAL_NS: &str = "ijima";
@@ -57,43 +57,81 @@ pub struct SurrealStore {
 }
 
 impl SurrealStore {
-    /// Opens an in-memory embedded store, scoped to the Ijima NS/DB,
-    /// with **no embedder**. Memories store without embeddings and
-    /// [`Store::search_memories`] errors.
+    /// Opens an **in-memory** embedded store (the `Mem` engine), with no
+    /// embedder. Use for tests; data does not survive restart.
     ///
     /// # Errors
     ///
     /// Returns [`IjimaError::Store`] if SurrealDB cannot initialize.
     pub async fn open_embedded() -> Result<Self> {
-        Self::open(None).await
+        Self::open_with_db(new_mem().await?, None).await
     }
 
-    /// Opens an in-memory embedded store with an [`Embedder`]. Memories
-    /// are embedded at write time, enabling
-    /// [`Store::search_memories`] via Cosine ranking.
+    /// Opens an **in-memory** embedded store with an [`Embedder`].
     ///
     /// # Errors
     ///
     /// Returns [`IjimaError::Store`] if SurrealDB cannot initialize.
     pub async fn open_embedded_with(embedder: Arc<dyn Embedder>) -> Result<Self> {
-        Self::open(Some(embedder)).await
+        Self::open_with_db(new_mem().await?, Some(embedder)).await
     }
 
-    async fn open(embedder: Option<Arc<dyn Embedder>>) -> Result<Self> {
-        let db = Surreal::new::<Mem>(())
-            .await
-            .map_err(|e| IjimaError::Store {
-                detail: format!("surrealdb init: {e}"),
-            })?;
+    /// Opens a **persistent** store (the `SurrealKv` engine) at `path`,
+    /// with no embedder. Data survives restart. Creates the directory if
+    /// absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Store`] if SurrealDB cannot initialize or
+    /// the path is unwritable.
+    pub async fn open_persistent(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_with_db(new_surrealkv(&path).await?, None).await
+    }
+
+    /// Opens a **persistent** store with an [`Embedder`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Store`] if SurrealDB cannot initialize or
+    /// the path is unwritable.
+    pub async fn open_persistent_with(
+        path: impl AsRef<std::path::Path>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<Self> {
+        Self::open_with_db(new_surrealkv(&path).await?, Some(embedder)).await
+    }
+
+    async fn open_with_db(db: Surreal<Db>, embedder: Option<Arc<dyn Embedder>>) -> Result<Self> {
         db.use_ns(SURREAL_NS)
             .use_db(SURREAL_DB)
             .await
             .map_err(|e| IjimaError::Store {
                 detail: format!("surrealdb use_ns/use_db: {e}"),
             })?;
-
         Ok(Self { db, embedder })
     }
+}
+
+async fn new_mem() -> Result<Surreal<Db>> {
+    Surreal::new::<Mem>(())
+        .await
+        .map_err(|e| IjimaError::Store {
+            detail: format!("surrealdb mem init: {e}"),
+        })
+}
+
+async fn new_surrealkv(path: impl AsRef<std::path::Path>) -> Result<Surreal<Db>> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| IjimaError::Store {
+            detail: format!("mkdir {}: {e}", parent.display()),
+        })?;
+    }
+    Surreal::new::<SurrealKv>(path.to_string_lossy().to_string())
+        .await
+        .map_err(|e| IjimaError::Store {
+            detail: format!("surrealdb surrealkv init at {}: {e}", path.display()),
+        })
 }
 
 // ---------- wire records ----------
@@ -116,6 +154,11 @@ struct MemoryRecord {
     importance: f32,
     #[serde(default)]
     created_at: String,
+    /// Which embedding model produced `embedding` (D10 provenance), e.g.
+    /// `sentence-transformers/all-MiniLM-L6-v2@main`. Absent when no
+    /// embedder is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed_model: Option<String>,
     /// Embedding vector (present when the store was opened with an
     /// [`Embedder`]). `#[serde(default)]` so namespace-filtered selects
     /// that omit it still deserialize.
@@ -128,7 +171,12 @@ fn default_record_importance() -> f32 {
 }
 
 impl MemoryRecord {
-    fn from_memory(memory: &Memory, ns: &NamespaceId, embedding: Option<Vec<f32>>) -> Self {
+    fn from_memory(
+        memory: &Memory,
+        ns: &NamespaceId,
+        embedding: Option<Vec<f32>>,
+        embed_model: Option<String>,
+    ) -> Self {
         Self {
             memory_id: memory.id.0.clone(),
             content: memory.content.clone(),
@@ -140,6 +188,7 @@ impl MemoryRecord {
             namespace: ns.as_str().to_string(),
             importance: memory.importance,
             created_at: memory.created_at.clone(),
+            embed_model,
             embedding,
         }
     }
@@ -183,12 +232,19 @@ fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
 #[async_trait]
 impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
-        let embedding = match &self.embedder {
-            Some(e) => embed_for(e.as_ref(), &memory.content)?,
-            None => None,
+        let (embedding, embed_model) = match &self.embedder {
+            Some(e) => {
+                // Stamp the model id (D10 provenance) so a future model
+                // swap is detectable and a re-embed pass can be triggered.
+                (
+                    embed_for(e.as_ref(), &memory.content)?,
+                    Some(e.model_id().to_string()),
+                )
+            }
+            None => (None, None),
         };
         let id_str = memory.id.0.clone();
-        let record = MemoryRecord::from_memory(&memory, ns, embedding);
+        let record = MemoryRecord::from_memory(&memory, ns, embedding, embed_model);
         let _: Option<MemoryRecord> = self
             .db
             .create((MEMORIES_TABLE, id_str.clone()))
@@ -977,5 +1033,35 @@ mod tests {
             .await
             .expect("query");
         assert!(rec.outgoing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistent_store_survives_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "ijima-persist-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ns = NamespaceId::new("ns_persist");
+
+        // Write with one instance.
+        {
+            let store = SurrealStore::open_persistent(&dir).await.expect("open");
+            store
+                .store_memory(&ns, sample_memory("mem_p", "survives restart"))
+                .await
+                .expect("store");
+        }
+
+        // A fresh instance pointing at the same path must see the memory.
+        let store = SurrealStore::open_persistent(&dir).await.expect("reopen");
+        let got = store
+            .recall_memory(&ns, &MemoryId("mem_p".into()))
+            .await
+            .expect("recall")
+            .expect("memory must survive reopen");
+        assert_eq!(got.content, "survives restart");
     }
 }

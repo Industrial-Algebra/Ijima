@@ -44,6 +44,8 @@ pub struct CandleEmbedder {
     model: BertModel,
     tokenizer: Mutex<Tokenizer>,
     device: Device,
+    /// The HF model id + revision this embedder loaded (provenance, D10).
+    model_id: String,
 }
 
 impl CandleEmbedder {
@@ -56,6 +58,22 @@ impl CandleEmbedder {
     /// downloaded or the weights/config/tokenizer fail to load.
     pub fn from_hub() -> Result<Self> {
         Self::from_hub_model(DEFAULT_MODEL, "main")
+    }
+
+    /// Loads the model selected by `IJIMA_EMBED_MODEL` /
+    /// `IJIMA_EMBED_REVISION` (defaulting to MiniLM-L6-v2 @ main).
+    /// This is the config-driven entry point for near-term model
+    /// iteration (D10) — swapping the embedding model is a config
+    /// change, not a code change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Store`] on download or load failure.
+    pub fn from_env() -> Result<Self> {
+        let model =
+            std::env::var("IJIMA_EMBED_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        let revision = std::env::var("IJIMA_EMBED_REVISION").unwrap_or_else(|_| "main".to_string());
+        Self::from_hub_model(&model, &revision)
     }
 
     /// Loads an arbitrary sentence-transformer BERT model from the HF
@@ -107,6 +125,7 @@ impl CandleEmbedder {
             model,
             tokenizer: Mutex::new(tokenizer),
             device,
+            model_id: format!("{model_id}@{revision}"),
         })
     }
 }
@@ -114,6 +133,10 @@ impl CandleEmbedder {
 impl Embedder for CandleEmbedder {
     fn dim(&self) -> usize {
         DEFAULT_EMBEDDING_DIM
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
     }
 
     fn embed(&self, text: &str) -> Result<Embedding> {

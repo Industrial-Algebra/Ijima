@@ -67,6 +67,16 @@ pub trait Embedder: Send + Sync {
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Embedding>> {
         texts.iter().map(|t| self.embed(t)).collect()
     }
+
+    /// The model id that produced these embeddings (e.g.
+    /// `sentence-transformers/all-MiniLM-L6-v2@main`). Used for
+    /// **embedding provenance** (D10): memories stamp the model that
+    /// embedded them, so a model swap is detectable and a re-embed pass
+    /// can be triggered rather than silently producing incomparable
+    /// vectors. Default `"unknown"` for backends that don't track it.
+    fn model_id(&self) -> &str {
+        "unknown"
+    }
 }
 
 #[cfg(test)]
