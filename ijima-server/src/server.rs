@@ -71,15 +71,18 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let db_path = data_dir.join("ijima.db");
 
     #[cfg(feature = "embeddings-candle")]
-    let store: Arc<dyn Store> = Arc::new(
+    let store_inner = Arc::new(
         crate::SurrealStore::open_persistent_with(&db_path, embedder.clone().unwrap()).await?,
     );
     #[cfg(not(feature = "embeddings-candle"))]
-    let store: Arc<dyn Store> = Arc::new(crate::SurrealStore::open_persistent(&db_path).await?);
+    let store_inner = Arc::new(crate::SurrealStore::open_persistent(&db_path).await?);
+    let store: Arc<dyn Store> = store_inner.clone();
+    let kg: Arc<dyn ijima_core::KnowledgeGraph> = store_inner;
 
     let app = api::app(
         auth,
         store,
+        kg,
         embedder,
         std::sync::Arc::new(crate::redaction::Redactor::new()),
     );

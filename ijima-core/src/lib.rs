@@ -43,6 +43,7 @@ pub mod capabilities;
 pub mod embeddings;
 pub mod error;
 pub mod harness;
+pub mod knowledge;
 pub mod memory;
 pub mod namespace;
 pub mod session;
@@ -50,6 +51,7 @@ pub mod store;
 
 pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
 pub use error::IjimaError;
+pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Triple};
 pub use memory::{Memory, MemoryId, MemorySource};
 pub use namespace::{Namespace, NamespaceId, NamespaceKind};
 pub use session::{Session, SessionId, SessionTurn, TurnRole};

@@ -33,8 +33,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, Memory, MemoryId, SessionId, SessionTurn, Store,
-    capabilities::{MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
+    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, SessionId, SessionTurn, Store,
+    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
 };
 
 use crate::extractor::AuthPrincipal;
@@ -47,6 +47,7 @@ use crate::redaction::Redactor;
 pub fn app(
     auth: Arc<crate::IjimaAuth>,
     store: Arc<dyn Store>,
+    kg: Arc<dyn KnowledgeGraph>,
     embedder: Option<Arc<dyn Embedder>>,
     redactor: Arc<Redactor>,
 ) -> Router {
@@ -58,12 +59,18 @@ pub fn app(
         .route("/memories/:id/promote", post(promote_memory))
         .route("/doctrine", post(ingest_doctrine))
         .route("/wakeup", get(wakeup))
+        .route("/kg/triples", post(add_triple).get(find_triples))
+        .route("/kg/entities/:id", get(query_entity))
+        .route("/kg/triples/:id/invalidate", post(invalidate_triple))
+        .route("/kg/timeline", get(kg_timeline))
+        .route("/kg/stats", get(kg_stats))
         .route(
             "/sessions/:session_id/turns",
             post(ingest_turn).get(session_turns),
         )
         .layer(Extension(auth))
         .layer(Extension(store))
+        .layer(Extension(kg))
         .layer(Extension(embedder))
         .layer(Extension(redactor))
 }
@@ -397,6 +404,134 @@ async fn wakeup(
     }))
 }
 
+// ---------- knowledge graph ----------
+
+#[derive(Deserialize)]
+struct AddTripleRequest {
+    subject: String,
+    predicate: String,
+    object: String,
+    valid_from: Option<String>,
+    confidence: Option<f32>,
+    source_memory_id: Option<String>,
+}
+
+async fn add_triple(
+    principal: AuthPrincipal,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(req): Json<AddTripleRequest>,
+) -> Result<Json<ijima_core::Triple>, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::KNOWLEDGE_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, None)?;
+    let triple = kg
+        .add_triple(
+            &ns,
+            EntityId::new(req.subject),
+            &req.predicate,
+            EntityId::new(req.object),
+            req.valid_from.as_deref(),
+            req.confidence.unwrap_or(1.0),
+            req.source_memory_id.as_deref(),
+        )
+        .await
+        .map_err(internal)?;
+    // Touch `store` so the Extension is consumed.
+    let _ = store;
+    Ok(Json(triple))
+}
+
+async fn query_entity(
+    principal: AuthPrincipal,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Path(id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<ijima_core::EntityRecord>, ApiError> {
+    if !principal.0.may(KNOWLEDGE_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let rec = kg
+        .query_entity(&ns, &EntityId::new(id))
+        .await
+        .map_err(internal)?;
+    Ok(Json(rec))
+}
+
+async fn invalidate_triple(
+    principal: AuthPrincipal,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Path(id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::KNOWLEDGE_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    kg.invalidate_triple(&ns, &id).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, Default)]
+struct FindTriplesQuery {
+    namespace: Option<String>,
+    subject: Option<String>,
+    predicate: Option<String>,
+    object: Option<String>,
+}
+
+async fn find_triples(
+    principal: AuthPrincipal,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Query(q): Query<FindTriplesQuery>,
+) -> Result<Json<Vec<ijima_core::Triple>>, ApiError> {
+    if !principal.0.may(KNOWLEDGE_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let triples = kg
+        .find_triples(
+            &ns,
+            q.subject.as_deref().map(EntityId::new).as_ref(),
+            q.predicate.as_deref(),
+            q.object.as_deref().map(EntityId::new).as_ref(),
+        )
+        .await
+        .map_err(internal)?;
+    Ok(Json(triples))
+}
+
+async fn kg_timeline(
+    principal: AuthPrincipal,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<Vec<ijima_core::Triple>>, ApiError> {
+    if !principal.0.may(KNOWLEDGE_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let triples = kg
+        .kg_timeline(&ns, q.limit.unwrap_or(50))
+        .await
+        .map_err(internal)?;
+    Ok(Json(triples))
+}
+
+async fn kg_stats(
+    principal: AuthPrincipal,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<ijima_core::KgStats>, ApiError> {
+    if !principal.0.may(KNOWLEDGE_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let stats = kg.knowledge_stats(&ns).await.map_err(internal)?;
+    Ok(Json(stats))
+}
+
 async fn ingest_turn(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
@@ -447,12 +582,14 @@ mod tests {
 
     async fn app_with_store() -> (Router, Arc<IjimaAuth>) {
         let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
-        let store: Arc<dyn Store> =
-            Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
         (
             app(
                 auth.clone(),
                 store,
+                kg,
                 None,
                 Arc::new(crate::redaction::Redactor::new()),
             ),
@@ -924,5 +1061,94 @@ mod tests {
         assert_eq!(body["doctrine"].as_array().unwrap().len(), 1);
         assert_eq!(body["doctrine"][0]["content"], "doctrine baseline");
         assert_eq!(body["doctrine"][0]["source"], "Doctrine");
+    }
+
+    #[tokio::test]
+    async fn knowledge_graph_add_query_invalidate() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", "knowledge:write");
+        let read = bearer(&auth, "elliott", "knowledge:read");
+
+        // Add a triple.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/kg/triples")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "subject": "Ijima",
+                            "predicate": "depends_on",
+                            "object": "SurrealDB",
+                            "confidence": 1.0,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Query the entity — outgoing edge present.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/kg/entities/Ijima")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["outgoing"].as_array().unwrap().len(), 1);
+        assert_eq!(body["outgoing"][0]["object"], "SurrealDB");
+        assert!(body["incoming"].as_array().unwrap().is_empty());
+
+        // Stats.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/kg/stats")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["entities"], 2);
+        assert_eq!(body["triples"], 1);
+
+        // Invalidate.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/kg/triples/Ijima:depends_on:SurrealDB/invalidate")
+                    .header("authorization", &write)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
     }
 }
