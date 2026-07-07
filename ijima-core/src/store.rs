@@ -17,6 +17,26 @@ use async_trait::async_trait;
 
 use crate::{Embedding, Memory, MemoryId, NamespaceId, Result, SessionId, SessionTurn};
 
+/// Global memory-palace statistics (across all namespaces).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StoreStats {
+    /// Total memories across every namespace.
+    pub total_memories: usize,
+    /// Per-namespace breakdown.
+    pub namespaces: Vec<NamespaceCount>,
+}
+
+/// One namespace's memory count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NamespaceCount {
+    /// The namespace id.
+    pub namespace: String,
+    /// Memories in that namespace.
+    pub memories: usize,
+}
+
 /// The storage contract.
 ///
 /// Implementations must be `Send + Sync` (shared across an axum handler
@@ -40,6 +60,10 @@ pub trait Store: Send + Sync {
     /// then recency DESC. Powers wake-up composition (L1a personal
     /// essentials, L1b doctrine baseline).
     async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
+    /// Global store statistics across all namespaces (operator/admin
+    /// view). Powers `GET /status`.
+    async fn store_stats(&self) -> Result<StoreStats>;
 
     /// Semantic search over memories in `ns` by nearest embedding.
     ///

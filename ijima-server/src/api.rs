@@ -33,7 +33,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, SessionId, SessionTurn, Store,
+    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, SessionId, SessionTurn,
+    Store,
     capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
 };
 
@@ -53,6 +54,7 @@ pub fn app(
 ) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/status", get(status))
         .route("/memories", post(store_memory))
         .route("/memories/search", post(search_memories))
         .route("/memories/:id", get(recall_memory).delete(delete_memory))
@@ -140,6 +142,35 @@ fn resolve_ns(
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    memories: usize,
+    namespaces: Vec<NamespaceCount>,
+    entities: usize,
+    triples: usize,
+}
+
+/// Global store statistics across all namespaces. Admin-gated (it spans
+/// every principal's data). Per-namespace KG counts are available via
+/// `GET /kg/stats?namespace=...`.
+async fn status(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+) -> Result<Json<StatusResponse>, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let store_stats = store.store_stats().await.map_err(internal)?;
+    let kg_stats = kg.kg_global_stats().await.map_err(internal)?;
+    Ok(Json(StatusResponse {
+        memories: store_stats.total_memories,
+        namespaces: store_stats.namespaces,
+        entities: kg_stats.entities,
+        triples: kg_stats.triples,
+    }))
 }
 
 #[derive(Serialize)]
@@ -1150,5 +1181,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn status_requires_admin_and_reports_counts() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "op", "admin");
+        let read = bearer(&auth, "user", MEMORY_READ);
+
+        // Store a memory + a triple so counts are non-zero.
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "m1",
+                            "content": "stat test",
+                            "project": "x",
+                            "topic": "x",
+                            "source": "Explicit",
+                            "harness": "Pi",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Non-admin is forbidden.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin sees global counts.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/status")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["memories"], 1);
+        assert!(!body["namespaces"].as_array().unwrap().is_empty());
     }
 }

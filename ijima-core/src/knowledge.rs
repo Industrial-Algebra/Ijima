@@ -136,6 +136,9 @@ pub trait KnowledgeGraph: Send + Sync {
 
     /// Entity + triple counts for `ns`.
     async fn knowledge_stats(&self, ns: &NamespaceId) -> Result<KgStats>;
+
+    /// Global entity + triple counts across all namespaces.
+    async fn kg_global_stats(&self) -> Result<KgStats>;
 }
 
 #[cfg(test)]
