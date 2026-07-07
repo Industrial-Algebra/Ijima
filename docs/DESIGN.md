@@ -312,6 +312,150 @@ settled with good reason; the novel concepts have been adopted.
 
 ## Decision Index
 
+## D10. Embedding pipeline: candle as the iteration foundation
+
+Candle stays in the stack — deliberately. A centralized company memory
+store wants its embedding foundation to be **stable, self-controlled,
+and not silently re-defined by an external service's model upgrade**.
+Local candle inference gives that: the model is a fixed 90 MB artefact we
+control, the daemon embeds offline, and swapping in a better local model
+later is a file change, not an architecture change. The 8-minute build
+is the one-time cost of that foundation, not a defect.
+
+### Near-term: design the pipeline modularly for model iteration
+
+Candle is the **iteration surface** for the near term. To make model
+swaps safe and cheap, two gaps must close:
+
+1. **Config-driven model selection.** Today the model id is hardcoded
+   (`DEFAULT_MODEL`); the daemon calls `from_hub()`, not
+   `from_hub_model(...)`. Add `IJIMA_EMBED_MODEL` + `IJIMA_EMBED_REVISION`
+   env vars so swapping MiniLM for a larger/domain-tuned model is a
+   config change, not a code change.
+2. **Embedding provenance.** Today memories store the vector but not
+   *which model produced it*. A model swap silently creates
+   incomparable vectors (MiniLM-384 vs a new model/dim) — the exact
+   corruption risk a long-lived memory store must avoid. Store the
+   embedder's model id alongside embeddings (a store-level "current
+   embedding model" marker); on daemon start, if the configured model
+   differs from the stored one, flag that a re-embed pass is required.
+
+The [`Embedder`](../../ijima-core/src/embeddings.rs) trait is the seam:
+`CandleEmbedder` plugs in today; a `RemoteEmbedder` (HTTP endpoint) or a
+future holographic backend plugs in the same way.
+
+### Far-term: trajectory toward Minuet / Kagome holographic memory
+
+The long arc is holographic memory: **Minuet** (holographic memory on
+`amari-holographic` — binding algebra, resonator retrieval, capacity/
+eviction/journaling) backed eventually by **Kagome** (the physical
+microwave-optical hardware). Holographic / vector-symbolic
+representations give compositional retrieval that flat embeddings
+cannot — genuinely better for a memory that must recall *relations*,
+not just similar text.
+
+Two swap seams lead there:
+
+- **Near**: the `Embedder` trait — a `MinuetEmbedder` (binding-algebra
+  encoder) plugs in here.
+- **Deep**: `Store::search_memories` — a Minuet-backed retrieval tier
+  replaces flat cosine. The `Store` trait isolates this; SurrealDB stays
+  the persistence layer beneath.
+
+This composes cleanly: Schubert already integrates Minuet via its
+`holographic` feature (D3). Ijima adopting Minuet later is a feature-
+gated retrieval tier, not a rewrite.
+
+---
+
+## D11. Latent lifting and the representation spectrum *(exploration)*
+
+> **Status: exploration / bluesky.** Not an implementation decision.
+> Records the conceptual landscape surfacing across three sibling
+> projects (pxpipe, Morphogen, Minuet) so the *reason* Ijima stores text
+> + a discrete KG — and treats any lifted/latent form as a lossy cache —
+> is explicit rather than accidental.
+
+### The spectrum
+
+Memory (and programs, and context) can be represented at four densities.
+Each trades portability for token/parameter efficiency:
+
+| Tier | Representation | Portable? | Cost to inject | Lossless? |
+|---|---|---|---|---|
+| **Text** | discrete symbols | ✅ any model | high | ✅ |
+| **Partial lift** | continuous, *derived from text* (pxpipe: rendered image → vision patch-latents) | semi (any VLM) | low | ❌ lossy |
+| **Latent** | continuous, opaque (hidden states, KV-cache) | ❌ model-locked | lowest | ❌❌ |
+| **Graft** | parametric delta (LoRA adapter) | ❌❂ base-locked | n/a | behavioral |
+
+Ijima is deliberately at the **text** end: text is the source of truth,
+the embedding is a *re-derivable index* (D10), and the KG is *discrete*.
+
+### Two active explorations in the portfolio
+
+- **pxpipe** (`../pxpipe`, "Partial Latent Lifting"): re-renders bulky
+  text as PNG and sends the image — exploiting that a VLM projects each
+  image patch to one continuous embedding, so image-token cost scales
+  with pixel area, not content density. ~3.1 chars/image-token vs ~1
+  char/text-token. It is an *opportunistic, manual* lift into the vision
+  encoder's latent space.
+- **Morphogen** (`../Morphogen`, "Latent Lifting via Neural Inverse
+  Rewrite rules"): the principled end. Thesis — the latent is *canonical*;
+  text/bytecode/Verilog/memory-layout are *renders* via learned decoders.
+  Inverse rewrite rules are the decoders that move between representations.
+  Programs (and, by extension, any artifact) *develop* rather than
+  compile-and-run.
+
+### The governing principle for Ijima (and why)
+
+The decisive finding, from pxpipe's research log and generalizable to
+*any* latent scheme: **continuous representations have no discrete
+symbol to flag low confidence, so their failures are silent
+confabulations.** pxpipe's prose recall is 98/98 but 12-char hex IDs read
+0/15–13/15 — and the misses are *plausible fabrications, not errors*.
+There is a capacity ceiling (exact-read accuracy is monotonic in
+pixels-per-glyph, locked by the resample limit) that no rendering trick
+breaks at a given density.
+
+Therefore, for a **long-lived company brain**:
+
+- **Text + the discrete KG are the lossless source of truth.** They
+  survive any model change; the KG is *why* — explicit, auditable facts
+  are the antidote to latent confabulation.
+- **Any lifted/latent form is a lossy, model-tagged, regenerable cache**
+  for injection/retrieval — never the stored fact. Same principle as
+  D10's embedding provenance (the embedding is a derived index,
+  regenerable from text), at a different modality.
+
+### Content-dependence → which tier may lift
+
+The lossiness is content-dependent, and it maps onto Ijima's tiers:
+
+| Ijima tier | May lift? | Why |
+|---|---|---|
+| **Knowledge graph** (entities, triples, facts) | **never** | byte-exact; a confabulated fact is corruption |
+| **Memory palace** content | stored text lossless; a lifted *summary* may cache | source of truth stays text |
+| **Session-context repository** (raw transcripts) | **yes** | "what was discussed" tolerates a lossy gist |
+
+### The arc and the open question
+
+Near → far: **text+KG (now)** → **chunking** (better retrieval
+granularity) → **Minuet holographic codes** (D10's trajectory: a
+principled memory-latent — continuous/compositional like a lift, but
+purpose-built for binding/retrieval/capacity, not an opportunistic reuse
+of a vision channel). pxpipe is the opportunistic lift; Morphogen is the
+principled latent-native; Minuet is the principled *memory* latent.
+
+The open bluesky question: could a far-future Ijima tier store memory as
+a Morphogen-style canonical latent with text as one render among many?
+The portability/re-embed problem (D10) would become a *decoder* problem
+— re-derivation via inverse rewrite rather than re-embedding. That is a
+research question, not a design decision, and it is correctly deferred.
+
+---
+
+## Decision Index
+
 | ID | Topic | Resolves | Status |
 |----|-------|----------|--------|
 | D1 | Embedding/vector backend = candle | HANDOFF §8 Q3, Q4 | Decided |
@@ -323,6 +467,8 @@ settled with good reason; the novel concepts have been adopted.
 | D7 | Vector search: Cosine similarity, **brute-force** now (correct, no ANN approximation); HNSW index is the planned optimization once the SDK emits typed `<N>f32` vectors (MTREE deprecated in SurrealDB 2.6) | D6 vector search | Decided (wired) |
 | D8 | Surveyed Orlando / Karpal / Amari for the typed-vector + cosine problems — **no composition benefit for v0**; Minuet is the future path for richer retrieval | D7 follow-up | Decided (no wiring) |
 | D9 | Incorporated `docs/discovery/memory-service-design.md` (parallel-context team design). Adopted: `Doctrine` origin, redaction-at-promotion boundary, multi-party hybrid model. Noted Postgres-vs-SurrealDB tension (SurrealDB stands). | D2, D6, memory model | Decided (aligned + Doctrine wired) |
+| D10 | Embedding pipeline: **keep candle** as the iteration foundation; design modular (config-driven model + embedding provenance) for near-term model iteration; far-term trajectory toward **Minuet/Kagome holographic memory** | D1, D7 | Decided (direction) |
+| D11 | Latent lifting & the representation spectrum (pxpipe / Morphogen / Minuet). **Exploration:** text+KG = lossless source of truth; any lifted/latent form = lossy model-tagged cache. Why: continuous reps confabulate silently. | D10 | Exploration (bluesky) |
 |----|-------|----------|--------|
 | D1 | Embedding/vector backend = candle | HANDOFF §8 Q3, Q4 | Decided |
 | D2 | Multi-user/multi-access design | HANDOFF §8 Q10, Q11 | Decided (design) |

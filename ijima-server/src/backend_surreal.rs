@@ -149,6 +149,11 @@ struct MemoryRecord {
     importance: f32,
     #[serde(default)]
     created_at: String,
+    /// Which embedding model produced `embedding` (D10 provenance), e.g.
+    /// `sentence-transformers/all-MiniLM-L6-v2@main`. Absent when no
+    /// embedder is configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    embed_model: Option<String>,
     /// Embedding vector (present when the store was opened with an
     /// [`Embedder`]). `#[serde(default)]` so namespace-filtered selects
     /// that omit it still deserialize.
@@ -161,7 +166,12 @@ fn default_record_importance() -> f32 {
 }
 
 impl MemoryRecord {
-    fn from_memory(memory: &Memory, ns: &NamespaceId, embedding: Option<Vec<f32>>) -> Self {
+    fn from_memory(
+        memory: &Memory,
+        ns: &NamespaceId,
+        embedding: Option<Vec<f32>>,
+        embed_model: Option<String>,
+    ) -> Self {
         Self {
             memory_id: memory.id.0.clone(),
             content: memory.content.clone(),
@@ -173,6 +183,7 @@ impl MemoryRecord {
             namespace: ns.as_str().to_string(),
             importance: memory.importance,
             created_at: memory.created_at.clone(),
+            embed_model,
             embedding,
         }
     }
@@ -216,12 +227,19 @@ fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
 #[async_trait]
 impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
-        let embedding = match &self.embedder {
-            Some(e) => embed_for(e.as_ref(), &memory.content)?,
-            None => None,
+        let (embedding, embed_model) = match &self.embedder {
+            Some(e) => {
+                // Stamp the model id (D10 provenance) so a future model
+                // swap is detectable and a re-embed pass can be triggered.
+                (
+                    embed_for(e.as_ref(), &memory.content)?,
+                    Some(e.model_id().to_string()),
+                )
+            }
+            None => (None, None),
         };
         let id_str = memory.id.0.clone();
-        let record = MemoryRecord::from_memory(&memory, ns, embedding);
+        let record = MemoryRecord::from_memory(&memory, ns, embedding, embed_model);
         let _: Option<MemoryRecord> = self
             .db
             .create((MEMORIES_TABLE, id_str.clone()))

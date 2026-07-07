@@ -48,7 +48,8 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     #[cfg(feature = "embeddings-candle")]
     let embedder: Option<Arc<dyn ijima_core::Embedder>> = {
         let e: Arc<dyn ijima_core::Embedder> =
-            Arc::new(crate::embeddings_candle::CandleEmbedder::from_hub()?);
+            Arc::new(crate::embeddings_candle::CandleEmbedder::from_env()?);
+        eprintln!("ijima: embedder = {} (dim via Embedder::dim)", e.model_id());
         Some(e)
     };
     #[cfg(not(feature = "embeddings-candle"))]
