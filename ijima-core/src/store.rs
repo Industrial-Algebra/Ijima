@@ -65,6 +65,10 @@ pub trait Store: Send + Sync {
     /// view). Powers `GET /status`.
     async fn store_stats(&self) -> Result<StoreStats>;
 
+    /// Checks whether a memory with identical content already exists in
+    /// `ns` (content-hash dedup). Returns the existing [`MemoryId`] if so.
+    async fn check_duplicate(&self, ns: &NamespaceId, content: &str) -> Result<Option<MemoryId>>;
+
     /// Semantic search over memories in `ns` by nearest embedding.
     ///
     /// Implementations back this with a vector index (SurrealDB MTREE,

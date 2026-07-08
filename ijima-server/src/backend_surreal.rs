@@ -144,6 +144,11 @@ struct MemoryRecord {
     /// results can return it without parsing a RecordId).
     memory_id: String,
     content: String,
+    /// SHA-256 of `content` (content-hash dedup, Phase 2.2). Stored for
+    /// O(1) exact-duplicate lookup within a namespace. `#[serde(default)]`
+    /// so SELECTs that omit it (list/search projections) still deserialize.
+    #[serde(default)]
+    content_hash: String,
     project: String,
     topic: String,
     source: MemorySource,
@@ -177,9 +182,12 @@ impl MemoryRecord {
         embedding: Option<Vec<f32>>,
         embed_model: Option<String>,
     ) -> Self {
+        use sha2::{Digest, Sha256};
+        let content_hash = hex(&Sha256::digest(memory.content.as_bytes()));
         Self {
             memory_id: memory.id.0.clone(),
             content: memory.content.clone(),
+            content_hash,
             project: memory.project.clone(),
             topic: memory.topic.clone(),
             source: memory.source,
@@ -225,6 +233,11 @@ fn store_err(e: surrealdb::Error) -> IjimaError {
     }
 }
 
+/// Lowercase hex of a byte slice (for content-hash).
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
     Ok(Some(embedder.embed(text)?.0))
 }
@@ -232,6 +245,14 @@ fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
 #[async_trait]
 impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
+        // Content-hash dedup (Phase 2.2): reject exact duplicates within
+        // the namespace, returning the existing id so callers can recover.
+        if let Some(existing) = self.check_duplicate(ns, &memory.content).await? {
+            return Err(IjimaError::duplicate(format!(
+                "content already stored as {}",
+                existing.0
+            )));
+        }
         let (embedding, embed_model) = match &self.embedder {
             Some(e) => {
                 // Stamp the model id (D10 provenance) so a future model
@@ -252,6 +273,27 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         Ok(memory.id)
+    }
+
+    async fn check_duplicate(&self, ns: &NamespaceId, content: &str) -> Result<Option<MemoryId>> {
+        use sha2::{Digest, Sha256};
+        let hash = hex(&Sha256::digest(content.as_bytes()));
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT memory_id FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns AND content_hash = $hash LIMIT 1"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("hash", hash))
+            .await
+            .map_err(store_err)?;
+        #[derive(Deserialize)]
+        struct IdRow {
+            memory_id: String,
+        }
+        let rows: Vec<IdRow> = result.take(0).map_err(store_err)?;
+        Ok(rows.into_iter().next().map(|r| MemoryId(r.memory_id)))
     }
 
     async fn recall_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<Option<Memory>> {
@@ -731,6 +773,41 @@ mod tests {
         assert_eq!(got.content, "decided to use surrealdb");
         assert_eq!(got.harness, Harness::Pi);
         assert_eq!(got.source, MemorySource::Explicit);
+    }
+
+    #[tokio::test]
+    async fn store_rejects_exact_duplicate_content() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_dedup");
+        store
+            .store_memory(&ns, sample_memory("m1", "identical content"))
+            .await
+            .expect("first store");
+        // Same content, different id — must be rejected.
+        let result = store
+            .store_memory(&ns, sample_memory("m2", "identical content"))
+            .await;
+        assert!(matches!(result, Err(IjimaError::Duplicate { .. })));
+
+        // check_duplicate finds the existing id.
+        let dup = store
+            .check_duplicate(&ns, "identical content")
+            .await
+            .expect("check");
+        assert_eq!(dup.as_ref().unwrap().0, "m1");
+
+        // Different content stores fine.
+        store
+            .store_memory(&ns, sample_memory("m3", "different content"))
+            .await
+            .expect("distinct content stores");
+
+        // Same content in a DIFFERENT namespace is not a duplicate.
+        let other = NamespaceId::new("ns_other");
+        store
+            .store_memory(&other, sample_memory("mx", "identical content"))
+            .await
+            .expect("same content, different namespace");
     }
 
     #[tokio::test]

@@ -56,6 +56,7 @@ pub fn app(
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/memories", post(store_memory))
+        .route("/memories/check", post(check_duplicate))
         .route("/memories/search", post(search_memories))
         .route("/memories/:id", get(recall_memory).delete(delete_memory))
         .route("/memories/:id/promote", post(promote_memory))
@@ -88,6 +89,8 @@ pub enum ApiError {
     NotFound,
     /// Malformed request body or parameters.
     BadRequest(String),
+    /// Duplicate content (content-hash dedup) — 409.
+    Conflict(String),
     /// Store / internal failure.
     Internal(String),
 }
@@ -98,6 +101,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden => (StatusCode::FORBIDDEN, "forbidden".into()),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".into()),
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
         };
         (status, msg).into_response()
@@ -105,7 +109,10 @@ impl IntoResponse for ApiError {
 }
 
 fn internal(e: ijima_core::IjimaError) -> ApiError {
-    ApiError::Internal(e.to_string())
+    match e {
+        ijima_core::IjimaError::Duplicate { detail } => ApiError::Conflict(detail),
+        other => ApiError::Internal(other.to_string()),
+    }
 }
 
 /// Query params carrying an optional namespace override + limit.
@@ -196,6 +203,39 @@ async fn store_memory(
     }
     let id = store.store_memory(&ns, memory).await.map_err(internal)?;
     Ok(Json(IdResponse { id: id.0 }))
+}
+
+#[derive(Deserialize)]
+struct CheckDuplicateRequest {
+    content: String,
+}
+
+#[derive(Serialize)]
+struct CheckDuplicateResponse {
+    /// The id of an existing memory with identical content, if any.
+    duplicate: Option<String>,
+}
+
+/// Pre-check for content-hash dedup (`POST /memories/check`). Returns
+/// the existing memory id if identical content is already stored in the
+/// caller's (effective) namespace.
+async fn check_duplicate(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+    Json(req): Json<CheckDuplicateRequest>,
+) -> Result<Json<CheckDuplicateResponse>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let dup = store
+        .check_duplicate(&ns, &req.content)
+        .await
+        .map_err(internal)?;
+    Ok(Json(CheckDuplicateResponse {
+        duplicate: dup.map(|id| id.0),
+    }))
 }
 
 async fn recall_memory(
