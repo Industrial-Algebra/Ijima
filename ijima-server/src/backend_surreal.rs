@@ -29,8 +29,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ijima_core::{
     Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph, Memory,
-    MemoryId, NamespaceId, Result, SessionId, SessionTurn, Store, Triple, embeddings::Embedder,
-    harness::Harness, memory::MemorySource,
+    MemoryId, NamespaceCount, NamespaceId, Result, SessionId, SessionTurn, Store, StoreStats,
+    Triple, embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -295,6 +295,37 @@ impl Store for SurrealStore {
             .map_err(store_err)?;
         let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
         Ok(records.into_iter().map(|r| r.into_memory()).collect())
+    }
+
+    async fn store_stats(&self) -> Result<StoreStats> {
+        // One query for all namespaces; aggregate in Rust (avoids
+        // SurrealDB aggregate-function ambiguity, fine at v0 scale).
+        #[derive(Deserialize)]
+        struct NsRow {
+            namespace: String,
+        }
+        let mut result = self
+            .db
+            .query(format!("SELECT namespace FROM {MEMORIES_TABLE}"))
+            .await
+            .map_err(store_err)?;
+        let rows: Vec<NsRow> = result.take(0).map_err(store_err)?;
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for r in &rows {
+            *counts.entry(r.namespace.clone()).or_insert(0) += 1;
+        }
+        let namespaces = counts
+            .into_iter()
+            .map(|(namespace, memories)| NamespaceCount {
+                namespace,
+                memories,
+            })
+            .collect();
+        Ok(StoreStats {
+            total_memories: rows.len(),
+            namespaces,
+        })
     }
 
     async fn search_memories(
@@ -619,6 +650,28 @@ impl KnowledgeGraph for SurrealStore {
                  SELECT namespace FROM {TRIPLES_TABLE} WHERE namespace = $ns;"
             ))
             .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        #[derive(Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            namespace: String,
+        }
+        let entities: Vec<Row> = res.take(0).map_err(store_err)?;
+        let triples: Vec<Row> = res.take(1).map_err(store_err)?;
+        Ok(KgStats {
+            entities: entities.len(),
+            triples: triples.len(),
+        })
+    }
+
+    async fn kg_global_stats(&self) -> Result<KgStats> {
+        let mut res = self
+            .db
+            .query(format!(
+                "SELECT namespace FROM {ENTITIES_TABLE};
+                 SELECT namespace FROM {TRIPLES_TABLE};"
+            ))
             .await
             .map_err(store_err)?;
         #[derive(Deserialize)]
@@ -1033,6 +1086,32 @@ mod tests {
             .await
             .expect("query");
         assert!(rec.outgoing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_stats_counts_across_namespaces() {
+        let store = fresh().await;
+        store
+            .store_memory(&NamespaceId::new("ns_a"), sample_memory("m1", "x"))
+            .await
+            .unwrap();
+        store
+            .store_memory(&NamespaceId::new("ns_a"), sample_memory("m2", "y"))
+            .await
+            .unwrap();
+        store
+            .store_memory(&NamespaceId::new("ns_b"), sample_memory("m3", "z"))
+            .await
+            .unwrap();
+        let stats = store.store_stats().await.expect("stats");
+        assert_eq!(stats.total_memories, 3);
+        assert_eq!(stats.namespaces.len(), 2);
+        let ns_a = stats
+            .namespaces
+            .iter()
+            .find(|n| n.namespace == "ns_a")
+            .expect("ns_a");
+        assert_eq!(ns_a.memories, 2);
     }
 
     #[tokio::test]

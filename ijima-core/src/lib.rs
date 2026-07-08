@@ -55,7 +55,7 @@ pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Tri
 pub use memory::{Memory, MemoryId, MemorySource};
 pub use namespace::{Namespace, NamespaceId, NamespaceKind};
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
-pub use store::Store;
+pub use store::{NamespaceCount, Store, StoreStats};
 
 /// Convenience `Result` alias used throughout the Ijima crates.
 pub type Result<T, E = IjimaError> = core::result::Result<T, E>;
