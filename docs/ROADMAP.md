@@ -131,9 +131,14 @@ endpoints are namespace-scoped reads (`memory:read` + `resolve_ns`).
 
 ### 3.4 Operational hardening
 
-- **Backup/export** — SurrealDB `db.export()`.
-- **Structured logging** — replace `eprintln!` with `tracing`.
-- **Rate limiting** — wire Schubert's `RateLimiter`.
+- **Structured logging** ✅ — `tracing`/`tracing-subscriber` replace
+  `eprintln!`; `IJIMA_LOG` env filter (`ijima=info` default).
+- **Rate limiting** ✅ — Schubert `RateLimiter` wired into the
+  `AuthPrincipal` extractor (the capability token drives authn + authz +
+  throughput). Capacity scales with the capability's Schubert intersection
+  number (codimension): `memory:read`→1×, `memory:write`→2×, `admin`→16×.
+  429 on exhaustion. `IJIMA_RATE_BASE`/`IJIMA_RATE_MULTIPLIER`/`IJIMA_RATE_DISABLE`.
+- **Backup/export** — SurrealDB `db.export()` (SDK supports it; follow-up).
 - **TLS** — plain HTTP today; acceptable on Tailscale, worth noting.
 
 ### 3.5 Multi-party handling (D9 §3)

@@ -14,7 +14,7 @@ description = "HTTP daemon and store backends for the Ijima centralized agentic 
 default = ["std", "http"]
 std = []
 # HTTP/JSON transport (axum). Disable to embed the store without a server.
-http = ["dep:axum", "dep:tokio", "dep:tracing", "ijima-core/serde"]
+http = ["dep:axum", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "ijima-core/serde"]
 # SurrealDB store backend — the primary backend (D6). Embedded (`kv-mem`)
 # or server mode. Requires ijima-core's serde.
 backend-surreal = ["dep:surrealdb", "ijima-core/serde", "dep:tokio", "dep:sha2"]
@@ -25,6 +25,10 @@ backend-sqlite = ["dep:rusqlite", "ijima-core/serde"]
 # tokens on Gr(4,8). Loads policy/policy.toml. When off, the store runs
 # in unauthenticated single-process mode (tests, embedded use).
 server-auth = ["dep:schubert", "dep:base64", "dep:ed25519-dalek", "dep:rand"]
+# Schubert geometric rate limiting (Phase 3.4). Per-principal token
+# buckets whose capacity scales with the capability's Schubert
+# intersection number (codimension). Composes with `server-auth`.
+rate-limit = ["server-auth", "http"]
 # The `ijima` CLI binary (clap). The `ijima token issue` subcommand.
 cli = ["dep:clap", "dep:reqwest"]
 # Candle (Hugging Face Rust ML) embedding backend — the IA-standard
@@ -42,6 +46,7 @@ async-trait = "0.1"
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "smallvec"], optional = true }
 candle-core = { git = "https://github.com/huggingface/candle", default-features = false, optional = true }
 candle-nn = { git = "https://github.com/huggingface/candle", default-features = false, optional = true }
 candle-transformers = { git = "https://github.com/huggingface/candle", default-features = false, optional = true }

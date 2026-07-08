@@ -100,12 +100,13 @@ struct IssueArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    ijima_server::server::init_tracing();
     match cli.command {
         Command::Token { action } => match action {
             TokenAction::Issue(args) => match run_issue(args) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("ijima: {e}");
+                    tracing::error!(error = %e, "token issue failed");
                     ExitCode::FAILURE
                 }
             },
@@ -118,16 +119,16 @@ fn main() -> ExitCode {
                 match rt {
                     Ok(rt) => match rt.block_on(run_doctrine_ingest(args)) {
                         Ok(n) => {
-                            eprintln!("ijima: ingested {n} doctrine entries");
+                            tracing::info!(entries = n, "doctrine ingested");
                             ExitCode::SUCCESS
                         }
                         Err(e) => {
-                            eprintln!("ijima: {e}");
+                            tracing::error!(error = %e, "doctrine ingest failed");
                             ExitCode::FAILURE
                         }
                     },
                     Err(e) => {
-                        eprintln!("ijima: runtime: {e}");
+                        tracing::error!(error = %e, "runtime build failed");
                         ExitCode::FAILURE
                     }
                 }
@@ -148,12 +149,12 @@ fn main() -> ExitCode {
                 Ok(rt) => match rt.block_on(ijima_server::server::serve(&config)) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
-                        eprintln!("ijima: {e}");
+                        tracing::error!(error = %e, "serve failed");
                         ExitCode::FAILURE
                     }
                 },
                 Err(e) => {
-                    eprintln!("ijima: runtime: {e}");
+                    tracing::error!(error = %e, "runtime build failed");
                     ExitCode::FAILURE
                 }
             }
@@ -198,13 +199,10 @@ fn validate_capability(cap: &str) -> ijima_core::Result<()> {
 async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
     let entries = ijima_server::doctrine::read_doctrine_dir(&args.dir)?;
     if entries.is_empty() {
-        eprintln!(
-            "ijima: no *.md doctrine files found in {}",
-            args.dir.display()
-        );
+        tracing::warn!(dir = %args.dir.display(), "no *.md doctrine files found");
         return Ok(0);
     }
-    eprintln!("ijima: ingesting {} doctrine entries...", entries.len());
+    tracing::info!(entries = entries.len(), "ingesting doctrine");
     let parsed: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
     ijima_server::doctrine::ingest_to_daemon(&args.url, &args.token, &parsed).await
 }

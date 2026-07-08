@@ -33,13 +33,30 @@ use crate::auth::{AuthenticatedPrincipal, IjimaAuth};
 #[derive(Debug, Clone)]
 pub struct AuthPrincipal(pub AuthenticatedPrincipal);
 
-/// Error returned when authentication fails; maps to HTTP 401.
+/// Error returned when authentication fails; maps to HTTP 401. When
+/// Schubert rate limiting is enabled and the principal's token bucket is
+/// exhausted, [`AuthRejection::RateLimited`] maps to HTTP 429.
 #[derive(Debug)]
-pub struct AuthError(pub &'static str);
+pub enum AuthRejection {
+    /// Authentication failed (missing/invalid token).
+    Unauthorized(&'static str),
+    /// Rate limit exceeded (Schubert `RateLimitExceeded`).
+    #[cfg(feature = "rate-limit")]
+    RateLimited,
+}
 
-impl IntoResponse for AuthError {
+/// Back-compat alias: the historical single-variant name.
+pub type AuthError = AuthRejection;
+
+impl IntoResponse for AuthRejection {
     fn into_response(self) -> axum::response::Response {
-        (StatusCode::UNAUTHORIZED, self.0).into_response()
+        match self {
+            AuthRejection::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg).into_response(),
+            #[cfg(feature = "rate-limit")]
+            AuthRejection::RateLimited => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded").into_response()
+            }
+        }
     }
 }
 
@@ -48,27 +65,38 @@ impl<S> FromRequestParts<S> for AuthPrincipal
 where
     S: Send + Sync,
 {
-    type Rejection = AuthError;
+    type Rejection = AuthRejection;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let Extension(auth): Extension<Arc<IjimaAuth>> =
             Extension::from_request_parts(parts, _state)
                 .await
-                .map_err(|_| AuthError("auth state not installed"))?;
+                .map_err(|_| AuthRejection::Unauthorized("auth state not installed"))?;
 
         let header = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
-            .ok_or(AuthError("missing Authorization header"))?;
+            .ok_or(AuthRejection::Unauthorized("missing Authorization header"))?;
 
         let token = header
             .strip_prefix("Bearer ")
-            .ok_or(AuthError("expected 'Bearer <token>'"))?;
+            .ok_or(AuthRejection::Unauthorized("expected 'Bearer <token>'"))?;
 
         let principal = auth
             .verify_bearer(token)
-            .map_err(|_| AuthError("invalid capability token"))?;
+            .map_err(|_| AuthRejection::Unauthorized("invalid capability token"))?;
+
+        // Schubert rate limiting: if a RateLimitState extension is
+        // installed, consume one token. The capability token drives
+        // authentication, authorization, AND throughput in one step.
+        #[cfg(feature = "rate-limit")]
+        {
+            if let Some(rl) = parts.extensions.get::<crate::rate_limit::RateLimitState>() {
+                crate::rate_limit::consume(rl, &principal)
+                    .map_err(|_| AuthRejection::RateLimited)?;
+            }
+        }
 
         Ok(AuthPrincipal(principal))
     }

@@ -55,8 +55,9 @@ pub fn app(
     kg: Arc<dyn KnowledgeGraph>,
     embedder: Option<Arc<dyn Embedder>>,
     redactor: Arc<Redactor>,
+    #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
 ) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/memories", post(store_memory))
@@ -85,7 +86,17 @@ pub fn app(
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
-        .layer(Extension(redactor))
+        .layer(Extension(redactor));
+
+    #[cfg(feature = "rate-limit")]
+    let router = match rate_limiter {
+        Some(rl) => router.layer(Extension(rl)),
+        None => router,
+    };
+    #[cfg(not(feature = "rate-limit"))]
+    let router = router;
+
+    router
 }
 
 // ---------- errors ----------
@@ -837,6 +848,8 @@ mod tests {
                 kg,
                 None,
                 Arc::new(crate::redaction::Redactor::new()),
+                #[cfg(feature = "rate-limit")]
+                None,
             ),
             auth,
         )
@@ -846,6 +859,27 @@ mod tests {
         format!(
             "Bearer {}",
             auth.issue_bearer(principal, cap).expect("issue")
+        )
+    }
+
+    /// Builds an app with a Schubert rate limiter (for rate-limit tests).
+    #[cfg(feature = "rate-limit")]
+    async fn app_with_rate_limit() -> (Router, Arc<IjimaAuth>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let rl = crate::rate_limit::make_rate_limiter(1.0, 1.0);
+        (
+            app(
+                auth.clone(),
+                store,
+                kg,
+                None,
+                Arc::new(crate::redaction::Redactor::new()),
+                Some(rl),
+            ),
+            auth,
         )
     }
 
@@ -1700,5 +1734,94 @@ mod tests {
         .unwrap();
         assert_eq!(body["memories_a"].as_array().unwrap().len(), 2);
         assert_eq!(body["memories_b"].as_array().unwrap().len(), 1);
+    }
+
+    #[cfg(feature = "rate-limit")]
+    #[tokio::test]
+    async fn rate_limit_returns_429_when_bucket_exhausted() {
+        let (app, auth) = app_with_rate_limit().await;
+        let read = bearer(&auth, "op", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[cfg(feature = "rate-limit")]
+    #[tokio::test]
+    async fn rate_limit_gives_write_holder_more_capacity() {
+        let (app, auth) = app_with_rate_limit().await;
+        let write = bearer(&auth, "op", MEMORY_WRITE);
+
+        for i in 0..2 {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/memories")
+                        .header("authorization", &write)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": format!("m{i}"),
+                                "content": format!("note {i}"),
+                                "project": "p",
+                                "topic": "t",
+                                "source": "Explicit",
+                                "harness": "Pi",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "write {i}");
+        }
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "m3",
+                            "content": "one too many",
+                            "project": "p",
+                            "topic": "t",
+                            "source": "Explicit",
+                            "harness": "Pi",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 }

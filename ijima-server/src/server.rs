@@ -21,6 +21,17 @@ pub struct DaemonConfig {
     pub port: u16,
 }
 
+/// Initializes structured logging (`tracing`) if not already installed.
+/// Idempotent — safe to call from both the daemon and CLI paths.
+pub fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_env("IJIMA_LOG").unwrap_or_else(|_| EnvFilter::new("ijima=info")),
+        )
+        .try_init();
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -41,6 +52,7 @@ impl Default for DaemonConfig {
 ///
 /// Returns [`IjimaError`] if the key, store, or socket cannot be opened.
 pub async fn serve(config: &DaemonConfig) -> Result<()> {
+    init_tracing();
     let key_path = key_store::default_key_path()?;
     let seed = key_store::load_or_create(&key_path)?;
     let auth = Arc::new(IjimaAuth::from_embedded_policy_with_seed(seed)?);
@@ -49,7 +61,7 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let embedder: Option<Arc<dyn ijima_core::Embedder>> = {
         let e: Arc<dyn ijima_core::Embedder> =
             Arc::new(crate::embeddings_candle::CandleEmbedder::from_env()?);
-        eprintln!("ijima: embedder = {} (dim via Embedder::dim)", e.model_id());
+        tracing::info!(model = %e.model_id(), "embedder loaded");
         Some(e)
     };
     #[cfg(not(feature = "embeddings-candle"))]
@@ -79,12 +91,38 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let store: Arc<dyn Store> = store_inner.clone();
     let kg: Arc<dyn ijima_core::KnowledgeGraph> = store_inner;
 
+    // Schubert geometric rate limiting (Phase 3.4). Configurable via env;
+    // disabled when IJIMA_RATE_DISABLE is set (tests, CI). Capacity scales
+    // with the capability's Schubert intersection number (codimension).
+    #[cfg(feature = "rate-limit")]
+    let rate_limiter: Option<crate::rate_limit::RateLimitState> =
+        if std::env::var_os("IJIMA_RATE_DISABLE").is_some() {
+            None
+        } else {
+            let base = std::env::var("IJIMA_RATE_BASE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10.0);
+            let mult = std::env::var("IJIMA_RATE_MULTIPLIER")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0);
+            tracing::info!(
+                base_tokens_per_second = base,
+                multiplier = mult,
+                "rate limiting enabled (Schubert intersection-number capacity)"
+            );
+            Some(crate::rate_limit::make_rate_limiter(base, mult))
+        };
+
     let app = api::app(
         auth,
         store,
         kg,
         embedder,
         std::sync::Arc::new(crate::redaction::Redactor::new()),
+        #[cfg(feature = "rate-limit")]
+        rate_limiter,
     );
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -93,7 +131,7 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
         .map_err(|e| IjimaError::Store {
             detail: format!("bind {addr}: {e}"),
         })?;
-    eprintln!("ijima: listening on http://{addr}");
+    tracing::info!(addr = %addr, "ijima listening");
     axum::serve(listener, app)
         .await
         .map_err(|e| IjimaError::Store {
