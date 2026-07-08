@@ -20,6 +20,9 @@
 //! | POST | `/memories/search` | `memory:read` | `search_memories` |
 //! | POST | `/sessions/:session_id/turns` | `session:ingest` | `ingest_turn` |
 //! | GET | `/sessions/:session_id/turns` | `memory:read` | `session_turns` |
+//! | POST | `/sessions` | `session:ingest` | `create_session` |
+//! | GET | `/sessions` | `memory:read` | `list_sessions` |
+//! | POST | `/sessions/:session_id/end` | `session:ingest` | `end_session` |
 
 use std::sync::Arc;
 
@@ -33,9 +36,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, SessionId, SessionTurn,
-    Store,
+    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, Session, SessionId,
+    SessionTurn, Store,
     capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
+    harness::Harness,
 };
 
 use crate::extractor::AuthPrincipal;
@@ -71,6 +75,8 @@ pub fn app(
             "/sessions/:session_id/turns",
             post(ingest_turn).get(session_turns),
         )
+        .route("/sessions", post(create_session).get(list_sessions))
+        .route("/sessions/:session_id/end", post(end_session))
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
@@ -640,6 +646,83 @@ async fn session_turns(
         .await
         .map_err(internal)?;
     Ok(Json(TurnsResponse { turns }))
+}
+
+/// Creates (or upserts) a session's metadata. `ended_at` is forced to
+/// `None` on create — use `POST /sessions/:id/end` to close a session.
+/// Auth: `session:ingest`. The session is stored in the caller's
+/// personal namespace (matching turn ingest).
+async fn create_session(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(mut session): Json<Session>,
+) -> Result<Json<IdResponse>, ApiError> {
+    if !principal.0.may(SESSION_INGEST) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    if session.started_at.is_empty() {
+        session.started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+    }
+    session.ended_at = None;
+    let id = store.create_session(&ns, session).await.map_err(internal)?;
+    Ok(Json(IdResponse { id: id.0 }))
+}
+
+#[derive(Deserialize)]
+struct SessionListQuery {
+    namespace: Option<String>,
+    /// Optional harness filter (wire string, e.g. `pi`).
+    harness: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Lists sessions in the effective namespace, newest first, optionally
+/// filtered by harness. Auth: `memory:read` (session metadata is
+/// read via the same capability as memory palace reads).
+async fn list_sessions(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<SessionListQuery>,
+) -> Result<Json<Vec<Session>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let harness = q.harness.as_deref().map(Harness::from_wire_str);
+    let limit = q.limit.unwrap_or(50).min(500);
+    let sessions = store
+        .list_sessions(&ns, harness.as_ref(), limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(sessions))
+}
+
+#[derive(Deserialize)]
+struct EndSessionRequest {
+    ended_at: String,
+}
+
+/// Marks a session as ended. Scoped to the caller's personal namespace.
+/// Auth: `session:ingest`.
+async fn end_session(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(session_id): Path<String>,
+    Json(req): Json<EndSessionRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(SESSION_INGEST) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    store
+        .end_session(&ns, &SessionId::new(session_id), req.ended_at)
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -1288,5 +1371,109 @@ mod tests {
         .unwrap();
         assert_eq!(body["memories"], 1);
         assert!(!body["namespaces"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sessions_create_list_end_via_http() {
+        let (app, auth) = app_with_store().await;
+        let ingest = bearer(&auth, "op", SESSION_INGEST);
+        let read = bearer(&auth, "op", MEMORY_READ);
+
+        // Create two sessions.
+        for (id, harness) in [("sess_a", "Pi"), ("sess_b", "Sakamoto")] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/sessions")
+                        .header("authorization", &ingest)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": id,
+                                "harness": harness,
+                                "channel": "thread-1",
+                                "started_at": "2026-07-05T10:00:00Z",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+
+        // List — both present.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+
+        // Filter by harness=pi.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions?harness=pi")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["harness"], "Pi");
+
+        // End sess_a.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/sess_a/end")
+                    .header("authorization", &ingest)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "ended_at": "2026-07-05T11:00:00Z" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // Verify ended_at is persisted.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/sessions?harness=pi")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(body[0]["ended_at"], "2026-07-05T11:00:00Z");
     }
 }

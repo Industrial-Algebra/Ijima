@@ -52,7 +52,7 @@
 #![forbid(unsafe_code)]
 
 use ijima_core::harness::Harness;
-use ijima_core::{IjimaError, Memory, Result, SessionTurn};
+use ijima_core::{IjimaError, Memory, Result, Session, SessionTurn};
 use serde::Deserialize;
 
 /// Configuration for connecting to an Ijima server.
@@ -301,6 +301,70 @@ impl Client {
         let resp = self.get(&path).await?;
         let r: TurnsResponse = decode(ok_status(resp).await?).await?;
         Ok(r.turns)
+    }
+
+    /// Creates or upserts a session's metadata (`POST /sessions`).
+    /// `ended_at` is forced to `None` server-side; use [`Self::end_session`]
+    /// to close a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn create_session(&self, session: Session) -> Result<String> {
+        let resp = self.post("/sessions", &session).await?;
+        let r: IdResponse = decode(ok_status(resp).await?).await?;
+        Ok(r.id)
+    }
+
+    /// Lists sessions in the effective namespace (`GET /sessions`), newest
+    /// first, optionally filtered by `harness` (wire string, e.g. `"pi"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn list_sessions(
+        &self,
+        namespace: Option<&str>,
+        harness: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Session>> {
+        let mut params: Vec<String> = Vec::new();
+        if let Some(ns) = namespace {
+            params.push(format!("namespace={ns}"));
+        }
+        if let Some(h) = harness {
+            params.push(format!("harness={h}"));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        let path = if params.is_empty() {
+            "/sessions".to_string()
+        } else {
+            format!("/sessions?{}", params.join("&"))
+        };
+        let resp = self.get(&path).await?;
+        let sessions: Vec<Session> = decode(ok_status(resp).await?).await?;
+        Ok(sessions)
+    }
+
+    /// Marks a session as ended (`POST /sessions/:id/end`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn end_session(&self, session_id: &str, ended_at: &str) -> Result<()> {
+        let resp = self
+            .post(
+                &format!("/sessions/{session_id}/end"),
+                &serde_json::json!({ "ended_at": ended_at }),
+            )
+            .await?;
+        ok_status(resp).await?;
+        Ok(())
     }
 
     /// Composes the session-start context (`GET /wakeup`): L0 identity +

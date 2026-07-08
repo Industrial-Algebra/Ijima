@@ -29,8 +29,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ijima_core::{
     Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph, Memory,
-    MemoryId, NamespaceCount, NamespaceId, Result, SessionId, SessionTurn, Store, StoreStats,
-    Triple, embeddings::Embedder, harness::Harness, memory::MemorySource,
+    MemoryId, NamespaceCount, NamespaceId, Result, Session, SessionId, SessionTurn, Store,
+    StoreStats, Triple, embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -42,6 +42,7 @@ const SURREAL_DB: &str = "core";
 
 const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
+const SESSIONS_TABLE: &str = "sessions";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -225,6 +226,42 @@ struct SessionTurnRecord {
     content: String,
     timestamp: String,
     namespace: String,
+}
+
+/// Stored row for a session's metadata (Phase 2.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionRecord {
+    session_id: String,
+    harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    channel: Option<String>,
+    started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ended_at: Option<String>,
+    namespace: String,
+}
+
+impl SessionRecord {
+    fn from_session(session: &Session, ns: &NamespaceId) -> Self {
+        Self {
+            session_id: session.id.0.clone(),
+            harness: session.harness.as_wire_str().to_string(),
+            channel: session.channel.clone(),
+            started_at: session.started_at.clone(),
+            ended_at: session.ended_at.clone(),
+            namespace: ns.as_str().to_string(),
+        }
+    }
+
+    fn into_session(self) -> Session {
+        Session {
+            id: SessionId(self.session_id),
+            harness: Harness::from_wire_str(&self.harness),
+            channel: self.channel,
+            started_at: self.started_at,
+            ended_at: self.ended_at,
+        }
+    }
 }
 
 fn store_err(e: surrealdb::Error) -> IjimaError {
@@ -452,6 +489,72 @@ impl Store for SurrealStore {
                 timestamp: r.timestamp,
             })
             .collect())
+    }
+
+    async fn create_session(&self, ns: &NamespaceId, session: Session) -> Result<SessionId> {
+        let id_str = session.id.0.clone();
+        let record = SessionRecord::from_session(&session, ns);
+        // Upsert: create if absent, replace metadata if present. Session
+        // ids are globally unique (same convention as memory ids).
+        let _: Option<SessionRecord> = self
+            .db
+            .upsert((SESSIONS_TABLE, id_str.clone()))
+            .content(record)
+            .await
+            .map_err(store_err)?;
+        Ok(session.id)
+    }
+
+    async fn list_sessions(
+        &self,
+        ns: &NamespaceId,
+        harness: Option<&Harness>,
+        limit: usize,
+    ) -> Result<Vec<Session>> {
+        let mut query = format!(
+            "SELECT session_id, harness, channel, started_at, ended_at, namespace
+             FROM {SESSIONS_TABLE}
+             WHERE namespace = $ns"
+        );
+        if harness.is_some() {
+            query.push_str(" AND harness = $harness");
+        }
+        query.push_str(" ORDER BY started_at DESC LIMIT $lim");
+        let mut q = self
+            .db
+            .query(query)
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("lim", limit as i64));
+        if let Some(h) = harness {
+            q = q.bind(("harness", h.as_wire_str().to_string()));
+        }
+        let res = q.await.map_err(store_err)?;
+        let mut res = res;
+        let rows: Vec<SessionRecord> = res.take(0).map_err(store_err)?;
+        Ok(rows.into_iter().map(SessionRecord::into_session).collect())
+    }
+
+    async fn end_session(
+        &self,
+        ns: &NamespaceId,
+        session: &SessionId,
+        ended_at: String,
+    ) -> Result<()> {
+        // Scoped by namespace + session id (safety: a principal can only
+        // end sessions in their own namespace).
+        let _ = self
+            .db
+            .query(format!(
+                "UPDATE {SESSIONS_TABLE}
+                 SET ended_at = $ended
+                 WHERE namespace = $ns AND session_id = $sid"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("sid", session.0.clone()))
+            .bind(("ended", ended_at))
+            .await
+            .map_err(store_err)?;
+        Ok(())
     }
 }
 
@@ -921,6 +1024,83 @@ mod tests {
         assert_eq!(last_two.len(), 2);
         assert_eq!(last_two[1].content, "turn 4");
         assert!(last_two.iter().all(|t| t.content != "intruder"));
+    }
+
+    #[tokio::test]
+    async fn session_metadata_create_list_end_round_trip() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_sessions");
+
+        // Create two sessions (different harnesses).
+        let s1 = Session {
+            id: SessionId::new("sess_a"),
+            harness: Harness::Pi,
+            channel: Some("thread-1".into()),
+            started_at: "2026-07-05T10:00:00Z".into(),
+            ended_at: None,
+        };
+        let s2 = Session {
+            id: SessionId::new("sess_b"),
+            harness: Harness::Sakamoto,
+            channel: None,
+            started_at: "2026-07-05T12:00:00Z".into(),
+            ended_at: None,
+        };
+        store
+            .create_session(&ns, s1.clone())
+            .await
+            .expect("create s1");
+        store
+            .create_session(&ns, s2.clone())
+            .await
+            .expect("create s2");
+
+        // List all — newest first (s2 has later started_at).
+        let all = store.list_sessions(&ns, None, 10).await.expect("list");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].id.as_str(), "sess_b");
+        assert_eq!(all[1].id.as_str(), "sess_a");
+        assert!(all[0].ended_at.is_none());
+
+        // Filter by harness.
+        let pi_only = store
+            .list_sessions(&ns, Some(&Harness::Pi), 10)
+            .await
+            .expect("list pi");
+        assert_eq!(pi_only.len(), 1);
+        assert_eq!(pi_only[0].id.as_str(), "sess_a");
+
+        // End s1.
+        store
+            .end_session(
+                &ns,
+                &SessionId::new("sess_a"),
+                "2026-07-05T11:30:00Z".into(),
+            )
+            .await
+            .expect("end");
+        let after_end = store.list_sessions(&ns, None, 10).await.expect("list");
+        let s1_row = after_end
+            .iter()
+            .find(|s| s.id.as_str() == "sess_a")
+            .unwrap();
+        assert_eq!(s1_row.ended_at.as_deref(), Some("2026-07-05T11:30:00Z"));
+
+        // Upsert (re-create s1) preserves metadata shape.
+        store.create_session(&ns, s1.clone()).await.expect("upsert");
+        let upserted = store
+            .list_sessions(&ns, Some(&Harness::Pi), 10)
+            .await
+            .expect("list");
+        assert_eq!(upserted.len(), 1);
+
+        // Namespace isolation: sessions in another namespace are invisible.
+        let other = NamespaceId::new("ns_other");
+        let cross = store
+            .list_sessions(&other, None, 10)
+            .await
+            .expect("list other");
+        assert!(cross.is_empty());
     }
 
     // ===== Vector search =====

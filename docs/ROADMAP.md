@@ -90,12 +90,17 @@ reference.
 
 **Effort**: Medium. **Branch**: `feature/dedup`.
 
-### 2.3 Session-context repository completion
+### 2.3 Session-context repository completion ✅
 
 The `Session` struct (harness, channel, started/ended) **isn't stored**.
 Add: `POST /sessions` (create w/ metadata), `GET /sessions` (list by
 harness/namespace), session-end signaling. Completes the repository the
 miner will read from.
+
+**Done** (`feature/sessions`): `Store::create_session` / `list_sessions`
+(with optional harness filter) / `end_session`; SurrealDB `sessions`
+table (upsert by id); `POST /sessions`, `GET /sessions?harness=&namespace=&limit=`,
+`POST /sessions/:id/end`; client methods; `Harness::from_wire_str`.
 
 **Effort**: Medium. **Branch**: `feature/sessions`.
 

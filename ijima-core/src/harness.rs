@@ -49,6 +49,22 @@ impl Harness {
             Harness::Other => "other",
         }
     }
+
+    /// Parses a wire string back into a [`Harness`]. Unknown strings
+    /// map to [`Harness::Other`] so records from a future harness don't
+    /// break deserialization.
+    pub fn from_wire_str(s: &str) -> Self {
+        match s {
+            "dominic" => Harness::Dominic,
+            "wallace" => Harness::Wallace,
+            "sakamoto" => Harness::Sakamoto,
+            "tsume" => Harness::Tsume,
+            "pi" => Harness::Pi,
+            "opencode" => Harness::Opencode,
+            "proserpina" => Harness::Proserpina,
+            _ => Harness::Other,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -75,5 +91,22 @@ mod tests {
                 "wire string for {h:?} must be lowercase"
             );
         }
+    }
+
+    #[test]
+    fn from_wire_str_round_trips_known_harnesses() {
+        for h in [
+            Harness::Dominic,
+            Harness::Wallace,
+            Harness::Sakamoto,
+            Harness::Tsume,
+            Harness::Pi,
+            Harness::Opencode,
+            Harness::Proserpina,
+        ] {
+            assert_eq!(Harness::from_wire_str(h.as_wire_str()), h);
+        }
+        // Unknown strings fall back to Other (forward-compat).
+        assert_eq!(Harness::from_wire_str("future-harness"), Harness::Other);
     }
 }

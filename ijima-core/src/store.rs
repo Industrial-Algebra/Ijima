@@ -15,7 +15,10 @@
 
 use async_trait::async_trait;
 
-use crate::{Embedding, Memory, MemoryId, NamespaceId, Result, SessionId, SessionTurn};
+use crate::{
+    Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
+    harness::Harness,
+};
 
 /// Global memory-palace statistics (across all namespaces).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -93,4 +96,27 @@ pub trait Store: Send + Sync {
         session: &SessionId,
         limit: usize,
     ) -> Result<Vec<SessionTurn>>;
+
+    /// Creates or updates a session's metadata under `ns` (upsert by
+    /// id). Call when a session starts; turns reference the session id.
+    /// `ended_at` is set via [`Self::end_session`].
+    async fn create_session(&self, ns: &NamespaceId, session: Session) -> Result<SessionId>;
+
+    /// Lists up to `limit` sessions in `ns`, newest first, optionally
+    /// filtered by `harness`.
+    async fn list_sessions(
+        &self,
+        ns: &NamespaceId,
+        harness: Option<&Harness>,
+        limit: usize,
+    ) -> Result<Vec<Session>>;
+
+    /// Marks a session as ended (sets `ended_at`). Scoped by `ns` so a
+    /// principal can only end sessions in their own namespace.
+    async fn end_session(
+        &self,
+        ns: &NamespaceId,
+        session: &SessionId,
+        ended_at: String,
+    ) -> Result<()>;
 }
