@@ -108,15 +108,22 @@ table (upsert by id); `POST /sessions`, `GET /sessions?harness=&namespace=&limit
 
 ## Phase 3 — Nice-to-haves (organizational + operational)
 
-### 3.1 Palace graph & tunnels
+### 3.1 Palace graph & tunnels ✅
 
 `getPalaceGraph`, `traverseTunnel` — cross-project topic connections.
 *"What connects these two projects?"* Powerful for discovery, not
 essential for v1.
 
-### 3.2 Rooms & taxonomy browsing
+**Done** (`feature/palace-organization`): `Store::palace_graph` +
+`traverse_tunnel`; `GET /palace/graph`, `GET /palace/tunnel`.
+
+### 3.2 Rooms & taxonomy browsing ✅
 
 `listRooms`, `getTaxonomy` — projects/topics with counts. Navigation.
+
+**Done** (`feature/palace-organization`): `Store::list_rooms` +
+`taxonomy`; `GET /rooms`, `GET /taxonomy`. All four palace-organization
+endpoints are namespace-scoped reads (`memory:read` + `resolve_ns`).
 
 ### 3.3 Diaries
 

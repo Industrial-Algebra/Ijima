@@ -36,8 +36,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, Session, SessionId,
-    SessionTurn, Store,
+    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, PalaceGraph,
+    ProjectTaxon, Room, Session, SessionId, SessionTurn, Store, TunnelTraversal,
     capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
     harness::Harness,
 };
@@ -77,6 +77,10 @@ pub fn app(
         )
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:session_id/end", post(end_session))
+        .route("/rooms", get(list_rooms))
+        .route("/taxonomy", get(taxonomy))
+        .route("/palace/graph", get(palace_graph))
+        .route("/palace/tunnel", get(traverse_tunnel))
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
@@ -723,6 +727,93 @@ async fn end_session(
         .await
         .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- palace organization (Phase 3.1 + 3.2) ----------
+
+#[derive(Deserialize)]
+struct RoomsQuery {
+    namespace: Option<String>,
+    /// Optional project filter.
+    project: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Lists rooms (topic cells) in the effective namespace, optionally
+/// filtered by project. Auth: `memory:read`.
+async fn list_rooms(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<RoomsQuery>,
+) -> Result<Json<Vec<Room>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(100).min(1000);
+    let rooms = store
+        .list_rooms(&ns, q.project.as_deref(), limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(rooms))
+}
+
+/// Full project → topic → count taxonomy of the effective namespace.
+/// Auth: `memory:read`.
+async fn taxonomy(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<Vec<ProjectTaxon>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let taxons = store.taxonomy(&ns).await.map_err(internal)?;
+    Ok(Json(taxons))
+}
+
+/// The palace graph: projects as nodes, shared-topic tunnels as edges.
+/// Auth: `memory:read`.
+async fn palace_graph(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<PalaceGraph>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let graph = store.palace_graph(&ns).await.map_err(internal)?;
+    Ok(Json(graph))
+}
+
+#[derive(Deserialize)]
+struct TunnelQuery {
+    namespace: Option<String>,
+    topic: String,
+    project_a: String,
+    project_b: String,
+    limit: Option<usize>,
+}
+
+/// Traverses a tunnel: returns memories from both projects on the shared
+/// topic. Auth: `memory:read`.
+async fn traverse_tunnel(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<TunnelQuery>,
+) -> Result<Json<TunnelTraversal>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(20).min(200);
+    let traversal = store
+        .traverse_tunnel(&ns, &q.topic, &q.project_a, &q.project_b, limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(traversal))
 }
 
 #[cfg(test)]
@@ -1418,9 +1509,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let arr = body.as_array().unwrap();
         assert_eq!(arr.len(), 2);
 
@@ -1436,9 +1530,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body.as_array().unwrap().len(), 1);
         assert_eq!(body[0]["harness"], "Pi");
 
@@ -1471,9 +1568,137 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body[0]["ended_at"], "2026-07-05T11:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn palace_routes_rooms_graph_tunnel() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "op", MEMORY_WRITE);
+        let read = bearer(&auth, "op", MEMORY_READ);
+
+        // Seed two projects sharing the "auth" topic.
+        for (id, project, topic) in [
+            ("m1", "ijima", "auth"),
+            ("m2", "ijima", "auth"),
+            ("m3", "karpal", "auth"),
+            ("m4", "karpal", "build"),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/memories")
+                        .header("authorization", &write)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": id,
+                                "content": format!("note {id}"),
+                                "project": project,
+                                "topic": topic,
+                                "source": "Explicit",
+                                "harness": "Pi",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "seed {id}");
+        }
+
+        // GET /rooms — top room is ijima/auth (count 2).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rooms")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let rooms = body.as_array().unwrap();
+        assert!(rooms.len() >= 3);
+        assert_eq!(rooms[0]["count"], 2);
+
+        // GET /taxonomy — two projects.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/taxonomy")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 2);
+
+        // GET /palace/graph — has the auth tunnel.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/palace/graph")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body["projects"].as_array().unwrap().len() >= 2);
+        assert!(!body["tunnels"].as_array().unwrap().is_empty());
+
+        // GET /palace/tunnel — traverse the auth tunnel.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/palace/tunnel?topic=auth&project_a=ijima&project_b=karpal")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["memories_a"].as_array().unwrap().len(), 2);
+        assert_eq!(body["memories_b"].as_array().unwrap().len(), 1);
     }
 }
