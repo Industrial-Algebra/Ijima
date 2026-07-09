@@ -16,8 +16,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
-    harness::Harness,
+    AcceptedExtraction, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction, Result,
+    Session, SessionId, SessionTurn, harness::Harness,
 };
 
 /// Global memory-palace statistics (across all namespaces).
@@ -119,4 +119,29 @@ pub trait Store: Send + Sync {
         session: &SessionId,
         ended_at: String,
     ) -> Result<()>;
+
+    // ===== Mining review queue (ADR M2, M3) =====
+
+    /// Stages a PendingReview extraction in the per-namespace queue.
+    async fn enqueue_extraction(
+        &self,
+        ns: &NamespaceId,
+        memory: Memory,
+        confidence: f32,
+    ) -> Result<String>;
+
+    /// Lists pending extractions in `ns`, newest first.
+    async fn list_pending(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<QueuedExtraction>>;
+
+    /// Accepts a queued extraction: promotes it to the palace
+    /// (`store_memory`) and removes it from the queue. Returns the promoted
+    /// memory id.
+    async fn accept_extraction(
+        &self,
+        ns: &NamespaceId,
+        queue_id: &str,
+    ) -> Result<AcceptedExtraction>;
+
+    /// Rejects a queued extraction: drops it from the queue without promoting.
+    async fn reject_extraction(&self, ns: &NamespaceId, queue_id: &str) -> Result<()>;
 }

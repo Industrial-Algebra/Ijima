@@ -23,6 +23,9 @@
 //! | POST | `/sessions` | `session:ingest` | `create_session` |
 //! | GET | `/sessions` | `memory:read` | `list_sessions` |
 //! | POST | `/sessions/:session_id/end` | `session:ingest` | `end_session` |
+//! | GET | `/mining/queue` | `mining:review` | `list_pending` |
+//! | POST | `/mining/queue/:id/accept` | `mining:review` | `accept_extraction` |
+//! | POST | `/mining/queue/:id/reject` | `mining:review` | `reject_extraction` |
 
 use std::sync::Arc;
 
@@ -36,9 +39,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, Session, SessionId,
-    SessionTurn, Store,
-    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
+    AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
+    QueuedExtraction, Session, SessionId, SessionTurn, Store,
+    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST},
     harness::Harness,
 };
 
@@ -77,6 +80,9 @@ pub fn app(
         )
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:session_id/end", post(end_session))
+        .route("/mining/queue", get(list_pending))
+        .route("/mining/queue/:id/accept", post(accept_extraction))
+        .route("/mining/queue/:id/reject", post(reject_extraction))
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
@@ -722,6 +728,54 @@ async fn end_session(
         .end_session(&ns, &SessionId::new(session_id), req.ended_at)
         .await
         .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- mining review queue (ADR M2, M3) ----------
+
+/// Lists pending mining extractions in the effective namespace, newest
+/// first. Auth: `mining:review`.
+async fn list_pending(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<Vec<QueuedExtraction>>, ApiError> {
+    if !principal.0.may(MINING_REVIEW) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    let pending = store.list_pending(&ns, limit).await.map_err(internal)?;
+    Ok(Json(pending))
+}
+
+/// Accepts a queued extraction: promotes it to the palace and removes it
+/// from the queue. Auth: `mining:review`.
+async fn accept_extraction(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(id): Path<String>,
+) -> Result<Json<AcceptedExtraction>, ApiError> {
+    if !principal.0.may(MINING_REVIEW) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    let accepted = store.accept_extraction(&ns, &id).await.map_err(internal)?;
+    Ok(Json(accepted))
+}
+
+/// Rejects a queued extraction: drops it without promoting. Auth:
+/// `mining:review`. Returns 204.
+async fn reject_extraction(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(MINING_REVIEW) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    store.reject_extraction(&ns, &id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1418,9 +1472,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let arr = body.as_array().unwrap();
         assert_eq!(arr.len(), 2);
 
@@ -1436,9 +1493,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body.as_array().unwrap().len(), 1);
         assert_eq!(body[0]["harness"], "Pi");
 
@@ -1471,9 +1531,53 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body[0]["ended_at"], "2026-07-05T11:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn mining_queue_requires_review_capability() {
+        let (app, auth) = app_with_store().await;
+        let reviewer = bearer(&auth, "op", MINING_REVIEW);
+        let reader = bearer(&auth, "op", MEMORY_READ);
+
+        // A memory:read holder cannot list the queue.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/mining/queue")
+                    .header("authorization", &reader)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // A mining:review holder can list (empty queue).
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mining/queue")
+                    .header("authorization", &reviewer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(body.as_array().unwrap().is_empty());
     }
 }
