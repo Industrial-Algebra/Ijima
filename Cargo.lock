@@ -2633,6 +2633,7 @@ dependencies = [
  "ed25519-dalek",
  "hf-hub",
  "ijima-core",
+ "ijima-miner",
  "rand 0.8.6",
  "regex",
  "reqwest",

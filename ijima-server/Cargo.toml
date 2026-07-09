@@ -32,9 +32,13 @@ cli = ["dep:clap", "dep:reqwest"]
 # acceleration is a future opt-in (requires a CUDA toolchain).
 # When this is off, the store cannot embed new memories at write time.
 embeddings-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "ijima-core/serde"]
+# Mining trigger orchestration: fetch session turns, run the extraction
+# engine, and ingest (Auto → palace, PendingReview → review queue).
+mining = ["dep:ijima-miner", "backend-surreal"]
 
 [dependencies]
 ijima-core = { workspace = true }
+ijima-miner = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

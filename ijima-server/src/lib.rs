@@ -73,5 +73,9 @@ pub mod redaction;
 /// Doctrine seed-pack format parser + ingest client (D9).
 pub mod doctrine;
 
+/// Mining trigger orchestration (ADR M1/M3/M7). Behind `mining`.
+#[cfg(feature = "mining")]
+pub mod mining_pipeline;
+
 #[cfg(feature = "http")]
 pub mod server;
