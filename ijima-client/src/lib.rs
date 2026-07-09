@@ -53,8 +53,8 @@
 
 use ijima_core::harness::Harness;
 use ijima_core::{
-    IjimaError, Memory, PalaceGraph, ProjectTaxon, Result, Room, Session, SessionTurn,
-    TunnelTraversal,
+    DiaryEntry, IjimaError, Memory, PalaceGraph, ProjectTaxon, Result, Room, Session,
+    SessionTurn, TunnelTraversal,
 };
 use serde::Deserialize;
 
@@ -368,6 +368,36 @@ impl Client {
             .await?;
         ok_status(resp).await?;
         Ok(())
+    }
+
+    /// Appends a diary entry (`POST /diaries`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn write_diary(&self, entry: DiaryEntry) -> Result<()> {
+        let resp = self.post("/diaries", &entry).await?;
+        ok_status(resp).await?;
+        Ok(())
+    }
+
+    /// Reads an agent's diary (`GET /diaries/:agent`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn read_diary(
+        &self,
+        agent: &str,
+        namespace: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<DiaryEntry>> {
+        let path = build_path(&format!("/diaries/{agent}"), namespace, limit);
+        let resp = self.get(&path).await?;
+        let entries: Vec<DiaryEntry> = decode(ok_status(resp).await?).await?;
+        Ok(entries)
     }
 
     /// Lists rooms (topic cells) in the effective namespace

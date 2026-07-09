@@ -16,7 +16,7 @@
 use async_trait::async_trait;
 
 use crate::{
-    Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
+    DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
     harness::Harness,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
@@ -150,4 +150,18 @@ pub trait Store: Send + Sync {
         session: &SessionId,
         ended_at: String,
     ) -> Result<()>;
+
+    // ===== Diaries (Phase 3.3) =====
+
+    /// Appends a diary entry under `ns`.
+    async fn write_diary(&self, ns: &NamespaceId, entry: DiaryEntry) -> Result<()>;
+
+    /// Returns the last `limit` entries of `agent`'s diary under `ns`, in
+    /// chronological order.
+    async fn read_diary(
+        &self,
+        ns: &NamespaceId,
+        agent: &str,
+        limit: usize,
+    ) -> Result<Vec<DiaryEntry>>;
 }

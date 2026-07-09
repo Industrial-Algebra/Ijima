@@ -28,9 +28,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph, Memory,
-    MemoryId, NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, Result, Room, Session,
-    SessionId, SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal,
+    DiaryEntry, Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph,
+    Memory, MemoryId, NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, Result, Room,
+    Session, SessionId, SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal,
     embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ const SURREAL_DB: &str = "core";
 const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
+const DIARY_TABLE: &str = "diaries";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -281,6 +282,42 @@ struct SessionTurnRecord {
     content: String,
     timestamp: String,
     namespace: String,
+}
+
+/// Stored row for a diary entry (Phase 3.3). `ts` is an internal
+/// epoch-millis field for correct numeric ORDER BY (string timestamps
+/// don't sort lexicographically across formats).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiaryRecord {
+    agent: String,
+    content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    timestamp: String,
+    ts: i64,
+    namespace: String,
+}
+
+impl DiaryRecord {
+    fn from_entry(entry: &ijima_core::DiaryEntry, ns: &NamespaceId, now_ms: i64) -> Self {
+        Self {
+            agent: entry.agent.clone(),
+            content: entry.content.clone(),
+            topic: entry.topic.clone(),
+            timestamp: entry.timestamp.clone(),
+            ts: now_ms,
+            namespace: ns.as_str().to_string(),
+        }
+    }
+
+    fn into_entry(self) -> ijima_core::DiaryEntry {
+        ijima_core::DiaryEntry {
+            agent: self.agent,
+            content: self.content,
+            topic: self.topic,
+            timestamp: self.timestamp,
+        }
+    }
 }
 
 /// Stored row for a session's metadata (Phase 2.3).
@@ -726,6 +763,45 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         Ok(())
+    }
+
+    async fn write_diary(&self, ns: &NamespaceId, entry: DiaryEntry) -> Result<()> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let record = DiaryRecord::from_entry(&entry, ns, now_ms);
+        let _: Option<DiaryRecord> = self
+            .db
+            .create(DIARY_TABLE)
+            .content(record)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn read_diary(
+        &self,
+        ns: &NamespaceId,
+        agent: &str,
+        limit: usize,
+    ) -> Result<Vec<DiaryEntry>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT agent, content, topic, timestamp, ts, namespace
+                 FROM {DIARY_TABLE}
+                 WHERE namespace = $ns AND agent = $agent
+                 ORDER BY ts DESC LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("agent", agent.to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        let mut records: Vec<DiaryRecord> = result.take(0).map_err(store_err)?;
+        records.reverse(); // chronological (DESC → reverse)
+        Ok(records.into_iter().map(DiaryRecord::into_entry).collect())
     }
 }
 
@@ -1271,6 +1347,48 @@ mod tests {
             .list_sessions(&other, None, 10)
             .await
             .expect("list other");
+        assert!(cross.is_empty());
+    }
+
+    // ===== Diaries =====
+
+    #[tokio::test]
+    async fn diaries_write_appends_and_reads_chronologically() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_diaries");
+
+        let e1 = DiaryEntry {
+            agent: "claude".into(),
+            content: "first entry".into(),
+            topic: None,
+            timestamp: String::new(),
+        };
+        let e2 = DiaryEntry {
+            agent: "claude".into(),
+            content: "second entry".into(),
+            topic: Some("reflection".into()),
+            timestamp: "2026-07-05T12:00:00Z".into(),
+        };
+        store.write_diary(&ns, e1).await.expect("write1");
+        store.write_diary(&ns, e2).await.expect("write2");
+
+        let entries = store.read_diary(&ns, "claude", 10).await.expect("read");
+        assert_eq!(entries.len(), 2);
+        // chronological: e1 before e2
+        assert_eq!(entries[0].content, "first entry");
+        assert_eq!(entries[1].content, "second entry");
+        assert_eq!(entries[1].topic.as_deref(), Some("reflection"));
+
+        // Agent isolation: different agent sees nothing.
+        let other = store.read_diary(&ns, "pi", 10).await.expect("read");
+        assert!(other.is_empty());
+
+        // Namespace isolation: different ns sees nothing.
+        let other_ns = NamespaceId::new("ns_other");
+        let cross = store
+            .read_diary(&other_ns, "claude", 10)
+            .await
+            .expect("read");
         assert!(cross.is_empty());
     }
 
