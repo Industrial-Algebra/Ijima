@@ -167,6 +167,20 @@ impl SurrealStore {
         let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
         Ok(records.into_iter().map(|r| r.into_memory()).collect())
     }
+
+    /// Exports the entire store as a SurrealDB SQL dump to `path`.
+    /// Requires a persistent backend (SurrealKv); in-memory stores do not
+    /// support Backup.
+    pub async fn export_to(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        self.db
+            .export(path.as_ref())
+            .await
+            .map_err(|e| IjimaError::Store {
+                detail: format!("export: {e}"),
+            })?;
+        Ok(())
+    }
+    }
 }
 
 async fn new_mem() -> Result<Surreal<Db>> {
@@ -1779,5 +1793,33 @@ mod tests {
             .expect("recall")
             .expect("memory must survive reopen");
         assert_eq!(got.content, "survives restart");
+    }
+
+    #[tokio::test]
+    async fn export_to_writes_sql_dump_to_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ijima-export-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let db_path = dir.join("ijima.db");
+        let store = crate::SurrealStore::open_persistent(&db_path)
+            .await
+            .expect("open");
+        let ns = NamespaceId::new("ns_export");
+        store
+            .store_memory(&ns, sample_memory("mem_x", "export this memory"))
+            .await
+            .expect("store");
+
+        let out = dir.join("dump.surql");
+        store.export_to(&out).await.expect("export");
+        let contents = std::fs::read_to_string(&out).expect("read");
+        assert!(contents.contains("export this memory"));
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

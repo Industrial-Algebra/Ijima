@@ -41,6 +41,16 @@ enum Command {
     },
     /// Run the HTTP daemon.
     Serve(ServeArgs),
+    /// Export the SurrealDB store as a SQL dump.
+    Export(ExportArgs),
+}
+
+/// Arguments to `ijima export`.
+#[derive(Args, Debug)]
+struct ExportArgs {
+    /// Output path for the SurrealDB SQL dump.
+    #[arg(long, short)]
+    out: std::path::PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -159,6 +169,24 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Command::Export(args) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => match rt.block_on(run_export(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("ijima: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    eprintln!("ijima: runtime: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -205,4 +233,23 @@ async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
     tracing::info!(entries = entries.len(), "ingesting doctrine");
     let parsed: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
     ijima_server::doctrine::ingest_to_daemon(&args.url, &args.token, &parsed).await
+}
+
+async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
+    let data_dir = std::env::var("IJIMA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".ijima"))
+                .ok_or_else(|| {
+                    ijima_core::IjimaError::invalid_input(
+                        "cannot resolve data dir: set IJIMA_DIR or HOME",
+                    )
+                })
+        })?;
+    let db_path = data_dir.join("ijima.db");
+    let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
+    store.export_to(&args.out).await?;
+    eprintln!("ijima: exported to {}", args.out.display());
+    Ok(())
 }
