@@ -46,6 +46,7 @@ pub mod harness;
 pub mod knowledge;
 pub mod memory;
 pub mod namespace;
+pub mod repo;
 pub mod session;
 pub mod store;
 
@@ -54,6 +55,7 @@ pub use error::IjimaError;
 pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Triple};
 pub use memory::{Memory, MemoryId, MemorySource};
 pub use namespace::{Namespace, NamespaceId, NamespaceKind};
+pub use repo::RepoDirectory;
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
 pub use store::{NamespaceCount, Store, StoreStats};
 

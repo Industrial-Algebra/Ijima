@@ -16,8 +16,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
-    harness::Harness,
+    Embedding, Memory, MemoryId, NamespaceId, RepoDirectory, Result, Session, SessionId,
+    SessionTurn, harness::Harness,
 };
 
 /// Global memory-palace statistics (across all namespaces).
@@ -119,4 +119,19 @@ pub trait Store: Send + Sync {
         session: &SessionId,
         ended_at: String,
     ) -> Result<()>;
+
+    // ===== Context Mapper (global repo directory) =====
+
+    /// Registers or updates a repo in the global registry (upsert by name).
+    async fn register_repo(&self, repo: RepoDirectory) -> Result<()>;
+
+    /// Forward lookup by canonical name.
+    async fn lookup_repo(&self, name: &str) -> Result<Option<RepoDirectory>>;
+
+    /// Lists all registered repos (the canonical ecosystem roster).
+    async fn list_repos(&self) -> Result<Vec<RepoDirectory>>;
+
+    /// Reverse lookup: resolves a filesystem path to its repo via
+    /// longest-prefix match (so a CWD *inside* a repo resolves to it).
+    async fn resolve_path(&self, path: &str) -> Result<Option<RepoDirectory>>;
 }

@@ -23,6 +23,10 @@
 //! | POST | `/sessions` | `session:ingest` | `create_session` |
 //! | GET | `/sessions` | `memory:read` | `list_sessions` |
 //! | POST | `/sessions/:session_id/end` | `session:ingest` | `end_session` |
+//! | POST | `/repos` | `admin` | `register_repo` |
+//! | GET | `/repos` | `memory:read` | `list_repos` |
+//! | GET | `/repos/resolve?path=` | `memory:read` | `resolve_path` |
+//! | GET | `/repos/:name` | `memory:read` | `lookup_repo` |
 
 use std::sync::Arc;
 
@@ -36,8 +40,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, Session, SessionId,
-    SessionTurn, Store,
+    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, RepoDirectory, Session,
+    SessionId, SessionTurn, Store,
     capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
     harness::Harness,
 };
@@ -77,6 +81,9 @@ pub fn app(
         )
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:session_id/end", post(end_session))
+        .route("/repos", post(register_repo).get(list_repos))
+        .route("/repos/resolve", get(resolve_path))
+        .route("/repos/:name", get(lookup_repo))
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
@@ -723,6 +730,68 @@ async fn end_session(
         .await
         .map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- Context Mapper (global repo directory) ----------
+
+/// Registers or updates a repo in the global registry. Auth: `admin`
+/// (the roster is the canonical ecosystem list — registration is privileged).
+/// The path is normalized server-side.
+async fn register_repo(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(mut repo): Json<RepoDirectory>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    repo.path = ijima_core::repo::normalize_path(&repo.path);
+    store.register_repo(repo).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Lists all registered repos (the ecosystem roster). Auth: `memory:read`.
+async fn list_repos(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+) -> Result<Json<Vec<RepoDirectory>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let repos = store.list_repos().await.map_err(internal)?;
+    Ok(Json(repos))
+}
+
+/// Forward lookup by name. Auth: `memory:read`.
+async fn lookup_repo(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(name): Path<String>,
+) -> Result<Json<Option<RepoDirectory>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let repo = store.lookup_repo(&name).await.map_err(internal)?;
+    Ok(Json(repo))
+}
+
+#[derive(Deserialize)]
+struct ResolveQuery {
+    path: String,
+}
+
+/// Reverse lookup: resolves a filesystem path to its repo (longest-prefix
+/// match, so a CWD inside a repo resolves to it). Auth: `memory:read`.
+async fn resolve_path(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<ResolveQuery>,
+) -> Result<Json<Option<RepoDirectory>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let repo = store.resolve_path(&q.path).await.map_err(internal)?;
+    Ok(Json(repo))
 }
 
 #[cfg(test)]
@@ -1418,9 +1487,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         let arr = body.as_array().unwrap();
         assert_eq!(arr.len(), 2);
 
@@ -1436,9 +1508,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body.as_array().unwrap().len(), 1);
         assert_eq!(body[0]["harness"], "Pi");
 
@@ -1471,9 +1546,106 @@ mod tests {
             )
             .await
             .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(body[0]["ended_at"], "2026-07-05T11:00:00Z");
+    }
+
+    #[tokio::test]
+    async fn context_mapper_routes_register_list_resolve() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "op", ijima_core::capabilities::ADMIN);
+        let reader = bearer(&auth, "op", MEMORY_READ);
+        let writer = bearer(&auth, "op", MEMORY_WRITE);
+
+        // Non-admin cannot register.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos")
+                    .header("authorization", &writer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Ijima",
+                            "path": "/home/x/Ijima/",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin registers (path normalized: trailing slash stripped).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Ijima",
+                            "path": "/home/x/Ijima/",
+                            "remote_url": "git@github.com:Anima/Ijima.git",
+                            "role": "memory-service",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // List.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/repos")
+                    .header("authorization", &reader)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 1);
+        assert_eq!(body[0]["path"], "/home/x/Ijima");
+
+        // Reverse resolve a subdirectory.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/repos/resolve?path=/home/x/Ijima/src")
+                    .header("authorization", &reader)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["name"], "Ijima");
     }
 }

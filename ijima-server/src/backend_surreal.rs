@@ -29,8 +29,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ijima_core::{
     Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph, Memory,
-    MemoryId, NamespaceCount, NamespaceId, Result, Session, SessionId, SessionTurn, Store,
-    StoreStats, Triple, embeddings::Embedder, harness::Harness, memory::MemorySource,
+    MemoryId, NamespaceCount, NamespaceId, RepoDirectory, Result, Session, SessionId, SessionTurn,
+    Store, StoreStats, Triple, embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -43,6 +43,7 @@ const SURREAL_DB: &str = "core";
 const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
+const REPOS_TABLE: &str = "repos";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -267,6 +268,54 @@ impl SessionRecord {
 fn store_err(e: surrealdb::Error) -> IjimaError {
     IjimaError::Store {
         detail: e.to_string(),
+    }
+}
+
+/// Returns true if `target` is `base` or a subdirectory of `base`
+/// (component-aware, so `/foo` does not match `/foobar`).
+fn path_starts_with(target: &str, base: &str) -> bool {
+    target == base
+        || target
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Stored row for a registered repo (Context Mapper).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RepoRecord {
+    name: String,
+    path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(default = "default_true")]
+    is_anima_member: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl RepoRecord {
+    fn from_repo(repo: &RepoDirectory) -> Self {
+        Self {
+            name: repo.name.clone(),
+            path: ijima_core::repo::normalize_path(&repo.path),
+            remote_url: repo.remote_url.clone(),
+            role: repo.role.clone(),
+            is_anima_member: repo.is_anima_member,
+        }
+    }
+
+    fn into_repo(self) -> RepoDirectory {
+        RepoDirectory {
+            name: self.name,
+            path: self.path,
+            remote_url: self.remote_url,
+            role: self.role,
+            is_anima_member: self.is_anima_member,
+        }
     }
 }
 
@@ -556,9 +605,42 @@ impl Store for SurrealStore {
             .map_err(store_err)?;
         Ok(())
     }
-}
 
-// ---------- knowledge graph ----------
+    async fn register_repo(&self, repo: RepoDirectory) -> Result<()> {
+        let record = RepoRecord::from_repo(&repo);
+        let _: Option<RepoRecord> = self
+            .db
+            .upsert((REPOS_TABLE, record.name.clone()))
+            .content(record)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn lookup_repo(&self, name: &str) -> Result<Option<RepoDirectory>> {
+        let result: Option<RepoRecord> = self
+            .db
+            .select((REPOS_TABLE, name.to_string()))
+            .await
+            .map_err(store_err)?;
+        Ok(result.map(RepoRecord::into_repo))
+    }
+
+    async fn list_repos(&self) -> Result<Vec<RepoDirectory>> {
+        let records: Vec<RepoRecord> = self.db.select(REPOS_TABLE).await.map_err(store_err)?;
+        Ok(records.into_iter().map(RepoRecord::into_repo).collect())
+    }
+
+    async fn resolve_path(&self, path: &str) -> Result<Option<RepoDirectory>> {
+        let target = ijima_core::repo::normalize_path(path);
+        let repos = self.list_repos().await?;
+        // Longest-prefix match: a CWD inside a repo resolves to it.
+        Ok(repos
+            .into_iter()
+            .filter(|r| path_starts_with(&target, &r.path))
+            .max_by_key(|r| r.path.len()))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EntityRecord_ {
@@ -1369,6 +1451,71 @@ mod tests {
             .find(|n| n.namespace == "ns_a")
             .expect("ns_a");
         assert_eq!(ns_a.memories, 2);
+    }
+
+    #[tokio::test]
+    async fn context_mapper_register_lookup_list_resolve() {
+        let store = fresh().await;
+        // Register two repos.
+        store
+            .register_repo(
+                RepoDirectory::new("Ijima", "/home/x/Ijima")
+                    .with_remote("git@github.com:Anima/Ijima.git")
+                    .with_role("memory-service"),
+            )
+            .await
+            .expect("register ijima");
+        store
+            .register_repo(RepoDirectory::new("Kagome", "/home/x/Kagome"))
+            .await
+            .expect("register kagome");
+
+        // Forward lookup.
+        let ijima = store.lookup_repo("Ijima").await.expect("lookup");
+        let ijima = ijima.expect("found");
+        assert_eq!(
+            ijima.remote_url.as_deref(),
+            Some("git@github.com:Anima/Ijima.git")
+        );
+        assert_eq!(ijima.role.as_deref(), Some("memory-service"));
+        assert_eq!(ijima.path, "/home/x/Ijima");
+
+        // Missing name → None.
+        assert!(store.lookup_repo("nope").await.expect("lookup").is_none());
+
+        // List — both present.
+        let all = store.list_repos().await.expect("list");
+        assert_eq!(all.len(), 2);
+
+        // Reverse resolve: exact path.
+        let r = store.resolve_path("/home/x/Ijima").await.expect("resolve");
+        assert_eq!(r.unwrap().name, "Ijima");
+
+        // Reverse resolve: subdirectory (longest-prefix).
+        let r = store
+            .resolve_path("/home/x/Ijima/src/main.rs")
+            .await
+            .expect("resolve subdir");
+        assert_eq!(r.unwrap().name, "Ijima");
+
+        // Reverse resolve: unrelated path → None.
+        assert!(
+            store
+                .resolve_path("/etc/passwd")
+                .await
+                .expect("resolve")
+                .is_none()
+        );
+
+        // Upsert updates path without duplicating.
+        store
+            .register_repo(RepoDirectory::new("Ijima", "/home/x/moved/Ijima"))
+            .await
+            .expect("upsert");
+        let all = store.list_repos().await.expect("list");
+        assert_eq!(all.len(), 2); // still two, not three
+        let moved = store.lookup_repo("Ijima").await.expect("lookup").unwrap();
+        assert_eq!(moved.path, "/home/x/moved/Ijima");
     }
 
     #[tokio::test]
