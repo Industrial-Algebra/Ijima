@@ -41,6 +41,10 @@ use ijima_core::{Result, harness::Harness};
 
 pub mod rules;
 
+/// Proserpina-backed LLM extraction tier (ADR M5/M7/M8). Behind `llm`.
+#[cfg(feature = "llm")]
+pub mod llm;
+
 /// A proposed extraction from a mining pass.
 ///
 /// Exhaustive so callers must handle every outcome when new tiers land.
@@ -52,6 +56,18 @@ pub enum Extraction {
     PendingReview(ijima_core::Memory),
     /// Nothing extractable from this turn range.
     Nothing,
+}
+
+impl Extraction {
+    /// The underlying memory, if this is an `Auto` or `PendingReview`.
+    pub fn as_memory(&self) -> &ijima_core::Memory {
+        match self {
+            Extraction::Auto(m) | Extraction::PendingReview(m) => m,
+            Extraction::Nothing => {
+                panic!("as_memory called on Extraction::Nothing")
+            }
+        }
+    }
 }
 
 /// Provenance + heuristics supplied to an extraction pass.
@@ -90,6 +106,52 @@ pub fn mine(turns: &[String], ctx: &MiningContext) -> Result<Vec<Extraction>> {
         out.append(&mut found);
     }
     Ok(out)
+}
+
+/// Runs all available tiers and merges the results with content-dedup
+/// (ADR M7). When `agent` is `Some`, the llm tier runs after the rules
+/// tier; otherwise rules-only. Duplicate extractions (same content,
+/// case-insensitive) are dropped, keeping the first — so the rules and llm
+/// tiers don't double-report the same fact.
+///
+/// # Errors
+///
+/// Propagates a mining error from either tier.
+#[cfg(feature = "llm")]
+pub fn mine_all(
+    turns: &[String],
+    ctx: &MiningContext,
+    agent: Option<&mut dyn proserpina::Agent>,
+) -> Result<Vec<Extraction>> {
+    let mut extractions = mine(turns, ctx)?;
+    if let Some(agent) = agent {
+        let mut llm = llm::mine_llm(agent, &llm::default_roles(), turns, ctx)?;
+        extractions.append(&mut llm);
+        extractions = merge_extractions(extractions);
+    }
+    Ok(extractions)
+}
+
+/// Deduplicates extractions by memory content (case-insensitive, trimmed).
+/// Keeps the first occurrence of each distinct content. Order is preserved.
+pub fn merge_extractions(extractions: Vec<Extraction>) -> Vec<Extraction> {
+    use std::collections::HashSet;
+    let mut seen: HashSet<String> = HashSet::new();
+    extractions
+        .into_iter()
+        .filter(|e| match e {
+            Extraction::Nothing => false,
+            other => {
+                let key = match other {
+                    Extraction::Auto(m) | Extraction::PendingReview(m) => {
+                        m.content.trim().to_ascii_lowercase()
+                    }
+                    Extraction::Nothing => String::new(),
+                };
+                seen.insert(key)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -136,5 +198,72 @@ mod tests {
         let turns = vec!["just chatting".to_string(), "no signals".to_string()];
         let got = mine(&turns, &ctx()).expect("mine");
         assert!(got.is_empty());
+    }
+
+    #[test]
+    fn merge_dedups_by_content_case_insensitive() {
+        use ijima_core::{Memory, MemoryId, MemorySource};
+        fn mem(content: &str) -> Memory {
+            Memory {
+                id: MemoryId("x".into()),
+                content: content.into(),
+                project: "p".into(),
+                topic: "t".into(),
+                source: MemorySource::Mined,
+                harness: Harness::Pi,
+                session_id: None,
+                importance: 0.5,
+                created_at: "0".into(),
+            }
+        }
+        let ext = vec![
+            Extraction::Auto(mem("use surrealdb")),
+            Extraction::PendingReview(mem("Use SurrealDB")), // dup, different case
+            Extraction::Auto(mem("use candle")),
+            Extraction::Nothing,
+        ];
+        let got = merge_extractions(ext);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].as_memory().content, "use surrealdb");
+    }
+
+    #[test]
+    #[cfg(feature = "llm")]
+    fn mine_all_merges_rules_and_llm() {
+        // Scripted agent that emits a fact the rules tier won't catch.
+        struct Stub;
+        impl proserpina::Agent for Stub {
+            fn id(&self) -> &proserpina::AgentId {
+                use std::sync::OnceLock;
+                static ID: OnceLock<proserpina::AgentId> = OnceLock::new();
+                ID.get_or_init(|| proserpina::AgentId::new("stub"))
+            }
+            fn persona(&self) -> &proserpina::Persona {
+                use std::sync::OnceLock;
+                static P: OnceLock<proserpina::Persona> = OnceLock::new();
+                P.get_or_init(|| proserpina::Persona::new("stub"))
+            }
+            fn respond(
+                &mut self,
+                _msg: &proserpina::Message,
+            ) -> std::result::Result<proserpina::Message, proserpina::ProserpinaError> {
+                Ok(proserpina::Message::new(
+                    proserpina::AgentId::new("stub"),
+                    None,
+                    proserpina::MessageKind::Critique,
+                    "{\"content\":\"a model-judged fact\",\"confidence\":0.6}".to_string(),
+                ))
+            }
+        }
+        let turns = vec!["We decided to use SurrealDB.".to_string()];
+        let mut stub = Stub;
+        let got = mine_all(&turns, &ctx(), Some(&mut stub)).expect("mine_all");
+        // 1 rules decision + 1 llm fact, distinct content → both kept.
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|e| e.as_memory().topic == "decisions"));
+        assert!(
+            got.iter()
+                .any(|e| e.as_memory().content.contains("model-judged"))
+        );
     }
 }

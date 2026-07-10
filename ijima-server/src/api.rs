@@ -810,7 +810,9 @@ async fn trigger_mine(
         "general",
         ijima_core::harness::Harness::Other,
     );
-    let extractions = ijima_miner::mine(&turn_texts, &ctx).map_err(internal)?;
+    let extractions = ijima_miner::mine_all(&turn_texts, &ctx, None).map_err(internal)?;
+    // TODO(follow-on): construct a Proserpina agent from IJIMA_LLM_* config
+    // and pass Some(&mut agent) so the llm tier (Fact + Pattern) runs too.;
     let report = crate::mining_pipeline::ingest_extractions(store.as_ref(), &ns, extractions)
         .await
         .map_err(internal)?;

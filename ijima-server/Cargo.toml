@@ -34,7 +34,9 @@ cli = ["dep:clap", "dep:reqwest"]
 embeddings-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "ijima-core/serde"]
 # Mining trigger orchestration: fetch session turns, run the extraction
 # engine, and ingest (Auto → palace, PendingReview → review queue).
-mining = ["dep:ijima-miner", "backend-surreal"]
+# Enables the miner's llm tier so `mine_all` is available; the daemon
+# constructs the Proserpina agent from config in a follow-on.
+mining = ["dep:ijima-miner", "backend-surreal", "ijima-miner/llm"]
 
 [dependencies]
 ijima-core = { workspace = true }
