@@ -23,8 +23,9 @@
 //! | POST | `/sessions` | `session:ingest` | `create_session` |
 //! | GET | `/sessions` | `memory:read` | `list_sessions` |
 //! | POST | `/sessions/:session_id/end` | `session:ingest` | `end_session` |
-//! | POST | `/diaries` | `memory:write` | `write_diary` |
-//! | GET | `/diaries/:agent` | `memory:read` | `read_diary` |
+//! | GET | `/mining/queue` | `mining:review` | `list_pending` |
+//! | POST | `/mining/queue/:id/accept` | `mining:review` | `accept_extraction` |
+//! | POST | `/mining/queue/:id/reject` | `mining:review` | `reject_extraction` |
 
 use std::sync::Arc;
 
@@ -38,9 +39,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
-    PalaceGraph, ProjectTaxon, Room, Session, SessionId, SessionTurn, Store, TunnelTraversal,
-    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
+    AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
+    QueuedExtraction, Session, SessionId, SessionTurn, Store,
+    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST},
     harness::Harness,
 };
 
@@ -57,9 +58,8 @@ pub fn app(
     kg: Arc<dyn KnowledgeGraph>,
     embedder: Option<Arc<dyn Embedder>>,
     redactor: Arc<Redactor>,
-    #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
 ) -> Router {
-    let router = Router::new()
+    Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/memories", post(store_memory))
@@ -80,27 +80,14 @@ pub fn app(
         )
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:session_id/end", post(end_session))
-        .route("/diaries", post(write_diary))
-        .route("/diaries/:agent", get(read_diary))
-        .route("/rooms", get(list_rooms))
-        .route("/taxonomy", get(taxonomy))
-        .route("/palace/graph", get(palace_graph))
-        .route("/palace/tunnel", get(traverse_tunnel))
+        .route("/mining/queue", get(list_pending))
+        .route("/mining/queue/:id/accept", post(accept_extraction))
+        .route("/mining/queue/:id/reject", post(reject_extraction))
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
-        .layer(Extension(redactor));
-
-    #[cfg(feature = "rate-limit")]
-    let router = match rate_limiter {
-        Some(rl) => router.layer(Extension(rl)),
-        None => router,
-    };
-    #[cfg(not(feature = "rate-limit"))]
-    let router = router;
-
-    router
+        .layer(Extension(redactor))
 }
 
 // ---------- errors ----------
@@ -744,131 +731,52 @@ async fn end_session(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ---------- palace organization (Phase 3.1 + 3.2) ----------
+// ---------- mining review queue (ADR M2, M3) ----------
 
-#[derive(Deserialize)]
-struct RoomsQuery {
-    namespace: Option<String>,
-    /// Optional project filter.
-    project: Option<String>,
-    limit: Option<usize>,
-}
-
-/// Lists rooms (topic cells) in the effective namespace, optionally
-/// filtered by project. Auth: `memory:read`.
-async fn list_rooms(
-    principal: AuthPrincipal,
-    Extension(store): Extension<Arc<dyn Store>>,
-    Query(q): Query<RoomsQuery>,
-) -> Result<Json<Vec<Room>>, ApiError> {
-    if !principal.0.may(MEMORY_READ) {
-        return Err(ApiError::Forbidden);
-    }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
-    let limit = q.limit.unwrap_or(100).min(1000);
-    let rooms = store
-        .list_rooms(&ns, q.project.as_deref(), limit)
-        .await
-        .map_err(internal)?;
-    Ok(Json(rooms))
-}
-
-/// Full project → topic → count taxonomy of the effective namespace.
-/// Auth: `memory:read`.
-async fn taxonomy(
+/// Lists pending mining extractions in the effective namespace, newest
+/// first. Auth: `mining:review`.
+async fn list_pending(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
     Query(q): Query<NsQuery>,
-) -> Result<Json<Vec<ProjectTaxon>>, ApiError> {
-    if !principal.0.may(MEMORY_READ) {
-        return Err(ApiError::Forbidden);
-    }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
-    let taxons = store.taxonomy(&ns).await.map_err(internal)?;
-    Ok(Json(taxons))
-}
-
-/// The palace graph: projects as nodes, shared-topic tunnels as edges.
-/// Auth: `memory:read`.
-async fn palace_graph(
-    principal: AuthPrincipal,
-    Extension(store): Extension<Arc<dyn Store>>,
-    Query(q): Query<NsQuery>,
-) -> Result<Json<PalaceGraph>, ApiError> {
-    if !principal.0.may(MEMORY_READ) {
-        return Err(ApiError::Forbidden);
-    }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
-    let graph = store.palace_graph(&ns).await.map_err(internal)?;
-    Ok(Json(graph))
-}
-
-#[derive(Deserialize)]
-struct TunnelQuery {
-    namespace: Option<String>,
-    topic: String,
-    project_a: String,
-    project_b: String,
-    limit: Option<usize>,
-}
-
-/// Traverses a tunnel: returns memories from both projects on the shared
-/// topic. Auth: `memory:read`.
-async fn traverse_tunnel(
-    principal: AuthPrincipal,
-    Extension(store): Extension<Arc<dyn Store>>,
-    Query(q): Query<TunnelQuery>,
-) -> Result<Json<TunnelTraversal>, ApiError> {
-    if !principal.0.may(MEMORY_READ) {
-        return Err(ApiError::Forbidden);
-    }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
-    let limit = q.limit.unwrap_or(20).min(200);
-    let traversal = store
-        .traverse_tunnel(&ns, &q.topic, &q.project_a, &q.project_b, limit)
-        .await
-        .map_err(internal)?;
-    Ok(Json(traversal))
-}
-
-// ---------- diaries (Phase 3.3) ----------
-
-/// Appends a diary entry. Auth: `memory:write`. Stored in personal
-/// namespace.
-async fn write_diary(
-    principal: AuthPrincipal,
-    Extension(store): Extension<Arc<dyn Store>>,
-    Json(mut entry): Json<DiaryEntry>,
-) -> Result<StatusCode, ApiError> {
-    if !principal.0.may(MEMORY_WRITE) {
-        return Err(ApiError::Forbidden);
-    }
-    let ns = principal.0.personal_namespace();
-    if entry.timestamp.is_empty() {
-        entry.timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs().to_string())
-            .unwrap_or_default();
-    }
-    store.write_diary(&ns, entry).await.map_err(internal)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// Reads the last `limit` entries of `agent`'s diary in the effective
-/// namespace, chronological. Auth: `memory:read`.
-async fn read_diary(
-    principal: AuthPrincipal,
-    Extension(store): Extension<Arc<dyn Store>>,
-    Path(agent): Path<String>,
-    Query(q): Query<NsQuery>,
-) -> Result<Json<Vec<DiaryEntry>>, ApiError> {
-    if !principal.0.may(MEMORY_READ) {
+) -> Result<Json<Vec<QueuedExtraction>>, ApiError> {
+    if !principal.0.may(MINING_REVIEW) {
         return Err(ApiError::Forbidden);
     }
     let ns = resolve_ns(&principal, q.namespace.as_deref())?;
     let limit = q.limit.unwrap_or(50).min(500);
-    let entries = store.read_diary(&ns, &agent, limit).await.map_err(internal)?;
-    Ok(Json(entries))
+    let pending = store.list_pending(&ns, limit).await.map_err(internal)?;
+    Ok(Json(pending))
+}
+
+/// Accepts a queued extraction: promotes it to the palace and removes it
+/// from the queue. Auth: `mining:review`.
+async fn accept_extraction(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(id): Path<String>,
+) -> Result<Json<AcceptedExtraction>, ApiError> {
+    if !principal.0.may(MINING_REVIEW) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    let accepted = store.accept_extraction(&ns, &id).await.map_err(internal)?;
+    Ok(Json(accepted))
+}
+
+/// Rejects a queued extraction: drops it without promoting. Auth:
+/// `mining:review`. Returns 204.
+async fn reject_extraction(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(MINING_REVIEW) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    store.reject_extraction(&ns, &id).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
@@ -892,8 +800,6 @@ mod tests {
                 kg,
                 None,
                 Arc::new(crate::redaction::Redactor::new()),
-                #[cfg(feature = "rate-limit")]
-                None,
             ),
             auth,
         )
@@ -903,27 +809,6 @@ mod tests {
         format!(
             "Bearer {}",
             auth.issue_bearer(principal, cap).expect("issue")
-        )
-    }
-
-    /// Builds an app with a Schubert rate limiter (for rate-limit tests).
-    #[cfg(feature = "rate-limit")]
-    async fn app_with_rate_limit() -> (Router, Arc<IjimaAuth>) {
-        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
-        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
-        let store: Arc<dyn Store> = store_inner.clone();
-        let kg: Arc<dyn KnowledgeGraph> = store_inner;
-        let rl = crate::rate_limit::make_rate_limiter(1.0, 1.0);
-        (
-            app(
-                auth.clone(),
-                store,
-                kg,
-                None,
-                Arc::new(crate::redaction::Redactor::new()),
-                Some(rl),
-            ),
-            auth,
         )
     }
 
@@ -1656,51 +1541,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn palace_routes_rooms_graph_tunnel() {
+    async fn mining_queue_requires_review_capability() {
         let (app, auth) = app_with_store().await;
-        let write = bearer(&auth, "op", MEMORY_WRITE);
-        let read = bearer(&auth, "op", MEMORY_READ);
+        let reviewer = bearer(&auth, "op", MINING_REVIEW);
+        let reader = bearer(&auth, "op", MEMORY_READ);
 
-        // Seed two projects sharing the "auth" topic.
-        for (id, project, topic) in [
-            ("m1", "ijima", "auth"),
-            ("m2", "ijima", "auth"),
-            ("m3", "karpal", "auth"),
-            ("m4", "karpal", "build"),
-        ] {
-            let res = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/memories")
-                        .header("authorization", &write)
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({
-                                "id": id,
-                                "content": format!("note {id}"),
-                                "project": project,
-                                "topic": topic,
-                                "source": "Explicit",
-                                "harness": "Pi",
-                            })
-                            .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "seed {id}");
-        }
-
-        // GET /rooms — top room is ijima/auth (count 2).
+        // A memory:read holder cannot list the queue.
         let res = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/rooms")
-                    .header("authorization", &read)
+                    .uri("/mining/queue")
+                    .header("authorization", &reader)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // A mining:review holder can list (empty queue).
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/mining/queue")
+                    .header("authorization", &reviewer)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1713,207 +1578,6 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let rooms = body.as_array().unwrap();
-        assert!(rooms.len() >= 3);
-        assert_eq!(rooms[0]["count"], 2);
-
-        // GET /taxonomy — two projects.
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/taxonomy")
-                    .header("authorization", &read)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(body.as_array().unwrap().len(), 2);
-
-        // GET /palace/graph — has the auth tunnel.
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/palace/graph")
-                    .header("authorization", &read)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let body: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert!(body["projects"].as_array().unwrap().len() >= 2);
-        assert!(!body["tunnels"].as_array().unwrap().is_empty());
-
-        // GET /palace/tunnel — traverse the auth tunnel.
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/palace/tunnel?topic=auth&project_a=ijima&project_b=karpal")
-                    .header("authorization", &read)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(body["memories_a"].as_array().unwrap().len(), 2);
-        assert_eq!(body["memories_b"].as_array().unwrap().len(), 1);
-    }
-
-    #[cfg(feature = "rate-limit")]
-    #[tokio::test]
-    async fn rate_limit_returns_429_when_bucket_exhausted() {
-        let (app, auth) = app_with_rate_limit().await;
-        let read = bearer(&auth, "op", MEMORY_READ);
-
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/sessions")
-                    .header("authorization", &read)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/sessions")
-                    .header("authorization", &read)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    #[cfg(feature = "rate-limit")]
-    #[tokio::test]
-    async fn rate_limit_gives_write_holder_more_capacity() {
-        let (app, auth) = app_with_rate_limit().await;
-        let write = bearer(&auth, "op", MEMORY_WRITE);
-
-        for i in 0..2 {
-            let res = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri("/memories")
-                        .header("authorization", &write)
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({
-                                "id": format!("m{i}"),
-                                "content": format!("note {i}"),
-                                "project": "p",
-                                "topic": "t",
-                                "source": "Explicit",
-                                "harness": "Pi",
-                            })
-                            .to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "write {i}");
-        }
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/memories")
-                    .header("authorization", &write)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "id": "m3",
-                            "content": "one too many",
-                            "project": "p",
-                            "topic": "t",
-                            "source": "Explicit",
-                            "harness": "Pi",
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
-    }
-
-    #[tokio::test]
-    async fn diaries_write_then_read_via_http() {
-        let (app, auth) = app_with_store().await;
-        let write = bearer(&auth, "op", MEMORY_WRITE);
-        let read = bearer(&auth, "op", MEMORY_READ);
-
-        let res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/diaries")
-                    .header("authorization", &write)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "agent": "claude",
-                            "content": "diary note",
-                            "topic": "reflection",
-                            "timestamp": "",
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-
-        let res = app
-            .oneshot(
-                Request::builder()
-                    .uri("/diaries/claude")
-                    .header("authorization", &read)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body: serde_json::Value =
-            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
-                .unwrap();
-        let arr = body.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0]["agent"], "claude");
+        assert!(body.as_array().unwrap().is_empty());
     }
 }

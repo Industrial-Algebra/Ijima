@@ -28,10 +28,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    DiaryEntry, Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats, KnowledgeGraph,
-    Memory, MemoryId, NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, Result, Room,
-    Session, SessionId, SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal,
-    embeddings::Embedder, harness::Harness, memory::MemorySource,
+    AcceptedExtraction, DiaryEntry, Embedding, Entity, EntityId, EntityRecord, IjimaError,
+    KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId, PalaceGraph,
+    ProjectTaxon, QueuedExtraction, Result, Room, Session, SessionId, SessionTurn, Store,
+    StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder, harness::Harness,
+    memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -45,6 +46,7 @@ const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
 const DIARY_TABLE: &str = "diaries";
+const QUEUE_TABLE: &str = "mining_queue";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -369,10 +371,99 @@ impl SessionRecord {
     }
 }
 
+/// Stored row for a queued mining extraction (ADR M2). `ts` is an internal
+/// epoch-millis for correct ORDER BY.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueueRecord {
+    queue_id: String,
+    /// Nested memory fields (flattened for storage).
+    memory_id: String,
+    content: String,
+    project: String,
+    topic: String,
+    #[serde(default)]
+    importance: f32,
+    session_id: Option<String>,
+    harness: String,
+    confidence: f32,
+    source_session_id: String,
+    ts: i64,
+    namespace: String,
+}
+
+impl QueueRecord {
+    fn from_extraction(
+        queue_id: &str,
+        memory: &Memory,
+        confidence: f32,
+        ns: &NamespaceId,
+        now_ms: i64,
+    ) -> Self {
+        Self {
+            queue_id: queue_id.to_string(),
+            memory_id: memory.id.0.clone(),
+            content: memory.content.clone(),
+            project: memory.project.clone(),
+            topic: memory.topic.clone(),
+            importance: memory.importance,
+            session_id: memory.session_id.clone(),
+            harness: memory.harness.as_wire_str().to_string(),
+            confidence,
+            source_session_id: memory.session_id.clone().unwrap_or_default(),
+            ts: now_ms,
+            namespace: ns.as_str().to_string(),
+        }
+    }
+
+    fn into_queued(self) -> QueuedExtraction {
+        let harness = Harness::from_wire_str(&self.harness);
+        let memory = Memory {
+            id: MemoryId(self.memory_id),
+            content: self.content,
+            project: self.project,
+            topic: self.topic,
+            source: MemorySource::Mined,
+            harness,
+            session_id: self.session_id,
+            importance: self.importance,
+            created_at: String::new(),
+        };
+        QueuedExtraction {
+            id: self.queue_id,
+            memory,
+            confidence: self.confidence,
+            source_session_id: self.source_session_id,
+            queued_at: self.ts.to_string(),
+        }
+    }
+
+    fn into_memory(self) -> Memory {
+        Memory {
+            id: MemoryId(self.memory_id),
+            content: self.content,
+            project: self.project,
+            topic: self.topic,
+            source: MemorySource::Mined,
+            harness: Harness::from_wire_str(&self.harness),
+            session_id: self.session_id,
+            importance: self.importance,
+            created_at: String::new(),
+        }
+    }
+}
+
 fn store_err(e: surrealdb::Error) -> IjimaError {
     IjimaError::Store {
         detail: e.to_string(),
     }
+}
+
+/// Current epoch-millis (for internal ORDER BY fields).
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Lowercase hex of a byte slice (for content-hash).
@@ -778,6 +869,91 @@ impl Store for SurrealStore {
         Ok(())
     }
 
+<<<<<<< HEAD
+    async fn enqueue_extraction(
+        &self,
+        ns: &NamespaceId,
+        memory: Memory,
+        confidence: f32,
+    ) -> Result<String> {
+        let now_ms = now_millis();
+        let queue_id = format!("q_{}_{now_ms}", memory.id.0);
+        let record = QueueRecord::from_extraction(&queue_id, &memory, confidence, ns, now_ms);
+        let _: Option<QueueRecord> = self
+            .db
+            .create((QUEUE_TABLE, queue_id.clone()))
+            .content(record)
+            .await
+            .map_err(store_err)?;
+        Ok(queue_id)
+    }
+
+    async fn list_pending(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<QueuedExtraction>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT queue_id, memory_id, content, project, topic, importance, session_id, harness, confidence, source_session_id, ts, namespace
+                 FROM {QUEUE_TABLE}
+                 WHERE namespace = $ns
+                 ORDER BY ts DESC LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        let records: Vec<QueueRecord> = result.take(0).map_err(store_err)?;
+        Ok(records.into_iter().map(QueueRecord::into_queued).collect())
+    }
+
+    async fn accept_extraction(
+        &self,
+        ns: &NamespaceId,
+        queue_id: &str,
+    ) -> Result<AcceptedExtraction> {
+        // Read the queued record (scoped by namespace), promote to the
+        // palace, then delete from the queue.
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT queue_id, memory_id, content, project, topic, importance, session_id, harness, confidence, source_session_id, ts, namespace
+                 FROM {QUEUE_TABLE}
+                 WHERE namespace = $ns AND queue_id = $qid LIMIT 1"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("qid", queue_id.to_string()))
+            .await
+            .map_err(store_err)?;
+        let records: Vec<QueueRecord> = result.take(0).map_err(store_err)?;
+        let Some(record) = records.into_iter().next() else {
+            return Err(IjimaError::not_found(format!("queue entry {queue_id}")));
+        };
+        let memory = record.into_memory();
+        let memory_id = memory.id.clone();
+        // store_memory does content-hash dedup; a duplicate promote is a no-op.
+        self.store_memory(ns, memory).await?;
+        let _: Option<QueueRecord> = self
+            .db
+            .delete((QUEUE_TABLE, queue_id.to_string()))
+            .await
+            .map_err(store_err)?;
+        Ok(AcceptedExtraction { memory_id })
+    }
+
+    async fn reject_extraction(&self, ns: &NamespaceId, queue_id: &str) -> Result<()> {
+        // Scoped delete: only removes if the namespace matches.
+        let _ = self
+            .db
+            .query(format!(
+                "DELETE FROM {QUEUE_TABLE}
+                 WHERE namespace = $ns AND queue_id = $qid"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("qid", queue_id.to_string()))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+=======
     async fn write_diary(&self, ns: &NamespaceId, entry: DiaryEntry) -> Result<()> {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -816,6 +992,7 @@ impl Store for SurrealStore {
         records.reverse(); // chronological (DESC → reverse)
         Ok(records.into_iter().map(DiaryRecord::into_entry).collect())
     }
+>>>>>>> develop
 }
 
 // ---------- knowledge graph ----------
@@ -1762,6 +1939,63 @@ mod tests {
         assert_eq!(trav.memories_b.len(), 1);
         assert!(trav.memories_a.iter().all(|m| m.project == "ijima"));
         assert!(trav.memories_b.iter().all(|m| m.project == "karpal"));
+    }
+
+    #[tokio::test]
+    async fn mining_queue_enqueue_list_accept_reject() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_mining");
+        let other = NamespaceId::new("ns_other");
+
+        // Enqueue two PendingReview extractions.
+        let q1 = store
+            .enqueue_extraction(&ns, sample_memory("m1", "decided to use surrealdb"), 0.6)
+            .await
+            .expect("enqueue1");
+        let q2 = store
+            .enqueue_extraction(&ns, sample_memory("m2", "see https://example.com"), 0.55)
+            .await
+            .expect("enqueue2");
+
+        // list_pending sees both (newest first).
+        let pending = store.list_pending(&ns, 10).await.expect("list");
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id, q2); // newest first
+        assert_eq!(pending[1].confidence, 0.6);
+
+        // Namespace isolation: other ns sees nothing.
+        let cross = store.list_pending(&other, 10).await.expect("list other");
+        assert!(cross.is_empty());
+
+        // Accept q1 → promotes to palace + removes from queue.
+        let accepted = store.accept_extraction(&ns, &q1).await.expect("accept");
+        assert_eq!(accepted.memory_id.0, "m1");
+        let after_accept = store.list_pending(&ns, 10).await.expect("list");
+        assert_eq!(after_accept.len(), 1);
+        // The promoted memory is now in the palace.
+        let promoted = store
+            .recall_memory(&ns, &MemoryId("m1".into()))
+            .await
+            .expect("recall");
+        assert!(promoted.is_some());
+
+        // Reject q2 → drops without promoting.
+        store.reject_extraction(&ns, &q2).await.expect("reject");
+        let after_reject = store.list_pending(&ns, 10).await.expect("list");
+        assert!(after_reject.is_empty());
+        let not_promoted = store
+            .recall_memory(&ns, &MemoryId("m2".into()))
+            .await
+            .expect("recall");
+        assert!(not_promoted.is_none());
+
+        // Cross-namespace accept fails (queue entry is in ns, not other).
+        let q3 = store
+            .enqueue_extraction(&ns, sample_memory("m3", "cross test"), 0.5)
+            .await
+            .expect("enqueue3");
+        let cross_accept = store.accept_extraction(&other, &q3).await;
+        assert!(cross_accept.is_err());
     }
 
     #[tokio::test]
