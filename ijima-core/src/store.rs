@@ -18,6 +18,9 @@ use async_trait::async_trait;
 use crate::{
     AcceptedExtraction, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction, Result,
     Session, SessionId, SessionTurn, harness::Harness,
+    DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
+    harness::Harness,
+    palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
 
 /// Global memory-palace statistics (across all namespaces).
@@ -84,6 +87,36 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Memory>>;
 
+    // ===== Palace organization (Phase 3.1 + 3.2) =====
+
+    /// Lists rooms (topic cells) in `ns`, optionally filtered to a single
+    /// project. Each room carries its memory count. Ordered by count desc.
+    async fn list_rooms(
+        &self,
+        ns: &NamespaceId,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Room>>;
+
+    /// Full project → topic → count taxonomy of `ns`. Powers
+    /// `getTaxonomy` navigation.
+    async fn taxonomy(&self, ns: &NamespaceId) -> Result<Vec<ProjectTaxon>>;
+
+    /// The palace graph: projects as nodes, shared-topic tunnels as edges.
+    /// Powers `getPalaceGraph` — *"what connects these projects?"*
+    async fn palace_graph(&self, ns: &NamespaceId) -> Result<PalaceGraph>;
+
+    /// Traverses a tunnel: returns the actual memories from both projects on
+    /// the shared `topic`, so the caller can see what connects them.
+    async fn traverse_tunnel(
+        &self,
+        ns: &NamespaceId,
+        topic: &str,
+        project_a: &str,
+        project_b: &str,
+        limit: usize,
+    ) -> Result<TunnelTraversal>;
+
     // ===== Session-context repository =====
 
     /// Appends a raw turn to the session transcript under `ns`.
@@ -144,4 +177,17 @@ pub trait Store: Send + Sync {
 
     /// Rejects a queued extraction: drops it from the queue without promoting.
     async fn reject_extraction(&self, ns: &NamespaceId, queue_id: &str) -> Result<()>;
+    // ===== Diaries (Phase 3.3) =====
+
+    /// Appends a diary entry under `ns`.
+    async fn write_diary(&self, ns: &NamespaceId, entry: DiaryEntry) -> Result<()>;
+
+    /// Returns the last `limit` entries of `agent`'s diary under `ns`, in
+    /// chronological order.
+    async fn read_diary(
+        &self,
+        ns: &NamespaceId,
+        agent: &str,
+        limit: usize,
+    ) -> Result<Vec<DiaryEntry>>;
 }

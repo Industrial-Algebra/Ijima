@@ -41,6 +41,16 @@ enum Command {
     },
     /// Run the HTTP daemon.
     Serve(ServeArgs),
+    /// Export the SurrealDB store as a SQL dump.
+    Export(ExportArgs),
+}
+
+/// Arguments to `ijima export`.
+#[derive(Args, Debug)]
+struct ExportArgs {
+    /// Output path for the SurrealDB SQL dump.
+    #[arg(long, short)]
+    out: std::path::PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -100,12 +110,13 @@ struct IssueArgs {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    ijima_server::server::init_tracing();
     match cli.command {
         Command::Token { action } => match action {
             TokenAction::Issue(args) => match run_issue(args) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
-                    eprintln!("ijima: {e}");
+                    tracing::error!(error = %e, "token issue failed");
                     ExitCode::FAILURE
                 }
             },
@@ -118,16 +129,16 @@ fn main() -> ExitCode {
                 match rt {
                     Ok(rt) => match rt.block_on(run_doctrine_ingest(args)) {
                         Ok(n) => {
-                            eprintln!("ijima: ingested {n} doctrine entries");
+                            tracing::info!(entries = n, "doctrine ingested");
                             ExitCode::SUCCESS
                         }
                         Err(e) => {
-                            eprintln!("ijima: {e}");
+                            tracing::error!(error = %e, "doctrine ingest failed");
                             ExitCode::FAILURE
                         }
                     },
                     Err(e) => {
-                        eprintln!("ijima: runtime: {e}");
+                        tracing::error!(error = %e, "runtime build failed");
                         ExitCode::FAILURE
                     }
                 }
@@ -146,6 +157,24 @@ fn main() -> ExitCode {
                 .build();
             match rt {
                 Ok(rt) => match rt.block_on(ijima_server::server::serve(&config)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "serve failed");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "runtime build failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Export(args) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => match rt.block_on(run_export(args)) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => {
                         eprintln!("ijima: {e}");
@@ -198,13 +227,29 @@ fn validate_capability(cap: &str) -> ijima_core::Result<()> {
 async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
     let entries = ijima_server::doctrine::read_doctrine_dir(&args.dir)?;
     if entries.is_empty() {
-        eprintln!(
-            "ijima: no *.md doctrine files found in {}",
-            args.dir.display()
-        );
+        tracing::warn!(dir = %args.dir.display(), "no *.md doctrine files found");
         return Ok(0);
     }
-    eprintln!("ijima: ingesting {} doctrine entries...", entries.len());
+    tracing::info!(entries = entries.len(), "ingesting doctrine");
     let parsed: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
     ijima_server::doctrine::ingest_to_daemon(&args.url, &args.token, &parsed).await
+}
+
+async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
+    let data_dir = std::env::var("IJIMA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".ijima"))
+                .ok_or_else(|| {
+                    ijima_core::IjimaError::invalid_input(
+                        "cannot resolve data dir: set IJIMA_DIR or HOME",
+                    )
+                })
+        })?;
+    let db_path = data_dir.join("ijima.db");
+    let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
+    store.export_to(&args.out).await?;
+    eprintln!("ijima: exported to {}", args.out.display());
+    Ok(())
 }

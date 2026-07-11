@@ -67,6 +67,10 @@ pub mod api;
 #[cfg(all(feature = "http", feature = "server-auth"))]
 pub mod extractor;
 
+/// Schubert geometric rate limiting (Phase 3.4). Behind `rate-limit`.
+#[cfg(feature = "rate-limit")]
+pub mod rate_limit;
+
 /// Redaction/scrub filter for the personal → shared promotion boundary (D9 §2).
 pub mod redaction;
 
