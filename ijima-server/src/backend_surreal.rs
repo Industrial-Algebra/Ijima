@@ -180,7 +180,6 @@ impl SurrealStore {
             })?;
         Ok(())
     }
-    }
 }
 
 async fn new_mem() -> Result<Surreal<Db>> {
