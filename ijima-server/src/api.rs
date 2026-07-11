@@ -23,6 +23,8 @@
 //! | POST | `/sessions` | `session:ingest` | `create_session` |
 //! | GET | `/sessions` | `memory:read` | `list_sessions` |
 //! | POST | `/sessions/:session_id/end` | `session:ingest` | `end_session` |
+//! | POST | `/diaries` | `memory:write` | `write_diary` |
+//! | GET | `/diaries/:agent` | `memory:read` | `read_diary` |
 
 use std::sync::Arc;
 
@@ -36,8 +38,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount, PalaceGraph,
-    ProjectTaxon, Room, Session, SessionId, SessionTurn, Store, TunnelTraversal,
+    DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
+    PalaceGraph, ProjectTaxon, Room, Session, SessionId, SessionTurn, Store, TunnelTraversal,
     capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, SESSION_INGEST},
     harness::Harness,
 };
@@ -78,6 +80,8 @@ pub fn app(
         )
         .route("/sessions", post(create_session).get(list_sessions))
         .route("/sessions/:session_id/end", post(end_session))
+        .route("/diaries", post(write_diary))
+        .route("/diaries/:agent", get(read_diary))
         .route("/rooms", get(list_rooms))
         .route("/taxonomy", get(taxonomy))
         .route("/palace/graph", get(palace_graph))
@@ -825,6 +829,46 @@ async fn traverse_tunnel(
         .await
         .map_err(internal)?;
     Ok(Json(traversal))
+}
+
+// ---------- diaries (Phase 3.3) ----------
+
+/// Appends a diary entry. Auth: `memory:write`. Stored in personal
+/// namespace.
+async fn write_diary(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(mut entry): Json<DiaryEntry>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    if entry.timestamp.is_empty() {
+        entry.timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+    }
+    store.write_diary(&ns, entry).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Reads the last `limit` entries of `agent`'s diary in the effective
+/// namespace, chronological. Auth: `memory:read`.
+async fn read_diary(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(agent): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<Vec<DiaryEntry>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    let entries = store.read_diary(&ns, &agent, limit).await.map_err(internal)?;
+    Ok(Json(entries))
 }
 
 #[cfg(test)]
@@ -1823,5 +1867,53 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn diaries_write_then_read_via_http() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "op", MEMORY_WRITE);
+        let read = bearer(&auth, "op", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diaries")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "agent": "claude",
+                            "content": "diary note",
+                            "topic": "reflection",
+                            "timestamp": "",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/diaries/claude")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["agent"], "claude");
     }
 }
