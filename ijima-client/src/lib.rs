@@ -52,7 +52,10 @@
 #![forbid(unsafe_code)]
 
 use ijima_core::harness::Harness;
-use ijima_core::{IjimaError, Memory, Result, Session, SessionTurn};
+use ijima_core::{
+    IjimaError, Memory, PalaceGraph, ProjectTaxon, Result, Room, Session, SessionTurn,
+    TunnelTraversal,
+};
 use serde::Deserialize;
 
 /// Configuration for connecting to an Ijima server.
@@ -367,7 +370,81 @@ impl Client {
         Ok(())
     }
 
-    /// Composes the session-start context (`GET /wakeup`): L0 identity +
+    /// Lists rooms (topic cells) in the effective namespace
+    /// (`GET /rooms`), optionally filtered by project.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn list_rooms(
+        &self,
+        namespace: Option<&str>,
+        project: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Room>> {
+        let path = build_path3("/rooms", namespace, project, limit);
+        let resp = self.get(&path).await?;
+        let rooms: Vec<Room> = decode(ok_status(resp).await?).await?;
+        Ok(rooms)
+    }
+
+    /// Full project → topic → count taxonomy (`GET /taxonomy`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn taxonomy(&self, namespace: Option<&str>) -> Result<Vec<ProjectTaxon>> {
+        let path = build_path("/taxonomy", namespace, None);
+        let resp = self.get(&path).await?;
+        let taxons: Vec<ProjectTaxon> = decode(ok_status(resp).await?).await?;
+        Ok(taxons)
+    }
+
+    /// The palace graph (`GET /palace/graph`): projects as nodes, tunnels as edges.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn palace_graph(&self, namespace: Option<&str>) -> Result<PalaceGraph> {
+        let path = build_path("/palace/graph", namespace, None);
+        let resp = self.get(&path).await?;
+        let graph: PalaceGraph = decode(ok_status(resp).await?).await?;
+        Ok(graph)
+    }
+
+    /// Traverses a tunnel (`GET /palace/tunnel`): memories from both
+    /// projects on the shared topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn traverse_tunnel(
+        &self,
+        namespace: Option<&str>,
+        topic: &str,
+        project_a: &str,
+        project_b: &str,
+        limit: Option<usize>,
+    ) -> Result<TunnelTraversal> {
+        let mut params: Vec<String> = Vec::new();
+        if let Some(ns) = namespace {
+            params.push(format!("namespace={ns}"));
+        }
+        params.push(format!("topic={topic}"));
+        params.push(format!("project_a={project_a}"));
+        params.push(format!("project_b={project_b}"));
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        let path = format!("/palace/tunnel?{}", params.join("&"));
+        let resp = self.get(&path).await?;
+        let traversal: TunnelTraversal = decode(ok_status(resp).await?).await?;
+        Ok(traversal)
+    }
     /// L1a personal essentials + L1b team doctrine.
     ///
     /// # Errors
@@ -461,6 +538,31 @@ fn build_path(base: &str, namespace: Option<&str>, limit: Option<usize>) -> Stri
     let mut params: Vec<String> = Vec::new();
     if let Some(ns) = namespace {
         params.push(format!("namespace={ns}"));
+    }
+    if let Some(l) = limit {
+        params.push(format!("limit={l}"));
+    }
+    if params.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, params.join("&"))
+    }
+}
+
+/// Like [`build_path`] but also carries an optional `project` query param
+/// (used by `GET /rooms`).
+fn build_path3(
+    base: &str,
+    namespace: Option<&str>,
+    project: Option<&str>,
+    limit: Option<usize>,
+) -> String {
+    let mut params: Vec<String> = Vec::new();
+    if let Some(ns) = namespace {
+        params.push(format!("namespace={ns}"));
+    }
+    if let Some(p) = project {
+        params.push(format!("project={p}"));
     }
     if let Some(l) = limit {
         params.push(format!("limit={l}"));
