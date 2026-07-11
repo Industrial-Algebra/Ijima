@@ -40,6 +40,7 @@
 #![warn(missing_docs)]
 
 pub mod capabilities;
+pub mod diary;
 pub mod embeddings;
 pub mod error;
 pub mod harness;
@@ -47,15 +48,19 @@ pub mod knowledge;
 pub mod memory;
 pub mod mining;
 pub mod namespace;
+pub mod palace;
 pub mod session;
 pub mod store;
 
+pub use capabilities::intersection_number;
+pub use diary::DiaryEntry;
 pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
 pub use error::IjimaError;
 pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Triple};
 pub use memory::{Memory, MemoryId, MemorySource};
 pub use mining::{AcceptedExtraction, QueuedExtraction};
 pub use namespace::{Namespace, NamespaceId, NamespaceKind};
+pub use palace::{PalaceGraph, ProjectTaxon, Room, Tunnel, TunnelTraversal};
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
 pub use store::{NamespaceCount, Store, StoreStats};
 

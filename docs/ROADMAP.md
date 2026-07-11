@@ -108,15 +108,22 @@ table (upsert by id); `POST /sessions`, `GET /sessions?harness=&namespace=&limit
 
 ## Phase 3 — Nice-to-haves (organizational + operational)
 
-### 3.1 Palace graph & tunnels
+### 3.1 Palace graph & tunnels ✅
 
 `getPalaceGraph`, `traverseTunnel` — cross-project topic connections.
 *"What connects these two projects?"* Powerful for discovery, not
 essential for v1.
 
-### 3.2 Rooms & taxonomy browsing
+**Done** (`feature/palace-organization`): `Store::palace_graph` +
+`traverse_tunnel`; `GET /palace/graph`, `GET /palace/tunnel`.
+
+### 3.2 Rooms & taxonomy browsing ✅
 
 `listRooms`, `getTaxonomy` — projects/topics with counts. Navigation.
+
+**Done** (`feature/palace-organization`): `Store::list_rooms` +
+`taxonomy`; `GET /rooms`, `GET /taxonomy`. All four palace-organization
+endpoints are namespace-scoped reads (`memory:read` + `resolve_ns`).
 
 ### 3.3 Diaries
 
@@ -124,9 +131,14 @@ essential for v1.
 
 ### 3.4 Operational hardening
 
-- **Backup/export** — SurrealDB `db.export()`.
-- **Structured logging** — replace `eprintln!` with `tracing`.
-- **Rate limiting** — wire Schubert's `RateLimiter`.
+- **Structured logging** ✅ — `tracing`/`tracing-subscriber` replace
+  `eprintln!`; `IJIMA_LOG` env filter (`ijima=info` default).
+- **Rate limiting** ✅ — Schubert `RateLimiter` wired into the
+  `AuthPrincipal` extractor (the capability token drives authn + authz +
+  throughput). Capacity scales with the capability's Schubert intersection
+  number (codimension): `memory:read`→1×, `memory:write`→2×, `admin`→16×.
+  429 on exhaustion. `IJIMA_RATE_BASE`/`IJIMA_RATE_MULTIPLIER`/`IJIMA_RATE_DISABLE`.
+- **Backup/export** — SurrealDB `db.export()` (SDK supports it; follow-up).
 - **TLS** — plain HTTP today; acceptable on Tailscale, worth noting.
 
 ### 3.5 Multi-party handling (D9 §3)

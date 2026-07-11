@@ -28,10 +28,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    AcceptedExtraction, Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats,
-    KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId, QueuedExtraction, Result,
-    Session, SessionId, SessionTurn, Store, StoreStats, Triple, embeddings::Embedder,
-    harness::Harness, memory::MemorySource,
+    AcceptedExtraction, DiaryEntry, Embedding, Entity, EntityId, EntityRecord, IjimaError,
+    KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId, PalaceGraph,
+    ProjectTaxon, QueuedExtraction, Result, Room, Session, SessionId, SessionTurn, Store,
+    StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder, harness::Harness,
+    memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -44,6 +45,7 @@ const SURREAL_DB: &str = "core";
 const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
+const DIARY_TABLE: &str = "diaries";
 const QUEUE_TABLE: &str = "mining_queue";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
@@ -112,6 +114,73 @@ impl SurrealStore {
                 detail: format!("surrealdb use_ns/use_db: {e}"),
             })?;
         Ok(Self { db, embedder })
+    }
+
+    /// Fetches all `(project, topic)` cells in `ns` with their memory counts.
+    /// One query, aggregated in Rust (consistent with `store_stats`).
+    async fn project_topic_counts(
+        &self,
+        ns: &NamespaceId,
+    ) -> Result<std::collections::BTreeMap<(String, String), usize>> {
+        #[derive(Deserialize)]
+        struct Row {
+            project: String,
+            topic: String,
+        }
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT project, topic FROM {MEMORIES_TABLE} WHERE namespace = $ns"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        let rows: Vec<Row> = result.take(0).map_err(store_err)?;
+        let mut counts = std::collections::BTreeMap::new();
+        for r in rows {
+            *counts.entry((r.project, r.topic)).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
+
+    /// Returns memories in `ns` matching `project` + `topic`, ranked by
+    /// importance desc then recency desc (mirrors `list_memories`).
+    async fn project_topic_memories(
+        &self,
+        ns: &NamespaceId,
+        project: &str,
+        topic: &str,
+        limit: usize,
+    ) -> Result<Vec<Memory>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace, importance, created_at
+                 FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns AND project = $proj AND topic = $topic
+                 ORDER BY importance DESC, created_at DESC LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("proj", project.to_string()))
+            .bind(("topic", topic.to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
+        Ok(records.into_iter().map(|r| r.into_memory()).collect())
+    }
+
+    /// Exports the entire store as a SurrealDB SQL dump to `path`.
+    /// Requires a persistent backend (SurrealKv); in-memory stores do not
+    /// support Backup.
+    pub async fn export_to(&self, path: impl AsRef<std::path::Path>) -> Result<()> {
+        self.db
+            .export(path.as_ref())
+            .await
+            .map_err(|e| IjimaError::Store {
+                detail: format!("export: {e}"),
+            })?;
+        Ok(())
     }
 }
 
@@ -228,6 +297,42 @@ struct SessionTurnRecord {
     content: String,
     timestamp: String,
     namespace: String,
+}
+
+/// Stored row for a diary entry (Phase 3.3). `ts` is an internal
+/// epoch-millis field for correct numeric ORDER BY (string timestamps
+/// don't sort lexicographically across formats).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiaryRecord {
+    agent: String,
+    content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topic: Option<String>,
+    timestamp: String,
+    ts: i64,
+    namespace: String,
+}
+
+impl DiaryRecord {
+    fn from_entry(entry: &ijima_core::DiaryEntry, ns: &NamespaceId, now_ms: i64) -> Self {
+        Self {
+            agent: entry.agent.clone(),
+            content: entry.content.clone(),
+            topic: entry.topic.clone(),
+            timestamp: entry.timestamp.clone(),
+            ts: now_ms,
+            namespace: ns.as_str().to_string(),
+        }
+    }
+
+    fn into_entry(self) -> ijima_core::DiaryEntry {
+        ijima_core::DiaryEntry {
+            agent: self.agent,
+            content: self.content,
+            topic: self.topic,
+            timestamp: self.timestamp,
+        }
+    }
 }
 
 /// Stored row for a session's metadata (Phase 2.3).
@@ -498,6 +603,122 @@ impl Store for SurrealStore {
         })
     }
 
+    async fn list_rooms(
+        &self,
+        ns: &NamespaceId,
+        project: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Room>> {
+        let counts = self.project_topic_counts(ns).await?;
+        let mut rooms: Vec<Room> = counts
+            .into_iter()
+            .filter(|((p, _), _)| project.is_none_or(|proj| p == proj))
+            .map(|((project, topic), count)| Room {
+                project,
+                topic,
+                count,
+            })
+            .collect();
+        // count desc, then topic for determinism.
+        rooms.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.topic.cmp(&b.topic)));
+        rooms.truncate(limit);
+        Ok(rooms)
+    }
+
+    async fn taxonomy(&self, ns: &NamespaceId) -> Result<Vec<ProjectTaxon>> {
+        let counts = self.project_topic_counts(ns).await?;
+        // group by project
+        let mut by_project: std::collections::BTreeMap<String, Vec<Room>> =
+            std::collections::BTreeMap::new();
+        for ((project, topic), count) in counts {
+            by_project.entry(project).or_default().push(Room {
+                project: String::new(),
+                topic,
+                count,
+            });
+        }
+        let mut taxons: Vec<ProjectTaxon> = by_project
+            .into_iter()
+            .map(|(project, mut rooms)| {
+                rooms.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.topic.cmp(&b.topic)));
+                for r in &mut rooms {
+                    r.project = project.clone();
+                }
+                let total = rooms.iter().map(|r| r.count).sum();
+                ProjectTaxon {
+                    project,
+                    rooms,
+                    total,
+                }
+            })
+            .collect();
+        // projects with the most memories first.
+        taxons.sort_by(|a, b| {
+            b.total
+                .cmp(&a.total)
+                .then_with(|| a.project.cmp(&b.project))
+        });
+        Ok(taxons)
+    }
+
+    async fn palace_graph(&self, ns: &NamespaceId) -> Result<PalaceGraph> {
+        let counts = self.project_topic_counts(ns).await?;
+        // topic -> set of (project, count)
+        let mut topics: std::collections::BTreeMap<String, Vec<(String, usize)>> =
+            std::collections::BTreeMap::new();
+        let mut projects: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for ((project, topic), count) in counts {
+            projects.insert(project.clone());
+            topics.entry(topic).or_default().push((project, count));
+        }
+        let mut tunnels = Vec::new();
+        for (topic, mut entries) in topics {
+            if entries.len() < 2 {
+                continue; // a tunnel needs two distinct projects
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            // every unordered pair of distinct projects on this topic
+            for i in 0..entries.len() {
+                for j in (i + 1)..entries.len() {
+                    tunnels.push(Tunnel {
+                        topic: topic.clone(),
+                        project_a: entries[i].0.clone(),
+                        project_b: entries[j].0.clone(),
+                        count_a: entries[i].1,
+                        count_b: entries[j].1,
+                    });
+                }
+            }
+        }
+        Ok(PalaceGraph {
+            projects: projects.into_iter().collect(),
+            tunnels,
+        })
+    }
+
+    async fn traverse_tunnel(
+        &self,
+        ns: &NamespaceId,
+        topic: &str,
+        project_a: &str,
+        project_b: &str,
+        limit: usize,
+    ) -> Result<TunnelTraversal> {
+        let memories_a = self
+            .project_topic_memories(ns, project_a, topic, limit)
+            .await?;
+        let memories_b = self
+            .project_topic_memories(ns, project_b, topic, limit)
+            .await?;
+        Ok(TunnelTraversal {
+            topic: topic.to_string(),
+            project_a: project_a.to_string(),
+            project_b: project_b.to_string(),
+            memories_a,
+            memories_b,
+        })
+    }
+
     async fn search_memories(
         &self,
         ns: &NamespaceId,
@@ -648,6 +869,7 @@ impl Store for SurrealStore {
         Ok(())
     }
 
+<<<<<<< HEAD
     async fn enqueue_extraction(
         &self,
         ns: &NamespaceId,
@@ -731,6 +953,46 @@ impl Store for SurrealStore {
             .map_err(store_err)?;
         Ok(())
     }
+=======
+    async fn write_diary(&self, ns: &NamespaceId, entry: DiaryEntry) -> Result<()> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let record = DiaryRecord::from_entry(&entry, ns, now_ms);
+        let _: Option<DiaryRecord> = self
+            .db
+            .create(DIARY_TABLE)
+            .content(record)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn read_diary(
+        &self,
+        ns: &NamespaceId,
+        agent: &str,
+        limit: usize,
+    ) -> Result<Vec<DiaryEntry>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT agent, content, topic, timestamp, ts, namespace
+                 FROM {DIARY_TABLE}
+                 WHERE namespace = $ns AND agent = $agent
+                 ORDER BY ts DESC LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("agent", agent.to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        let mut records: Vec<DiaryRecord> = result.take(0).map_err(store_err)?;
+        records.reverse(); // chronological (DESC → reverse)
+        Ok(records.into_iter().map(DiaryRecord::into_entry).collect())
+    }
+>>>>>>> develop
 }
 
 // ---------- knowledge graph ----------
@@ -1278,6 +1540,48 @@ mod tests {
         assert!(cross.is_empty());
     }
 
+    // ===== Diaries =====
+
+    #[tokio::test]
+    async fn diaries_write_appends_and_reads_chronologically() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_diaries");
+
+        let e1 = DiaryEntry {
+            agent: "claude".into(),
+            content: "first entry".into(),
+            topic: None,
+            timestamp: String::new(),
+        };
+        let e2 = DiaryEntry {
+            agent: "claude".into(),
+            content: "second entry".into(),
+            topic: Some("reflection".into()),
+            timestamp: "2026-07-05T12:00:00Z".into(),
+        };
+        store.write_diary(&ns, e1).await.expect("write1");
+        store.write_diary(&ns, e2).await.expect("write2");
+
+        let entries = store.read_diary(&ns, "claude", 10).await.expect("read");
+        assert_eq!(entries.len(), 2);
+        // chronological: e1 before e2
+        assert_eq!(entries[0].content, "first entry");
+        assert_eq!(entries[1].content, "second entry");
+        assert_eq!(entries[1].topic.as_deref(), Some("reflection"));
+
+        // Agent isolation: different agent sees nothing.
+        let other = store.read_diary(&ns, "pi", 10).await.expect("read");
+        assert!(other.is_empty());
+
+        // Namespace isolation: different ns sees nothing.
+        let other_ns = NamespaceId::new("ns_other");
+        let cross = store
+            .read_diary(&other_ns, "claude", 10)
+            .await
+            .expect("read");
+        assert!(cross.is_empty());
+    }
+
     // ===== Vector search =====
 
     /// A deterministic test embedder: maps text to a small fixed-dim
@@ -1546,6 +1850,97 @@ mod tests {
         assert_eq!(ns_a.memories, 2);
     }
 
+    /// Builds a memory with explicit project/topic (sample_memory hardcodes them).
+    fn mem_in(id: &str, project: &str, topic: &str, content: &str) -> Memory {
+        Memory {
+            id: MemoryId(id.into()),
+            content: content.into(),
+            project: project.into(),
+            topic: topic.into(),
+            source: MemorySource::Explicit,
+            harness: Harness::Pi,
+            session_id: None,
+            importance: 0.5,
+            created_at: "0".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn palace_organization_rooms_taxonomy_graph_tunnel() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_palace");
+        // Two projects sharing the topic "auth" (a tunnel), plus a
+        // project-only topic.
+        store
+            .store_memory(&ns, mem_in("m1", "ijima", "auth", "use schubert"))
+            .await
+            .unwrap();
+        store
+            .store_memory(&ns, mem_in("m2", "ijima", "auth", "proof tokens"))
+            .await
+            .unwrap();
+        store
+            .store_memory(&ns, mem_in("m3", "ijima", "store", "surrealdb"))
+            .await
+            .unwrap();
+        store
+            .store_memory(&ns, mem_in("m4", "karpal", "auth", "workspace manifest"))
+            .await
+            .unwrap();
+        store
+            .store_memory(&ns, mem_in("m5", "karpal", "build", "ci"))
+            .await
+            .unwrap();
+
+        // list_rooms — all rooms, count desc.
+        let rooms = store.list_rooms(&ns, None, 100).await.expect("rooms");
+        assert_eq!(rooms.len(), 4);
+        assert_eq!(rooms[0].count, 2); // ijima/auth
+        assert_eq!(rooms[0].project, "ijima");
+        assert_eq!(rooms[0].topic, "auth");
+
+        // list_rooms filtered to karpal.
+        let karpal_rooms = store
+            .list_rooms(&ns, Some("karpal"), 100)
+            .await
+            .expect("rooms karpal");
+        assert_eq!(karpal_rooms.len(), 2);
+        assert!(karpal_rooms.iter().all(|r| r.project == "karpal"));
+
+        // taxonomy — two projects.
+        let taxons = store.taxonomy(&ns).await.expect("taxonomy");
+        assert_eq!(taxons.len(), 2);
+        let ijima_t = taxons
+            .iter()
+            .find(|t| t.project == "ijima")
+            .expect("ijima taxon");
+        assert_eq!(ijima_t.total, 3);
+        assert_eq!(ijima_t.rooms.len(), 2); // auth, store
+
+        // palace_graph — projects + the auth tunnel between ijima & karpal.
+        let graph = store.palace_graph(&ns).await.expect("graph");
+        assert_eq!(graph.projects.len(), 2);
+        assert!(graph.projects.contains(&"ijima".to_string()));
+        assert!(graph.projects.contains(&"karpal".to_string()));
+        let auth_tunnel = graph
+            .tunnels
+            .iter()
+            .find(|t| t.topic == "auth")
+            .expect("auth tunnel");
+        assert_eq!(auth_tunnel.count_a, 2); // ijima
+        assert_eq!(auth_tunnel.count_b, 1); // karpal
+
+        // traverse_tunnel — memories from both sides.
+        let trav = store
+            .traverse_tunnel(&ns, "auth", "ijima", "karpal", 10)
+            .await
+            .expect("traverse");
+        assert_eq!(trav.memories_a.len(), 2);
+        assert_eq!(trav.memories_b.len(), 1);
+        assert!(trav.memories_a.iter().all(|m| m.project == "ijima"));
+        assert!(trav.memories_b.iter().all(|m| m.project == "karpal"));
+    }
+
     #[tokio::test]
     async fn mining_queue_enqueue_list_accept_reject() {
         let store = fresh().await;
@@ -1631,5 +2026,33 @@ mod tests {
             .expect("recall")
             .expect("memory must survive reopen");
         assert_eq!(got.content, "survives restart");
+    }
+
+    #[tokio::test]
+    async fn export_to_writes_sql_dump_to_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ijima-export-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let db_path = dir.join("ijima.db");
+        let store = crate::SurrealStore::open_persistent(&db_path)
+            .await
+            .expect("open");
+        let ns = NamespaceId::new("ns_export");
+        store
+            .store_memory(&ns, sample_memory("mem_x", "export this memory"))
+            .await
+            .expect("store");
+
+        let out = dir.join("dump.surql");
+        store.export_to(&out).await.expect("export");
+        let contents = std::fs::read_to_string(&out).expect("read");
+        assert!(contents.contains("export this memory"));
+        // Clean up.
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
