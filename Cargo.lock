@@ -3876,6 +3876,8 @@ dependencies = [
 [[package]]
 name = "proserpina"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54616a0e77105b5990aa734440830648bd01a210e3e9f595a2b80c993abf220b"
 dependencies = [
  "base64 0.22.1",
  "hex",

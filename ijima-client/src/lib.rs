@@ -53,8 +53,8 @@
 
 use ijima_core::harness::Harness;
 use ijima_core::{
-    DiaryEntry, IjimaError, Memory, PalaceGraph, ProjectTaxon, Result, Room, Session,
-    SessionTurn, TunnelTraversal,
+    DiaryEntry, IjimaError, Memory, PalaceGraph, ProjectTaxon, Result, Room, Session, SessionTurn,
+    TunnelTraversal,
 };
 use serde::Deserialize;
 

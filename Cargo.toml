@@ -22,7 +22,7 @@ readme = "README.md"
 ijima-core = { version = "0.1.0", path = "ijima-core" }
 ijima-server = { version = "0.1.0", path = "ijima-server" }
 ijima-miner = { version = "0.1.0", path = "ijima-miner" }
-proserpina = { version = "0.3.0", path = "../Proserpina" }
+proserpina = { version = "0.3.0" }
 ijima-client = { version = "0.1.0", path = "ijima-client" }
 
 # Shared external dependencies

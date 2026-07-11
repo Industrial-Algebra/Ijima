@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 use crate::{
     AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
-    Result, Session, SessionId, SessionTurn, harness::Harness,
+    Result, Session, SessionId, SessionTurn,
+    harness::Harness,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
 /// Global memory-palace statistics (across all namespaces).

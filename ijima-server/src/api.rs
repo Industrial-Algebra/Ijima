@@ -43,7 +43,7 @@ use ijima_core::{
     AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
     QueuedExtraction, Session, SessionId, SessionTurn, Store,
     capabilities::{
-        KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_TRIGGER, MINING_REVIEW, SESSION_INGEST,
+        KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER, SESSION_INGEST,
     },
     harness::Harness,
 };
@@ -1773,8 +1773,7 @@ mod tests {
         let body = axum::body::to_bytes(res.into_body(), usize::MAX)
             .await
             .unwrap();
-        let report: crate::mining_pipeline::MiningReport =
-            serde_json::from_slice(&body).unwrap();
+        let report: crate::mining_pipeline::MiningReport = serde_json::from_slice(&body).unwrap();
         assert!(
             report.archived >= 1,
             "rules tier should archive the decision: {report:?}"
