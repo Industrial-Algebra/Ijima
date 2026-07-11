@@ -178,6 +178,35 @@ report must establish this before the design is finalized.
 
 ---
 
+## Phase 5 — Federation: networked instances & cross-talk policies (proposed)
+
+**Status: proposed future feature (v0.2+). Not blocked — forward design.**
+Full analysis: [`docs/discovery/networked-instances-federation.md`](discovery/networked-instances-federation.md).
+
+Multiple Ijima daemons federating, for use cases one shared daemon cannot
+serve: airgap/sovereignty, offline/edge + central, multi-org/multi-trust-
+domain federation, resilience, and hub-spoke specialization (a unifying
+instance delegating to domain-authority instances or an archive/backup
+instance).
+
+**Architecture: Dominic orchestrates, Ijima enforces locally.** The
+federation control plane lives in **Dominic** (`../Dominic`), the Anima
+meta-orchestrator — not in Ijima. Ijima instances are the memory plane;
+Dominic brokers cross-talk (routing, domain delegation, conflict
+adjudication, offline coordination). Ijima does **not** need a P2P
+consensus protocol — it needs boundary policy enforcement + a
+Dominic-facing control API. The trust-tier egress and scope filters are
+**Ijima-local and non-bypassable**, so sovereignty holds even when Dominic
+is unreachable or compromised (defense in depth). *Note: Dominic is a
+greenfield stub today; the orchestration-side work is net-new there.*
+
+**Shared foundation with Phase 4:** both rest on an explicit
+trust/provenance-tier model on `Memory` (`MemorySource` + origin-instance +
+authority-scope). Design that extension first, in 0.1.x — it unlocks both
+Phase 4 and Phase 5.
+
+---
+
 ## Deferred (external dependencies)
 
 - **`ijima-miner` extraction** — blocked until Proserpina is finalized.
