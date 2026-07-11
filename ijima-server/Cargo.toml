@@ -51,7 +51,7 @@ schubert = { version = "0.3", features = ["std", "crypto", "policy"], optional =
 base64 = { version = "0.22", optional = true }
 surrealdb = { version = "2", default-features = false, features = ["kv-mem"], optional = true }
 rusqlite = { workspace = true, optional = true }
-ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
+ed25519-dalek = { version = "3", default-features = false, features = ["rand_core"], optional = true }
 rand = { version = "0.8", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 regex = "1"
