@@ -148,9 +148,41 @@ promoted to team) is documented but not implemented.
 
 ---
 
+## Phase 4 — Security: doctrine health & context-poisoning protection (proposed)
+
+**Status: under investigation — blocked on an incident report.**
+
+A trusted, front-loaded system/doctrine prompt degraded a GPT-5.6 session
+to uselessness — but only on one task class (AI research: "overbearing and
+sloppy"). Because the poison *is* trusted instructions, the usual
+retrieved-content sandboxing defense does not apply. The leading hypothesis
+is a **dose-dependent stance/persona directive** that activates on a
+specific task domain and accreted via drift. Full analysis and resume
+checklist: [`docs/discovery/context-poisoning-protection.md`](discovery/context-poisoning-protection.md).
+
+Candidate directions (to be confirmed against the report):
+
+- **B — Doctrine-health registry + outcome correlation** (drift detection,
+  version↔outcome correlation, bisect + rollback). Likely the spine.
+- **C — Stance-budget + task-domain profiles** (cap dose-dependent
+  stance/persona directives at serve time; serve a curated, tested doctrine
+  subset per task domain). The containment mechanism.
+- **A-slice — Ingest-time stance-directive validation** (cheap static
+  checks, not full behavioral regression). Catches obvious pathological
+  directives before they serve.
+
+**Gating open question:** is Ijima the authoritative doctrine store
+(ingest+serve gating on the table), or is the poisoned context largely
+harness-level (Ijima as an opt-in doctrine-health contract)? The incident
+report must establish this before the design is finalized.
+
+---
+
 ## Deferred (external dependencies)
 
 - **`ijima-miner` extraction** — blocked until Proserpina is finalized.
+  *(Proserpina 0.3.0 has shipped; the miner is implemented and merged.
+  This entry is retained for history.)*
 - **`backend-sqlite` migration** — one-time import of the live
   pi-mempalace corpus. Self-contained; pick up when migrating off the
   Node.js mempalace.
