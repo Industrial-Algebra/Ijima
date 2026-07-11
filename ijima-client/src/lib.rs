@@ -25,7 +25,7 @@
 //! ```no_run
 //! # #[tokio::main] async fn main() -> ijima_core::Result<()> {
 //! use ijima_client::{Client, ClientConfig};
-//! use ijima_core::{harness::Harness, Memory, MemoryId, MemorySource};
+//! use ijima_core::{harness::Harness, AuthorityScope, InstanceId, Memory, MemoryId, MemorySource};
 //!
 //! let mut cfg = ClientConfig::new("http://127.0.0.1:7373", Harness::Pi);
 //! cfg.token = Some("Bearer ...".into());
@@ -39,6 +39,8 @@
 //!     source: MemorySource::Explicit,
 //!     harness: Harness::Pi,
 //!     session_id: None,
+//!     origin: InstanceId::local(),
+//!     authority: AuthorityScope::local(),
 //!     importance: 0.5,
 //!     created_at: String::new(),
 //! }).await?;
@@ -674,6 +676,8 @@ mod tests {
                 source: ijima_core::memory::MemorySource::Explicit,
                 harness: Harness::Pi,
                 session_id: None,
+                origin: ijima_core::InstanceId::local(),
+                authority: ijima_core::AuthorityScope::local(),
                 importance: 0.5,
                 created_at: String::new(),
             })

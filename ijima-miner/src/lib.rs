@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn merge_dedups_by_content_case_insensitive() {
-        use ijima_core::{Memory, MemoryId, MemorySource};
+        use ijima_core::{AuthorityScope, InstanceId, Memory, MemoryId, MemorySource};
         fn mem(content: &str) -> Memory {
             Memory {
                 id: MemoryId("x".into()),
@@ -212,6 +212,8 @@ mod tests {
                 source: MemorySource::Mined,
                 harness: Harness::Pi,
                 session_id: None,
+                origin: InstanceId::local(),
+                authority: AuthorityScope::local(),
                 importance: 0.5,
                 created_at: "0".into(),
             }

@@ -59,6 +59,29 @@ kind = "WriteLike"
 label = "Trigger mining"
 description = "Trigger a mining/extraction pass over session context."
 
+# --- Trust-tier transitions (ADR: provenance-tier model) ---
+# Raising trust is costlier than writing at a tier, so these sit above
+# memory:write (codim 2). trust:override is default-deny (no principal
+# seeded with it); wired in Phase 5.
+
+[capabilities."trust:promote"]
+partition = [3, 1]
+kind = "WriteLike"
+label = "Promote trust tier"
+description = "Promote content to a higher trust tier or a shared namespace. Replaces the memory:write check on promote_memory."
+
+[capabilities."trust:endorse"]
+partition = [3, 2]
+kind = "WriteLike"
+label = "Endorse as explicit"
+description = "Endorse mined/auto-capture content as Explicit (a cross-tier jump)."
+
+[capabilities."trust:override"]
+partition = [4, 2]
+kind = "WriteLike"
+label = "Override authority"
+description = "Override local authority (accept conflicting content). Default-deny; Phase 5 federation."
+
 # --- Administrative capability (point class, codimension 16) ---
 
 [capabilities."admin"]

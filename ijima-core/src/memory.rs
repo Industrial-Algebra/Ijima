@@ -10,6 +10,7 @@
 //! client crates.
 
 use crate::harness::Harness;
+use crate::provenance::{AuthorityScope, InstanceId};
 
 /// A newtype for the stable, opaque identifier of a stored memory.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -40,6 +41,16 @@ pub struct Memory {
     pub harness: Harness,
     /// Provenance: the originating session, when known.
     pub session_id: Option<String>,
+    /// Provenance: the instance that authored this entry (ADR
+    /// provenance-tier). Defaults to the local instance for 0.1.0;
+    /// federation (Phase 5) stamps the origin instance.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub origin: InstanceId,
+    /// Provenance: the authority scope (source-of-truth) for this entry's
+    /// domain (ADR provenance-tier). Defaults to local; drives Phase 5
+    /// conflict resolution.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub authority: AuthorityScope,
     /// Importance score (0.0–1.0). Used for wake-up ranking
     /// (top-N by importance × recency). Defaults to 0.5, matching
     /// pi-mempalace.
@@ -71,6 +82,31 @@ pub enum MemorySource {
     Doctrine,
 }
 
+impl MemorySource {
+    /// The Schubert trust grade (codimension) of this tier — the
+    /// quantitative trust axis. **Higher = more trusted.** Phase 5 egress
+    /// filters turn this into intersection arithmetic ("does this
+    /// content's grade fit the link's trust budget?"); Phase 4 keys
+    /// doctrine-health on it.
+    ///
+    /// Grades fit comfortably inside Gr(4,8)'s 4×4 Schubert box:
+    ///
+    /// | Tier | `trust_grade` |
+    /// |---|---|
+    /// | [`AutoCapture`](MemorySource::AutoCapture) | 1 (ambient, unverified) |
+    /// | [`Mined`](MemorySource::Mined) | 2 (model-extracted, review-eligible) |
+    /// | [`Explicit`](MemorySource::Explicit) | 3 (a human deliberately saved it) |
+    /// | [`Doctrine`](MemorySource::Doctrine) | 4 (Git-versioned, PR-reviewed, curated) |
+    pub fn trust_grade(self) -> u64 {
+        match self {
+            MemorySource::AutoCapture => 1,
+            MemorySource::Mined => 2,
+            MemorySource::Explicit => 3,
+            MemorySource::Doctrine => 4,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +121,8 @@ mod tests {
             source: MemorySource::Mined,
             harness: Harness::Pi,
             session_id: Some("sess_7".into()),
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
             importance: 0.8,
             created_at: "123".into(),
         };
@@ -103,5 +141,20 @@ mod tests {
         assert!(matches!(MemorySource::Doctrine, MemorySource::Doctrine));
         assert_ne!(MemorySource::Doctrine, MemorySource::Explicit);
         assert_ne!(MemorySource::Doctrine, MemorySource::Mined);
+    }
+
+    #[test]
+    fn trust_grade_monotone_in_trust() {
+        // Higher tier ⇒ higher grade (more trusted). Drives Phase 5 egress
+        // intersection arithmetic and Phase 4 doctrine-health.
+        assert_eq!(MemorySource::AutoCapture.trust_grade(), 1);
+        assert_eq!(MemorySource::Mined.trust_grade(), 2);
+        assert_eq!(MemorySource::Explicit.trust_grade(), 3);
+        assert_eq!(MemorySource::Doctrine.trust_grade(), 4);
+        assert!(
+            MemorySource::AutoCapture.trust_grade() < MemorySource::Mined.trust_grade()
+                && MemorySource::Mined.trust_grade() < MemorySource::Explicit.trust_grade()
+                && MemorySource::Explicit.trust_grade() < MemorySource::Doctrine.trust_grade()
+        );
     }
 }

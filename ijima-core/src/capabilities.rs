@@ -35,6 +35,9 @@
 //! | [`KNOWLEDGE_WRITE`] | WriteLike | σ₂ | 2 | add/invalidate triples |
 //! | [`SESSION_INGEST`] | WriteLike | σ₃ | 3 | append session-context turns |
 //! | [`MINING_TRIGGER`] | WriteLike | σ₃₁ | 4 | trigger an extraction pass |
+//! | [`TRUST_PROMOTE`] | WriteLike | σ₃₁ | 4 | promote content to a higher trust tier / shared namespace |
+//! | [`TRUST_ENDORSE`] | WriteLike | σ₃₂ | 5 | endorse mined/auto content as Explicit |
+//! | [`TRUST_OVERRIDE`] | WriteLike | σ₄₂ | 6 | override local authority (Phase 5) |
 //! | [`ADMIN`] | AdminLike | σ₄₄₄₄ (point) | 16 | full control |
 
 /// The Grassmannian Ijima's policy lives on: **Gr(4,8)**, dimension 16.
@@ -59,6 +62,20 @@ pub const MINING_TRIGGER: &str = "mining:trigger";
 /// Full administrative control (the point class σ₄₄₄₄; implies all others).
 pub const ADMIN: &str = "admin";
 
+// --- Trust-tier transitions (ADR: provenance-tier model) ---
+// Raising trust is costlier than writing at a tier, so these sit at higher
+// codimension than `memory:write`. `trust:override` is default-deny in
+// policy (no principal seeded with it) — wired in Phase 5.
+
+/// Promote content to a higher trust tier / shared namespace. Replaces the
+/// plain `memory:write` check on `promote_memory` (codim 4, a consequential
+/// write on par with `mining:trigger`).
+pub const TRUST_PROMOTE: &str = "trust:promote";
+/// Endorse mined/auto content as Explicit — a cross-tier jump (codim 5).
+pub const TRUST_ENDORSE: &str = "trust:endorse";
+/// Override local authority (accept conflicting content) — Phase 5 (codim 6).
+pub const TRUST_OVERRIDE: &str = "trust:override";
+
 /// Every capability wire ID, in increasing-codimension order. Used to
 /// validate identifiers at the API boundary; the geometric definitions
 /// live in `policy/policy.toml`.
@@ -70,6 +87,9 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     KNOWLEDGE_WRITE,
     SESSION_INGEST,
     MINING_TRIGGER,
+    TRUST_PROMOTE,
+    TRUST_ENDORSE,
+    TRUST_OVERRIDE,
     ADMIN,
 ];
 
@@ -93,7 +113,9 @@ pub fn intersection_number(capability: &str) -> u64 {
         MEMORY_READ | KNOWLEDGE_READ => 1,
         MINING_REVIEW | MEMORY_WRITE | KNOWLEDGE_WRITE => 2,
         SESSION_INGEST => 3,
-        MINING_TRIGGER => 4,
+        MINING_TRIGGER | TRUST_PROMOTE => 4,
+        TRUST_ENDORSE => 5,
+        TRUST_OVERRIDE => 6,
         ADMIN => 16,
         _ => 1,
     }
@@ -134,6 +156,9 @@ mod tests {
         assert_eq!(intersection_number(KNOWLEDGE_WRITE), 2);
         assert_eq!(intersection_number(SESSION_INGEST), 3);
         assert_eq!(intersection_number(MINING_TRIGGER), 4);
+        assert_eq!(intersection_number(TRUST_PROMOTE), 4);
+        assert_eq!(intersection_number(TRUST_ENDORSE), 5);
+        assert_eq!(intersection_number(TRUST_OVERRIDE), 6);
         assert_eq!(intersection_number(ADMIN), 16);
         // Unknown capabilities default to the lowest codim (conservative).
         assert_eq!(intersection_number("future:cap"), 1);

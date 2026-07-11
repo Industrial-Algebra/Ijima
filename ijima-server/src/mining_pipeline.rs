@@ -90,6 +90,8 @@ mod tests {
             source: MemorySource::Mined,
             harness: ijima_core::harness::Harness::Pi,
             session_id: Some("sess_1".into()),
+            origin: ijima_core::InstanceId::local(),
+            authority: ijima_core::AuthorityScope::local(),
             importance: 0.7,
             created_at: "0".into(),
         }

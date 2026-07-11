@@ -28,7 +28,7 @@
 //! feature (constructed by the daemon); tests use a scripted agent that
 //! returns canned JSON.
 
-use ijima_core::{IjimaError, Memory, MemoryId, MemorySource, Result};
+use ijima_core::{AuthorityScope, IjimaError, InstanceId, Memory, MemoryId, MemorySource, Result};
 use proserpina::{Agent, AgentId, Message, MessageKind, Persona};
 use serde::Deserialize;
 
@@ -195,6 +195,8 @@ fn llm_memory(line: &LlmLine, ctx: &MiningContext) -> Memory {
         source: MemorySource::Mined,
         harness: ctx.harness,
         session_id: Some(ctx.session_id.clone()),
+        origin: InstanceId::local(),
+        authority: AuthorityScope::local(),
         importance: line.confidence.clamp(0.0, 1.0),
         created_at: ctx.now.clone(),
     }

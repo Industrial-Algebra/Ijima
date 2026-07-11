@@ -44,6 +44,7 @@ use ijima_core::{
     QueuedExtraction, Session, SessionId, SessionTurn, Store,
     capabilities::{
         KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER, SESSION_INGEST,
+        TRUST_PROMOTE,
     },
     harness::Harness,
 };
@@ -370,7 +371,7 @@ async fn promote_memory(
     Path(id): Path<String>,
     Json(req): Json<PromoteRequest>,
 ) -> Result<Json<PromoteResponse>, ApiError> {
-    if !principal.0.may(MEMORY_WRITE) {
+    if !principal.0.may(TRUST_PROMOTE) {
         return Err(ApiError::Forbidden);
     }
     let personal_ns = principal.0.personal_namespace();
@@ -399,6 +400,9 @@ async fn promote_memory(
         harness: memory.harness,
         // Provenance back-reference to the original personal memory.
         session_id: Some(id.clone()),
+        // Promotion preserves the origin/authority provenance of the source.
+        origin: memory.origin.clone(),
+        authority: memory.authority.clone(),
         importance: memory.importance,
         created_at: memory.created_at.clone(),
     };
@@ -452,6 +456,9 @@ async fn ingest_doctrine(
         source: ijima_core::memory::MemorySource::Doctrine,
         harness: ijima_core::harness::Harness::Other,
         session_id: None,
+        // Doctrine is the curated local tier — authoritative on this instance.
+        origin: ijima_core::InstanceId::local(),
+        authority: ijima_core::AuthorityScope::local(),
         importance: 1.0,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1080,6 +1087,7 @@ mod tests {
         let (app, auth) = app_with_store().await;
         let write = bearer(&auth, "elliott", MEMORY_WRITE);
         let read = bearer(&auth, "elliott", MEMORY_READ);
+        let promote = bearer(&auth, "elliott", TRUST_PROMOTE);
 
         // Store a personal memory containing a secret.
         let body = serde_json::json!({
@@ -1117,7 +1125,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/memories/mem_secret/promote")
-                    .header("authorization", &write)
+                    .header("authorization", &promote)
                     .header("content-type", "application/json")
                     .body(Body::from(promote_body))
                     .unwrap(),
@@ -1188,6 +1196,73 @@ mod tests {
         assert!(!shared.content.contains("ops@test.com"));
         // Provenance back-reference.
         assert_eq!(shared.session_id.as_deref(), Some("mem_secret"));
+    }
+
+    #[tokio::test]
+    async fn promote_requires_trust_promote_not_memory_write() {
+        // ADR provenance-tier: raising trust is costlier than writing at a
+        // tier, so promote_memory requires trust:promote (codim 4), not
+        // memory:write (codim 2). A memory:write-only token gets 403.
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "id": "mem_p",
+            "content": "provenance tier test",
+            "project": "ijima",
+            "topic": "t",
+            "source": "Explicit",
+            "harness": "Pi",
+        })
+        .to_string();
+        // Store succeeds with memory:write.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Promote is forbidden with only memory:write.
+        let promote_body = serde_json::json!({ "target_namespace": "ns_team_shared" }).to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/mem_p/promote")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(promote_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // A trust:promote holder succeeds.
+        let promote = bearer(&auth, "elliott", TRUST_PROMOTE);
+        let promote_body = serde_json::json!({ "target_namespace": "ns_team_shared" }).to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/mem_p/promote")
+                    .header("authorization", &promote)
+                    .header("content-type", "application/json")
+                    .body(Body::from(promote_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

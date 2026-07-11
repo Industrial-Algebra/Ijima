@@ -11,7 +11,7 @@
 //! All rule extractions route to [`crate::Extraction::Auto`] (high confidence —
 //! the signal is unambiguous). The LLM tier adds Fact + Pattern roles.
 
-use ijima_core::{Memory, MemoryId, MemorySource};
+use ijima_core::{AuthorityScope, InstanceId, Memory, MemoryId, MemorySource};
 
 use crate::{Extraction, MiningContext};
 
@@ -107,6 +107,8 @@ fn decision_memory(clause: &str, ctx: &MiningContext) -> Memory {
         source: MemorySource::Mined,
         harness: ctx.harness,
         session_id: Some(ctx.session_id.clone()),
+        origin: InstanceId::local(),
+        authority: AuthorityScope::local(),
         importance: 0.7,
         created_at: ctx.now.clone(),
     }
@@ -142,6 +144,8 @@ fn reference_memory(url: &str, ctx: &MiningContext) -> Memory {
         source: MemorySource::Mined,
         harness: ctx.harness,
         session_id: Some(ctx.session_id.clone()),
+        origin: InstanceId::local(),
+        authority: AuthorityScope::local(),
         importance: 0.5,
         created_at: ctx.now.clone(),
     }

@@ -49,6 +49,7 @@ pub mod memory;
 pub mod mining;
 pub mod namespace;
 pub mod palace;
+pub mod provenance;
 pub mod session;
 pub mod store;
 
@@ -61,6 +62,7 @@ pub use memory::{Memory, MemoryId, MemorySource};
 pub use mining::{AcceptedExtraction, QueuedExtraction};
 pub use namespace::{Namespace, NamespaceId, NamespaceKind};
 pub use palace::{PalaceGraph, ProjectTaxon, Room, Tunnel, TunnelTraversal};
+pub use provenance::{AuthorityScope, InstanceId};
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
 pub use store::{NamespaceCount, Store, StoreStats};
 

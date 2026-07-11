@@ -28,10 +28,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    AcceptedExtraction, DiaryEntry, Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats,
-    KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon,
-    QueuedExtraction, Result, Room, Session, SessionId, SessionTurn, Store, StoreStats, Triple,
-    Tunnel, TunnelTraversal, embeddings::Embedder, harness::Harness, memory::MemorySource,
+    AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
+    IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
+    PalaceGraph, ProjectTaxon, QueuedExtraction, Result, Room, Session, SessionId, SessionTurn,
+    Store, StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder, harness::Harness,
+    memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -230,6 +231,14 @@ struct MemoryRecord {
     importance: f32,
     #[serde(default)]
     created_at: String,
+    /// Provenance: the authoring instance (ADR provenance-tier). Defaults
+    /// to local for documents written before the field existed.
+    #[serde(default)]
+    origin: InstanceId,
+    /// Provenance: the authority scope (source-of-truth) for the record's
+    /// domain (ADR provenance-tier). Defaults to local.
+    #[serde(default)]
+    authority: AuthorityScope,
     /// Which embedding model produced `embedding` (D10 provenance), e.g.
     /// `sentence-transformers/all-MiniLM-L6-v2@main`. Absent when no
     /// embedder is configured.
@@ -267,6 +276,8 @@ impl MemoryRecord {
             namespace: ns.as_str().to_string(),
             importance: memory.importance,
             created_at: memory.created_at.clone(),
+            origin: memory.origin.clone(),
+            authority: memory.authority.clone(),
             embed_model,
             embedding,
         }
@@ -281,6 +292,8 @@ impl MemoryRecord {
             source: self.source,
             harness: self.harness,
             session_id: self.session_id,
+            origin: self.origin,
+            authority: self.authority,
             importance: self.importance,
             created_at: self.created_at,
         }
@@ -424,6 +437,8 @@ impl QueueRecord {
             source: MemorySource::Mined,
             harness,
             session_id: self.session_id,
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
             importance: self.importance,
             created_at: String::new(),
         };
@@ -445,6 +460,8 @@ impl QueueRecord {
             source: MemorySource::Mined,
             harness: Harness::from_wire_str(&self.harness),
             session_id: self.session_id,
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
             importance: self.importance,
             created_at: String::new(),
         }
@@ -1286,6 +1303,8 @@ mod tests {
             source: MemorySource::Explicit,
             harness: Harness::Pi,
             session_id: Some("sess_1".into()),
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
             importance: 0.5,
             created_at: "0".into(),
         }
@@ -1309,6 +1328,10 @@ mod tests {
         assert_eq!(got.content, "decided to use surrealdb");
         assert_eq!(got.harness, Harness::Pi);
         assert_eq!(got.source, MemorySource::Explicit);
+        // Provenance fields persist through a store→recall round-trip
+        // (ADR provenance-tier): origin/authority survive SurrealDB.
+        assert_eq!(got.origin, InstanceId::local());
+        assert_eq!(got.authority, AuthorityScope::local());
     }
 
     #[tokio::test]
@@ -1856,6 +1879,8 @@ mod tests {
             source: MemorySource::Explicit,
             harness: Harness::Pi,
             session_id: None,
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
             importance: 0.5,
             created_at: "0".into(),
         }
