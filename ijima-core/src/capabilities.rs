@@ -73,6 +73,32 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     ADMIN,
 ];
 
+/// The Schubert intersection number (codimension) of a capability's
+/// partition — the geometric weight used for rate-limiting capacity.
+///
+/// A capability's codimension is the sum of its partition parts (the
+/// degree of its Schubert cycle). Per Schubert's rate-limiter, this
+/// becomes the per-principal token-bucket capacity multiplier: a
+/// principal holding `memory:write` (codim 2) gets 2× the throughput of
+/// one holding `memory:read` (codim 1); `admin` (the point class, codim
+/// 16) gets 16×. *The geometry of access maps to the geometry of
+/// throughput.*
+///
+/// **Coupling:** these codimensions mirror `policy/policy.toml`. If the
+/// policy's partitions change, update this mapping. Unknown capability
+/// ids default to codim 1 (the lowest, σ₁) so a future capability is
+/// rate-limited conservatively until promoted here.
+pub fn intersection_number(capability: &str) -> u64 {
+    match capability {
+        MEMORY_READ | KNOWLEDGE_READ => 1,
+        MINING_REVIEW | MEMORY_WRITE | KNOWLEDGE_WRITE => 2,
+        SESSION_INGEST => 3,
+        MINING_TRIGGER => 4,
+        ADMIN => 16,
+        _ => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,5 +122,20 @@ mod tests {
     #[test]
     fn admin_is_in_vocabulary() {
         assert!(ALL_CAPABILITIES.contains(&ADMIN));
+    }
+
+    #[test]
+    fn intersection_numbers_match_policy_codimensions() {
+        // Codimension = sum of partition parts (mirrors policy/policy.toml).
+        assert_eq!(intersection_number(MEMORY_READ), 1);
+        assert_eq!(intersection_number(KNOWLEDGE_READ), 1);
+        assert_eq!(intersection_number(MINING_REVIEW), 2);
+        assert_eq!(intersection_number(MEMORY_WRITE), 2);
+        assert_eq!(intersection_number(KNOWLEDGE_WRITE), 2);
+        assert_eq!(intersection_number(SESSION_INGEST), 3);
+        assert_eq!(intersection_number(MINING_TRIGGER), 4);
+        assert_eq!(intersection_number(ADMIN), 16);
+        // Unknown capabilities default to the lowest codim (conservative).
+        assert_eq!(intersection_number("future:cap"), 1);
     }
 }

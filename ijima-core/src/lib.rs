@@ -50,6 +50,7 @@ pub mod palace;
 pub mod session;
 pub mod store;
 
+pub use capabilities::intersection_number;
 pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
 pub use error::IjimaError;
 pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Triple};
