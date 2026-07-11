@@ -46,7 +46,7 @@ candle-core = { git = "https://github.com/huggingface/candle", default-features 
 candle-nn = { git = "https://github.com/huggingface/candle", default-features = false, optional = true }
 candle-transformers = { git = "https://github.com/huggingface/candle", default-features = false, optional = true }
 tokenizers = { version = "0.21", optional = true }
-hf-hub = { version = "0.5", optional = true }
+hf-hub = { version = "1.0", optional = true }
 schubert = { version = "0.3", features = ["std", "crypto", "policy"], optional = true }
 base64 = { version = "0.22", optional = true }
 surrealdb = { version = "2", default-features = false, features = ["kv-mem"], optional = true }
