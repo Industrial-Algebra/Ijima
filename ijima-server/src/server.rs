@@ -126,6 +126,36 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     );
 
     let addr = format!("{}:{}", config.host, config.port);
+
+    // TLS: if both cert and key env vars are set, serve over HTTPS.
+    // Plain HTTP is the default — no config = no TLS.
+    #[cfg(feature = "tls")]
+    if let (Some(cert_path), Some(key_path)) = (
+        std::env::var_os("IJIMA_TLS_CERT"),
+        std::env::var_os("IJIMA_TLS_KEY"),
+    ) {
+        let tls_config =
+            axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path)
+                .await
+                .map_err(|e| IjimaError::Store {
+                    detail: format!("tls config: {e}"),
+                })?;
+        let listener = axum_server::bind_rustls(
+            addr.parse().map_err(|e| IjimaError::Store {
+                detail: format!("parse {addr}: {e}"),
+            })?,
+            tls_config,
+        );
+        eprintln!("ijima: listening on https://{addr}");
+        listener
+            .serve(app.into_make_service())
+            .await
+            .map_err(|e| IjimaError::Store {
+                detail: format!("serve: {e}"),
+            })?;
+        return Ok(());
+    }
+
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(|e| IjimaError::Store {
