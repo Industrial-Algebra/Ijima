@@ -19,27 +19,48 @@ The goal: any agent can ask *"what do we know about X?"* and get an
 answer drawing on every harness's accumulated context — scoped to what
 that agent is allowed to see.
 
-## Current state (v0.1.0)
+## Current state (unreleased — toward 0.1.0)
 
-The foundation is built, tested (69 tests), and live:
+> **Not yet shipped.** The features below are merged to `develop` (118
+tests) but nothing is 0.1.0 until the crates are published to crates.io
+> and the release is tagged. The authoritative status of what's merged:
 
 | Capability | Status |
 |---|---|
-| Memory palace CRUD + list | ✅ |
+| Memory palace CRUD + list + dedup (hash + semantic) | ✅ |
 | Semantic search (candle + cosine) | ✅ |
 | Multi-tenancy (personal/shared/doctrine + isolation) | ✅ |
-| Promotion (personal→shared, redacted) | ✅ |
+| Promotion (personal→shared, redacted) — gated by `trust:promote` | ✅ |
+| Knowledge graph (temporal triples, timeline, stats) | ✅ |
+| Session-context repository (sessions + turns) | ✅ |
 | Doctrine ingest (Git → CI → service) | ✅ |
 | Wake-up composition (L0 + L1a + L1b) | ✅ |
-| Schubert auth (proof-carrying tokens, Gr(4,8)) | ✅ |
+| Palace organization (graph, tunnels, rooms, taxonomy) | ✅ |
+| Per-agent diaries | ✅ |
+| **Mining pipeline** (rules + Proserpina llm, review queue, trigger) | ✅ |
+| **Context Mapper** (global repo directory, CWD→project) | ✅ |
+| **Provenance-tier model** (origin/authority + trust_grade + transition caps) | ✅ |
+| Schubert auth (proof-carrying tokens, Gr(4,8)) + rate limiting | ✅ |
+| Persistence (SurrealKv) + structured logging + backup/export + TLS | ✅ |
 | `ijima-client` (typed harness adapter) | ✅ |
-| `ijima token` / `ijima serve` / `ijima doctrine` CLI | ✅ |
+| `ijima token/serve/ingest/export/doctrine` CLI | ✅ |
 
-See `docs/DESIGN.md` for the decision log (D1–D9).
+See `docs/DESIGN.md` (D1–D11) and `docs/adr/` for the decision log.
+
+**Remaining for/after 0.1.0:** backend-sqlite corpus migration (import the
+live pi-mempalace corpus), pi integration (the migration's forcing
+function), 3.5 multi-party handling, and the Phase 4/5 future features
+(context-poisoning protection, federation).
 
 ---
 
 ## Phase 1 — Critical (blocks the mission)
+
+> **✅ Merged to develop (unreleased).** Phases 1–3 below are retained as the historical
+> design rationale for what landed; the authoritative status is the
+> *Current state* table above. The remaining open work is [Phase 4/5
+> (future features)](#phase-4--security-doctrine-health--context-poisoning-protection-proposed),
+> the backend-sqlite corpus migration, and 3.5 multi-party.
 
 ### 1.1 Persistence
 
