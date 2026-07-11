@@ -26,6 +26,7 @@
 //! | GET | `/mining/queue` | `mining:review` | `list_pending` |
 //! | POST | `/mining/queue/:id/accept` | `mining:review` | `accept_extraction` |
 //! | POST | `/mining/queue/:id/reject` | `mining:review` | `reject_extraction` |
+//! | POST | `/sessions/:session_id/mine` | `mining:trigger` | `trigger_mine` (feature `mining`) |
 
 use std::sync::Arc;
 
@@ -41,7 +42,9 @@ use serde::{Deserialize, Serialize};
 use ijima_core::{
     AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
     QueuedExtraction, Session, SessionId, SessionTurn, Store,
-    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST},
+    capabilities::{
+        KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_TRIGGER, MINING_REVIEW, SESSION_INGEST,
+    },
     harness::Harness,
 };
 
@@ -83,7 +86,10 @@ pub fn app(
         .route("/sessions/:session_id/end", post(end_session))
         .route("/mining/queue", get(list_pending))
         .route("/mining/queue/:id/accept", post(accept_extraction))
-        .route("/mining/queue/:id/reject", post(reject_extraction))
+        .route("/mining/queue/:id/reject", post(reject_extraction));
+    #[cfg(feature = "mining")]
+    let router = router.route("/sessions/:session_id/mine", post(trigger_mine));
+    let router = router
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
@@ -788,6 +794,110 @@ async fn reject_extraction(
     let ns = principal.0.personal_namespace();
     store.reject_extraction(&ns, &id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- mining trigger (ADR M1, M3, M7) ----------
+
+/// Triggers an extraction pass over a session's turns: runs the rules tier
+/// (always) plus the llm tier when `IJIMA_LLM_*` is configured, merges +
+/// content-dedups, then ingests — `Auto` extractions archive to the palace,
+/// `PendingReview` stage in the review queue. Auth: `mining:trigger`.
+///
+/// The llm agent's `HttpAgent::respond` blocks on its own tokio runtime, so
+/// the synchronous `mine_all` pass runs on a blocking thread (via
+/// [`tokio::task::spawn_blocking`]) to avoid a runtime-in-runtime panic
+/// inside this async handler. The concrete [`HttpAgent`] is `Send`; the
+/// `&mut dyn Agent` coercion happens *inside* the closure, so it never
+/// crosses the spawn boundary as an unsized non-`Send` trait object.
+#[cfg(feature = "mining")]
+async fn trigger_mine(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(session_id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<crate::mining_pipeline::MiningReport>, ApiError> {
+    use proserpina::backend::http::HttpAgent;
+
+    if !principal.0.may(MINING_TRIGGER) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+
+    // Fetch the session's turns (a generous limit — v0 mines the whole session).
+    let turns = store
+        .session_turns(&ns, &SessionId::new(session_id.clone()), 10_000)
+        .await
+        .map_err(internal)?;
+    let turn_texts: Vec<String> = turns.into_iter().map(|t| t.content).collect();
+    let ctx = crate::mining_pipeline::mining_context(&session_id, "general", Harness::Other);
+
+    // The extraction pass is synchronous (ADR M1); the llm agent bridges to
+    // async HTTP internally via its own runtime + `block_on`. Run it on a
+    // blocking thread so that `block_on` is legal (we are outside any async
+    // executor here). `build_mining_agent` returns a concrete `Option<HttpAgent>`
+    // — kept as the concrete type (not a trait object) so it stays `Send` for
+    // the move into the spawned task.
+    let extractions = tokio::task::spawn_blocking(move || {
+        let mut agent: Option<HttpAgent> = build_mining_agent();
+        let agent_dyn: Option<&mut dyn proserpina::Agent> =
+            agent.as_mut().map(|a| a as &mut dyn proserpina::Agent);
+        ijima_miner::mine_all(&turn_texts, &ctx, agent_dyn)
+    })
+    .await
+    .map_err(|e| {
+        internal(ijima_core::IjimaError::Mining {
+            detail: format!("extraction task failed: {e}"),
+        })
+    })?
+    .map_err(internal)?;
+
+    let report = crate::mining_pipeline::ingest_extractions(store.as_ref(), &ns, extractions)
+        .await
+        .map_err(internal)?;
+    Ok(Json(report))
+}
+
+/// Constructs the llm extraction agent from `IJIMA_LLM_*` env config, or
+/// `None` when mining should run rules-only (no `IJIMA_LLM_MODEL` /
+/// `IJIMA_LLM_API_KEY` set). `mine_all(None)` then skips the llm tier.
+///
+/// Defaults `IJIMA_LLM_BASE_URL` to the DeepSeek endpoint. The agent uses a
+/// single "Session Mining Extractor" persona covering both fact and pattern
+/// extraction; v0 does not vary the agent persona per role (ADR M5,
+/// single-shot). Returns a concrete [`HttpAgent`] (not a trait object) so it
+/// remains `Send` for the blocking-thread move.
+#[cfg(feature = "mining")]
+fn build_mining_agent() -> Option<proserpina::backend::http::HttpAgent> {
+    use proserpina::{
+        AgentId, Persona,
+        backend::http::{HttpAgent, HttpConfig},
+    };
+
+    let base_url = std::env::var("IJIMA_LLM_BASE_URL")
+        .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
+    let model = std::env::var("IJIMA_LLM_MODEL").ok()?;
+    let api_key = std::env::var("IJIMA_LLM_API_KEY").ok()?;
+
+    let persona = Persona::new("Session Mining Extractor")
+        .with_framing(
+            "You mine session transcripts for durable facts and recurring \
+             patterns. Output one JSON object per line, each \
+             {\"content\",\"project\",\"topic\",\"confidence\"}. Omit all \
+             preamble. If nothing worth extracting, output nothing.",
+        )
+        .with_focus(
+            "decisions, chosen tools, stated constraints, measurements, recurring workflows",
+        );
+
+    Some(HttpAgent::new(
+        AgentId::new("ijima-miner"),
+        persona,
+        HttpConfig {
+            base_url,
+            model,
+            api_key,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1592,5 +1702,82 @@ mod tests {
         )
         .unwrap();
         assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "mining")]
+    #[tokio::test]
+    async fn trigger_requires_mining_trigger_capability() {
+        let (app, auth) = app_with_store().await;
+        // A memory:write holder cannot trigger mining.
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/sess_x/mine")
+                    .header("authorization", &write)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "mining")]
+    #[tokio::test]
+    async fn trigger_mines_decision_and_archives() {
+        // Rules-only: assumes no IJIMA_LLM_* env is set (CI is clean). When
+        // env is unset, `build_mining_agent` returns None and `mine_all` runs
+        // the deterministic rules tier.
+        let (app, auth) = app_with_store().await;
+        let ingest = bearer(&auth, "elliott", SESSION_INGEST);
+        let trigger = bearer(&auth, "elliott", MINING_TRIGGER);
+
+        // Ingest a decision-bearing turn into elliott's personal namespace.
+        let turn = serde_json::json!({
+            "session_id": "sess_mine",
+            "turn_index": 0,
+            "role": "User",
+            "content": "We decided to use SurrealDB for storage.",
+            "timestamp": "0",
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/sess_mine/turns")
+                    .header("authorization", &ingest)
+                    .header("content-type", "application/json")
+                    .body(Body::from(turn.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // Trigger mining (rules-only: no IJIMA_LLM_* env in tests).
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/sessions/sess_mine/mine")
+                    .header("authorization", &trigger)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let report: crate::mining_pipeline::MiningReport =
+            serde_json::from_slice(&body).unwrap();
+        assert!(
+            report.archived >= 1,
+            "rules tier should archive the decision: {report:?}"
+        );
     }
 }

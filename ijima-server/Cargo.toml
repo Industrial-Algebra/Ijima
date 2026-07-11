@@ -38,7 +38,7 @@ cli = ["dep:clap", "dep:reqwest"]
 embeddings-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "ijima-core/serde"]
 # Mining trigger orchestration: fetch session turns, run the extraction
 # engine, and ingest (Auto → palace, PendingReview → review queue).
-mining = ["dep:ijima-miner", "backend-surreal", "ijima-miner/llm"]
+mining = ["dep:ijima-miner", "dep:proserpina", "backend-surreal", "ijima-miner/llm", "proserpina/backend-http"]
 # Optional TLS for the HTTP daemon. Env-driven (`IJIMA_TLS_CERT` +
 # `IJIMA_TLS_KEY` PEM paths). Plain HTTP remains the default.
 tls = ["dep:axum-server", "http"]
@@ -46,6 +46,9 @@ tls = ["dep:axum-server", "http"]
 [dependencies]
 ijima-core = { workspace = true }
 ijima-miner = { workspace = true, optional = true }
+# Direct (optional) so the mining trigger can construct a Proserpina HTTP
+# agent. `mining` enables `backend-http` to compile the http module.
+proserpina = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
