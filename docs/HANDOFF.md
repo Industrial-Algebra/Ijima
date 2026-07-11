@@ -15,7 +15,7 @@
 
 ## 1. What Ijima Is
 
-Ijima is the **centralized agentic memory backend** for the IA ecosystem.
+Ijima is the **centralized agentic memory backend** for the Anima ecosystem.
 It replaces the fragmented, per-harness memory stores with a single
 authoritative memory service that every agent reads from and writes to.
 
@@ -423,7 +423,29 @@ queue. This connects to Tsume's mempalace-browser dashboard.
 4. **Session Context Repository** — raw session turns from every
    harness. Append-only, high-fidelity. The novel store (see §4).
 
-5. **The Miner** — the extraction engine. Reads sessions, proposes
+5. **The Context Mapper** — the Anima directory binder. A `repository_directory`
+   table that maps repo names to absolute paths, remote URLs, and roles.
+   Harnesses query Ijima for "where's Kagome?" instead of hard-coding
+   paths. This solves the pi context problem — when repos move (or when pi
+   sessions start in different directories), Ijima is the single source of
+   truth. The table also serves as the canonical Anima ecosystem member list.
+
+   ```sql
+   -- Proposed
+   CREATE TABLE repository_directory (
+     name TEXT PRIMARY KEY,           -- 'Kagome', 'Tsume', 'Dominic'
+     path TEXT NOT NULL,               -- '/home/elliotthall/working/industrial-algebra/Kagome'
+     remote_url TEXT,                  -- 'git@github.com:Industrial-Algebra/Kagome.git'
+     role TEXT,                        -- 'tui-substrate', 'gateway-adapter', 'orchestrator'
+     is_anima_member BOOLEAN DEFAULT 1 -- part of the Anima ecosystem?
+   );
+   ```
+
+   This is a **0.1.0 priority feature** — Ijima is approaching 0.1.0 and
+   the context mapper is essential for the Anima ecosystem to function
+   without hard-coded path assumptions.
+
+6. **The Miner** — the extraction engine. Reads sessions, proposes
    memory palace entries + triples. LLM-backed with rule-based
    pre-filtering. Provenance-tracked. Review-queue aware.
 

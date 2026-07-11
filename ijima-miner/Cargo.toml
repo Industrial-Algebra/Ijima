@@ -15,16 +15,16 @@ default = ["std"]
 std = []
 # Rule-based extraction (URL detection, "we decided" patterns). Cheap, no model.
 rules = []
-# LLM-backed extraction. Adds HTTP client + provider routing.
-llm = ["dep:reqwest", "dep:tokio", "dep:tracing"]
+# LLM-backed extraction via Proserpina (Agent trait + personas). The Agent
+# is synchronous, so no async runtime is needed in this crate; the HTTP
+# backend lives in Proserpina's `backend-http` (used by the daemon).
+llm = ["dep:proserpina"]
 
 [dependencies]
 ijima-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-reqwest = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
-tracing = { workspace = true, optional = true }
+proserpina = { workspace = true, optional = true }
 
 [dev-dependencies]
