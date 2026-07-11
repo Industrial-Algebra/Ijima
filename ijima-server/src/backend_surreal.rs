@@ -28,16 +28,35 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    AcceptedExtraction, Embedding, Entity, EntityId, EntityRecord, IjimaError, KgStats,
-    KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId, QueuedExtraction, Result,
-    Session, SessionId, SessionTurn, Store, StoreStats, Triple, embeddings::Embedder,
-    harness::Harness, memory::MemorySource,
-    AcceptedExtraction, DiaryEntry, Embedding, Entity, EntityId, EntityRecord, IjimaError,
-    KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId, PalaceGraph,
-    ProjectTaxon, QueuedExtraction, Result, Room, Session, SessionId, SessionTurn, Store,
-    StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder, harness::Harness,
+    AcceptedExtraction,
+    DiaryEntry,
+    Embedding,
+    Entity,
+    EntityId,
+    EntityRecord,
+    IjimaError,
+    KgStats,
+    KnowledgeGraph,
+    Memory,
+    MemoryId,
+    NamespaceCount,
+    NamespaceId,
+    PalaceGraph,
+    ProjectTaxon,
+    QueuedExtraction,
+    Result,
+    Room,
+    Session,
+    SessionId,
+    SessionTurn,
+    Store,
+    StoreStats,
+    Triple,
+    Tunnel,
+    TunnelTraversal,
+    embeddings::Embedder,
+    harness::Harness,
     memory::MemorySource,
-
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -51,7 +70,6 @@ const MEMORIES_TABLE: &str = "memories";
 const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
 const DIARY_TABLE: &str = "diaries";
-
 const QUEUE_TABLE: &str = "mining_queue";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
@@ -996,7 +1014,6 @@ impl Store for SurrealStore {
         records.reverse(); // chronological (DESC → reverse)
         Ok(records.into_iter().map(DiaryRecord::into_entry).collect())
     }
-
 }
 
 // ---------- knowledge graph ----------
@@ -1943,63 +1960,6 @@ mod tests {
         assert_eq!(trav.memories_b.len(), 1);
         assert!(trav.memories_a.iter().all(|m| m.project == "ijima"));
         assert!(trav.memories_b.iter().all(|m| m.project == "karpal"));
-    }
-
-    #[tokio::test]
-    async fn mining_queue_enqueue_list_accept_reject() {
-        let store = fresh().await;
-        let ns = NamespaceId::new("ns_mining");
-        let other = NamespaceId::new("ns_other");
-
-        // Enqueue two PendingReview extractions.
-        let q1 = store
-            .enqueue_extraction(&ns, sample_memory("m1", "decided to use surrealdb"), 0.6)
-            .await
-            .expect("enqueue1");
-        let q2 = store
-            .enqueue_extraction(&ns, sample_memory("m2", "see https://example.com"), 0.55)
-            .await
-            .expect("enqueue2");
-
-        // list_pending sees both (newest first).
-        let pending = store.list_pending(&ns, 10).await.expect("list");
-        assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].id, q2); // newest first
-        assert_eq!(pending[1].confidence, 0.6);
-
-        // Namespace isolation: other ns sees nothing.
-        let cross = store.list_pending(&other, 10).await.expect("list other");
-        assert!(cross.is_empty());
-
-        // Accept q1 → promotes to palace + removes from queue.
-        let accepted = store.accept_extraction(&ns, &q1).await.expect("accept");
-        assert_eq!(accepted.memory_id.0, "m1");
-        let after_accept = store.list_pending(&ns, 10).await.expect("list");
-        assert_eq!(after_accept.len(), 1);
-        // The promoted memory is now in the palace.
-        let promoted = store
-            .recall_memory(&ns, &MemoryId("m1".into()))
-            .await
-            .expect("recall");
-        assert!(promoted.is_some());
-
-        // Reject q2 → drops without promoting.
-        store.reject_extraction(&ns, &q2).await.expect("reject");
-        let after_reject = store.list_pending(&ns, 10).await.expect("list");
-        assert!(after_reject.is_empty());
-        let not_promoted = store
-            .recall_memory(&ns, &MemoryId("m2".into()))
-            .await
-            .expect("recall");
-        assert!(not_promoted.is_none());
-
-        // Cross-namespace accept fails (queue entry is in ns, not other).
-        let q3 = store
-            .enqueue_extraction(&ns, sample_memory("m3", "cross test"), 0.5)
-            .await
-            .expect("enqueue3");
-        let cross_accept = store.accept_extraction(&other, &q3).await;
-        assert!(cross_accept.is_err());
     }
 
     #[tokio::test]

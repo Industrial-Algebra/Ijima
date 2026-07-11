@@ -1,28 +1,19 @@
 // Copyright (C) 2026 Industrial Algebra
 // SPDX-License-Identifier: Apache-2.0
 
-//! The storage contract every backend implements.
+//! The storage contract — the abstraction boundary between Ijima's domain
+//! logic and the SurrealDB / SQLite / mock backends.
 //!
-//! A pure, backend-free trait (mirrors the [`crate::Embedder`] pattern):
-//! the memory palace, the session-context repository, and (in future)
-//! the knowledge graph all flow through [`Store`]. Concrete backends
-//! live in `ijima-server` behind additive features — `backend-surreal`
-//! (primary), `backend-sqlite` (migration-only), `backend-postgres`
-//! (future).
-//!
-//! Every method is scoped to a [`crate::NamespaceId`] so that isolation
-//! is enforced at the type level, not bolted on by callers.
+//! Every backend implements [`Store`] (memory palace + session context) and
+//! (in future) [`KnowledgeGraph`](crate::knowledge::KnowledgeGraph).
 
 use async_trait::async_trait;
 
 use crate::{
-    AcceptedExtraction, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction, Result,
-    Session, SessionId, SessionTurn, harness::Harness,
-    DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, Result, Session, SessionId, SessionTurn,
-    harness::Harness,
+    AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
+    Result, Session, SessionId, SessionTurn, harness::Harness,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
-
 /// Global memory-palace statistics (across all namespaces).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -153,30 +144,6 @@ pub trait Store: Send + Sync {
         ended_at: String,
     ) -> Result<()>;
 
-    // ===== Mining review queue (ADR M2, M3) =====
-
-    /// Stages a PendingReview extraction in the per-namespace queue.
-    async fn enqueue_extraction(
-        &self,
-        ns: &NamespaceId,
-        memory: Memory,
-        confidence: f32,
-    ) -> Result<String>;
-
-    /// Lists pending extractions in `ns`, newest first.
-    async fn list_pending(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<QueuedExtraction>>;
-
-    /// Accepts a queued extraction: promotes it to the palace
-    /// (`store_memory`) and removes it from the queue. Returns the promoted
-    /// memory id.
-    async fn accept_extraction(
-        &self,
-        ns: &NamespaceId,
-        queue_id: &str,
-    ) -> Result<AcceptedExtraction>;
-
-    /// Rejects a queued extraction: drops it from the queue without promoting.
-    async fn reject_extraction(&self, ns: &NamespaceId, queue_id: &str) -> Result<()>;
     // ===== Diaries (Phase 3.3) =====
 
     /// Appends a diary entry under `ns`.
@@ -190,4 +157,28 @@ pub trait Store: Send + Sync {
         agent: &str,
         limit: usize,
     ) -> Result<Vec<DiaryEntry>>;
+
+    // ===== Mining review queue (ADR M2, M3) =====
+
+    /// Stages a PendingReview extraction in the per-namespace queue.
+    async fn enqueue_extraction(
+        &self,
+        ns: &NamespaceId,
+        memory: Memory,
+        confidence: f32,
+    ) -> Result<String>;
+
+    /// Lists pending extractions in `ns`, newest first.
+    async fn list_pending(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<QueuedExtraction>>;
+
+    /// Accepts a queued extraction: promotes it to the palace and removes
+    /// it from the queue.
+    async fn accept_extraction(
+        &self,
+        ns: &NamespaceId,
+        queue_id: &str,
+    ) -> Result<AcceptedExtraction>;
+
+    /// Rejects a queued extraction: drops it from the queue without promoting.
+    async fn reject_extraction(&self, ns: &NamespaceId, queue_id: &str) -> Result<()>;
 }

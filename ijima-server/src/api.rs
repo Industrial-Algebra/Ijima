@@ -26,7 +26,6 @@
 //! | GET | `/mining/queue` | `mining:review` | `list_pending` |
 //! | POST | `/mining/queue/:id/accept` | `mining:review` | `accept_extraction` |
 //! | POST | `/mining/queue/:id/reject` | `mining:review` | `reject_extraction` |
-//! | POST | `/sessions/:session_id/mine` | `mining:trigger` | `trigger_mine` |
 
 use std::sync::Arc;
 
@@ -42,9 +41,7 @@ use serde::{Deserialize, Serialize};
 use ijima_core::{
     AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
     QueuedExtraction, Session, SessionId, SessionTurn, Store,
-    capabilities::{
-        KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER, SESSION_INGEST,
-    },
+    capabilities::{KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST},
     harness::Harness,
 };
 
@@ -61,6 +58,7 @@ pub fn app(
     kg: Arc<dyn KnowledgeGraph>,
     embedder: Option<Arc<dyn Embedder>>,
     redactor: Arc<Redactor>,
+    #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
@@ -85,15 +83,22 @@ pub fn app(
         .route("/sessions/:session_id/end", post(end_session))
         .route("/mining/queue", get(list_pending))
         .route("/mining/queue/:id/accept", post(accept_extraction))
-        .route("/mining/queue/:id/reject", post(reject_extraction));
-    #[cfg(feature = "mining")]
-    let router = router.route("/sessions/:session_id/mine", post(trigger_mine));
-    router
+        .route("/mining/queue/:id/reject", post(reject_extraction))
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
-        .layer(Extension(redactor))
+        .layer(Extension(redactor));
+
+    #[cfg(feature = "rate-limit")]
+    let router = match rate_limiter {
+        Some(rl) => router.layer(Extension(rl)),
+        None => router,
+    };
+    #[cfg(not(feature = "rate-limit"))]
+    let router = router;
+
+    router
 }
 
 // ---------- errors ----------
@@ -785,38 +790,6 @@ async fn reject_extraction(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Triggers a mining pass over a session's turns: fetches the turns, runs
-/// the extraction engine, and ingests (Auto → palace, PendingReview →
-/// queue). Auth: `mining:trigger`. Behind the `mining` feature.
-#[cfg(feature = "mining")]
-async fn trigger_mine(
-    principal: AuthPrincipal,
-    Extension(store): Extension<Arc<dyn Store>>,
-    Path(session_id): Path<String>,
-    Query(q): Query<NsQuery>,
-) -> Result<Json<crate::mining_pipeline::MiningReport>, ApiError> {
-    if !principal.0.may(MINING_TRIGGER) {
-        return Err(ApiError::Forbidden);
-    }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
-    // Fetch the session's turns (a generous limit — v0 mines the whole session).
-    let turns = store
-        .session_turns(&ns, &SessionId::new(session_id.clone()), 10_000)
-        .await
-        .map_err(internal)?;
-    let turn_texts: Vec<String> = turns.into_iter().map(|t| t.content).collect();
-    let ctx = crate::mining_pipeline::mining_context(
-        &session_id,
-        "general",
-        ijima_core::harness::Harness::Other,
-    );
-    let extractions = ijima_miner::mine(&turn_texts, &ctx).map_err(internal)?;
-    let report = crate::mining_pipeline::ingest_extractions(store.as_ref(), &ns, extractions)
-        .await
-        .map_err(internal)?;
-    Ok(Json(report))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,6 +811,8 @@ mod tests {
                 kg,
                 None,
                 Arc::new(crate::redaction::Redactor::new()),
+                #[cfg(feature = "rate-limit")]
+                None,
             ),
             auth,
         )
