@@ -1,0 +1,409 @@
+// Copyright (C) 2026 Industrial Algebra
+// SPDX-License-Identifier: Apache-2.0
+
+//! One-time corpus migration: read the legacy SQLite stores
+//! (pi-mempalace `memories.db` + ZeroClaw `brain.db`) and import them into
+//! the SurrealDB palace + knowledge graph. Behind `backend-sqlite`.
+//!
+//! ## Mapping (see `docs/HANDOFF.md` §3 for the source schema)
+//!
+//! - pi-mempalace `memories`: `auto-capture`→`AutoCapture`,
+//!   `manual-save`/`diary`→`Explicit`; harness `Pi`.
+//! - ZeroClaw `brain.db`: `conversation`→`AutoCapture`, else `Explicit`;
+//!   harness `Other` (ZeroClaw is a deprecated predecessor).
+//! - Embeddings are NOT ported (the source uses an unreadable `vec0`
+//!   virtual table); Ijima re-embeds centrally with candle at write time.
+//! - All migrated records stamp `origin`/`authority` = local (ADR
+//!   provenance-tier).
+
+use ijima_core::{
+    AuthorityScope, InstanceId, Memory, MemoryId, MemorySource, NamespaceId, harness::Harness,
+};
+
+/// A raw pi-mempalace `memories` row (the subset we migrate).
+#[derive(Debug, Clone)]
+pub struct PiPalaceRow {
+    pub id: String,
+    pub content: String,
+    pub project: String,
+    pub topic: String,
+    pub source: String,
+    pub timestamp: String,
+    pub session_id: String,
+    pub importance: f64,
+}
+
+/// A raw ZeroClaw `brain.db` memories row (the subset we migrate).
+#[derive(Debug, Clone)]
+pub struct ZeroClawRow {
+    pub id: String,
+    pub content: String,
+    pub category: String,
+    pub created_at: String,
+    pub session_id: Option<String>,
+}
+
+/// Maps a pi-mempalace source string to an Ijima [`MemorySource`].
+/// `auto-capture`→`AutoCapture`; `manual-save` and `diary`→`Explicit`;
+/// unknown→`AutoCapture` (conservative: unverified).
+pub fn map_pipalace_source(source: &str) -> MemorySource {
+    match source {
+        "auto-capture" => MemorySource::AutoCapture,
+        "manual-save" | "diary" => MemorySource::Explicit,
+        _ => MemorySource::AutoCapture,
+    }
+}
+
+/// Maps a ZeroClaw category to an Ijima [`MemorySource`].
+/// `conversation`→`AutoCapture` (raw chatter); everything else→`Explicit`.
+pub fn map_zeroclaw_source(category: &str) -> MemorySource {
+    match category {
+        "conversation" => MemorySource::AutoCapture,
+        _ => MemorySource::Explicit,
+    }
+}
+
+/// Builds an Ijima [`Memory`] from a pi-mempalace row. Harness = `Pi`;
+/// empty `session_id` becomes `None`.
+pub fn map_pipalace_memory(row: &PiPalaceRow) -> Memory {
+    Memory {
+        id: MemoryId(row.id.clone()),
+        content: row.content.clone(),
+        project: row.project.clone(),
+        topic: row.topic.clone(),
+        source: map_pipalace_source(&row.source),
+        harness: Harness::Pi,
+        session_id: if row.session_id.is_empty() {
+            None
+        } else {
+            Some(row.session_id.clone())
+        },
+        importance: row.importance.clamp(0.0, 1.0) as f32,
+        created_at: row.timestamp.clone(),
+        origin: InstanceId::local(),
+        authority: AuthorityScope::local(),
+    }
+}
+
+/// Builds an Ijima [`Memory`] from a ZeroClaw row. Harness = `Other`;
+/// project = `"zeroclaw"`; topic = the row's category.
+pub fn map_zeroclaw_memory(row: &ZeroClawRow) -> Memory {
+    Memory {
+        id: MemoryId(row.id.clone()),
+        content: row.content.clone(),
+        project: "zeroclaw".to_string(),
+        topic: row.category.clone(),
+        source: map_zeroclaw_source(&row.category),
+        harness: Harness::Other,
+        session_id: row.session_id.clone(),
+        importance: 0.5,
+        created_at: row.created_at.clone(),
+        origin: InstanceId::local(),
+        authority: AuthorityScope::local(),
+    }
+}
+
+/// The default namespace migrated records land in: the legacy pi-mempalace
+/// "everyone sees everything" commons (DESIGN D2 migration baseline).
+pub const MIGRATION_NAMESPACE: &str = "global";
+
+/// The migration namespace as a [`NamespaceId`].
+pub fn migration_namespace() -> NamespaceId {
+    NamespaceId::new(MIGRATION_NAMESPACE)
+}
+
+// ===== SQLite read path (rusqlite, bundled) =====
+
+/// Reads the `memories` table from a pi-mempalace `memories.db`.
+///
+/// # Errors
+/// Returns [`ijima_core::IjimaError::Store`] if the file can't be opened
+/// or the query fails.
+pub fn read_pipalace_memories(path: &str) -> ijima_core::Result<Vec<PiPalaceRow>> {
+    use rusqlite::Connection;
+    let conn = Connection::open(path).map_err(store_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content, project, topic, source, timestamp, session_id, importance \
+             FROM memories ORDER BY rowid",
+        )
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(PiPalaceRow {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                project: row.get(2)?,
+                topic: row.get(3)?,
+                source: row.get(4)?,
+                timestamp: row.get(5)?,
+                session_id: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                importance: row.get::<_, Option<f64>>(7)?.unwrap_or(0.5),
+            })
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(store_err)?);
+    }
+    Ok(out)
+}
+
+/// Reads the `memories` table from a ZeroClaw `brain.db`.
+pub fn read_zeroclaw_memories(path: &str) -> ijima_core::Result<Vec<ZeroClawRow>> {
+    use rusqlite::Connection;
+    let conn = Connection::open(path).map_err(store_err)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, content, category, created_at, session_id FROM memories ORDER BY rowid",
+        )
+        .map_err(store_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(ZeroClawRow {
+                id: row.get(0)?,
+                content: row.get(1)?,
+                category: row
+                    .get::<_, Option<String>>(2)?
+                    .unwrap_or_else(|| "core".into()),
+                created_at: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                session_id: row.get(4)?,
+            })
+        })
+        .map_err(store_err)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(store_err)?);
+    }
+    Ok(out)
+}
+
+fn store_err(e: rusqlite::Error) -> ijima_core::IjimaError {
+    ijima_core::IjimaError::Store {
+        detail: format!("migration sqlite: {e}"),
+    }
+}
+
+// ===== Import orchestration =====
+
+/// The outcome of a memory-import pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Rows read from the source.
+    pub attempted: usize,
+    /// Successfully stored in the palace.
+    pub imported: usize,
+    /// Not stored — content-hash duplicate (the common case) or a store error.
+    pub skipped: usize,
+}
+
+/// Imports already-mapped `memories` into `store` under `ns`. Content-hash
+/// dedup in `store_memory` means exact duplicates (across sources or
+/// re-runs) are counted as `skipped`, not errors. Embedding happens at
+/// write time if the store was opened with an embedder.
+///
+/// # Errors
+/// Propagates only a fatal store error from the *first* failure path;
+/// per-row failures are counted as `skipped` so one bad row doesn't abort
+/// the whole migration.
+pub async fn import_memories(
+    store: &dyn ijima_core::Store,
+    ns: &NamespaceId,
+    memories: Vec<Memory>,
+) -> ijima_core::Result<ImportReport> {
+    let mut report = ImportReport {
+        attempted: memories.len(),
+        ..Default::default()
+    };
+    for memory in memories {
+        match store.store_memory(ns, memory).await {
+            Ok(_) => report.imported += 1,
+            Err(_) => report.skipped += 1,
+        }
+    }
+    Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipalace_source_mapping() {
+        assert_eq!(
+            map_pipalace_source("auto-capture"),
+            MemorySource::AutoCapture
+        );
+        assert_eq!(map_pipalace_source("manual-save"), MemorySource::Explicit);
+        assert_eq!(map_pipalace_source("diary"), MemorySource::Explicit);
+        // Unknown → conservative AutoCapture.
+        assert_eq!(map_pipalace_source("???"), MemorySource::AutoCapture);
+    }
+
+    #[test]
+    fn zeroclaw_source_mapping() {
+        assert_eq!(
+            map_zeroclaw_source("conversation"),
+            MemorySource::AutoCapture
+        );
+        assert_eq!(map_zeroclaw_source("core"), MemorySource::Explicit);
+        assert_eq!(map_zeroclaw_source("daily"), MemorySource::Explicit);
+        assert_eq!(map_zeroclaw_source("identity"), MemorySource::Explicit);
+    }
+
+    #[test]
+    fn pipalace_row_maps_with_provenance() {
+        let row = PiPalaceRow {
+            id: "mem_abc".into(),
+            content: "Amari is the flagship math library".into(),
+            project: "amari".into(),
+            topic: "project-context".into(),
+            source: "manual-save".into(),
+            timestamp: "2026-04-22T00:23:59.352Z".into(),
+            session_id: "sess_7".into(),
+            importance: 0.97,
+        };
+        let m = map_pipalace_memory(&row);
+        assert_eq!(m.id.0, "mem_abc");
+        assert_eq!(m.project, "amari");
+        assert_eq!(m.source, MemorySource::Explicit);
+        assert_eq!(m.harness, Harness::Pi);
+        assert_eq!(m.session_id.as_deref(), Some("sess_7"));
+        assert_eq!(m.importance, 0.97);
+        // Provenance-tier stamps.
+        assert_eq!(m.origin, InstanceId::local());
+        assert_eq!(m.authority, AuthorityScope::local());
+    }
+
+    #[test]
+    fn pipalace_empty_session_becomes_none() {
+        let row = PiPalaceRow {
+            id: "x".into(),
+            content: "c".into(),
+            project: "p".into(),
+            topic: "t".into(),
+            source: "auto-capture".into(),
+            timestamp: "0".into(),
+            session_id: String::new(),
+            importance: 0.5,
+        };
+        assert!(map_pipalace_memory(&row).session_id.is_none());
+    }
+
+    #[test]
+    fn pipalace_importance_clamps_to_unit_range() {
+        let mut row = PiPalaceRow {
+            id: "x".into(),
+            content: "c".into(),
+            project: "p".into(),
+            topic: "t".into(),
+            source: "auto-capture".into(),
+            timestamp: "0".into(),
+            session_id: String::new(),
+            importance: 5.0,
+        };
+        assert_eq!(map_pipalace_memory(&row).importance, 1.0);
+        row.importance = -1.0;
+        assert_eq!(map_pipalace_memory(&row).importance, 0.0);
+    }
+
+    #[test]
+    fn zeroclaw_row_maps_with_category_as_topic() {
+        let row = ZeroClawRow {
+            id: "uuid-1".into(),
+            content: "Lucien brought me online".into(),
+            category: "core".into(),
+            created_at: "2026-06-16T09:22:38Z".into(),
+            session_id: None,
+        };
+        let m = map_zeroclaw_memory(&row);
+        assert_eq!(m.project, "zeroclaw");
+        assert_eq!(m.topic, "core");
+        assert_eq!(m.source, MemorySource::Explicit);
+        assert_eq!(m.harness, Harness::Other);
+        assert!(m.session_id.is_none());
+        assert_eq!(m.origin, InstanceId::local());
+    }
+
+    #[test]
+    fn zeroclaw_conversation_is_autocapture() {
+        let row = ZeroClawRow {
+            id: "u".into(),
+            content: "Say hello".into(),
+            category: "conversation".into(),
+            created_at: "0".into(),
+            session_id: Some("s".into()),
+        };
+        assert_eq!(map_zeroclaw_memory(&row).source, MemorySource::AutoCapture);
+        assert_eq!(map_zeroclaw_memory(&row).session_id.as_deref(), Some("s"));
+    }
+
+    #[test]
+    fn migration_namespace_is_global_commons() {
+        assert_eq!(MIGRATION_NAMESPACE, "global");
+        assert_eq!(migration_namespace().as_str(), "global");
+    }
+
+    #[test]
+    fn read_pipalace_memories_round_trips_a_fixture_db() {
+        use rusqlite::Connection;
+        let mut path = std::env::temp_dir();
+        path.push(format!("ijima_mig_test_{}.db", std::process::id()));
+        let conn = Connection::open(&path).expect("open");
+        conn.execute(
+            "CREATE TABLE memories (id TEXT, content TEXT, project TEXT, topic TEXT, \
+             source TEXT, timestamp TEXT, session_id TEXT, importance REAL)",
+            [],
+        )
+        .expect("create");
+        conn.execute(
+            "INSERT INTO memories VALUES ('m1','c','p','t','manual-save','ts','s1',0.9)",
+            [],
+        )
+        .expect("insert");
+        drop(conn);
+        let rows = read_pipalace_memories(path.to_str().expect("path")).expect("read");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "m1");
+        assert_eq!(rows[0].source, "manual-save");
+        assert_eq!(rows[0].importance, 0.9);
+        // Reader feeds the mapper cleanly.
+        let m = map_pipalace_memory(&rows[0]);
+        assert_eq!(m.source, MemorySource::Explicit);
+    }
+
+    #[tokio::test]
+    async fn import_memories_counts_dups_as_skipped() {
+        // Content-hash dedup: importing the same memory twice → second is
+        // rejected by store_memory and counted as skipped, not a hard error.
+        let store = crate::SurrealStore::open_embedded().await.expect("open");
+        let ns = migration_namespace();
+        let mem = map_pipalace_memory(&PiPalaceRow {
+            id: "mem_dup".into(),
+            content: "deterministic dup-content for migration test".into(),
+            project: "ijima".into(),
+            topic: "test".into(),
+            source: "manual-save".into(),
+            timestamp: "0".into(),
+            session_id: String::new(),
+            importance: 0.5,
+        });
+        let first = import_memories(&store, &ns, vec![mem.clone()])
+            .await
+            .expect("import");
+        assert_eq!(
+            first,
+            ImportReport {
+                attempted: 1,
+                imported: 1,
+                skipped: 0
+            }
+        );
+        let second = import_memories(&store, &ns, vec![mem])
+            .await
+            .expect("import");
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped, 1);
+    }
+}

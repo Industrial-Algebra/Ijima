@@ -49,6 +49,11 @@ pub mod backend_surreal;
 #[cfg(feature = "backend-surreal")]
 pub use backend_surreal::SurrealStore;
 
+/// One-time corpus migration from legacy SQLite stores. Behind
+/// `backend-sqlite` (migration-only read path, DESIGN D6).
+#[cfg(feature = "backend-sqlite")]
+pub mod migration;
+
 #[cfg(feature = "embeddings-candle")]
 pub mod embeddings_candle;
 

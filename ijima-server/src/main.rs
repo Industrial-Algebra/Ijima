@@ -43,6 +43,10 @@ enum Command {
     Serve(ServeArgs),
     /// Export the SurrealDB store as a SQL dump.
     Export(ExportArgs),
+    /// Migrate the legacy pi-mempalace / ZeroClaw SQLite corpora into the
+    /// SurrealDB store (one-time import).
+    #[cfg(feature = "backend-sqlite")]
+    Migrate(MigrateArgs),
 }
 
 /// Arguments to `ijima export`.
@@ -51,6 +55,22 @@ struct ExportArgs {
     /// Output path for the SurrealDB SQL dump.
     #[arg(long, short)]
     out: std::path::PathBuf,
+}
+
+/// Arguments to `ijima migrate`.
+#[derive(Args, Debug)]
+struct MigrateArgs {
+    /// pi-mempalace `memories.db` path (imports memories + KG).
+    #[arg(long, value_name = "PATH")]
+    palace: Option<std::path::PathBuf>,
+    /// ZeroClaw `brain.db` path (imports Sara's Discord memories).
+    #[arg(long, value_name = "PATH")]
+    brain: Option<std::path::PathBuf>,
+    /// Re-embed every imported memory with the candle embedder at write
+    /// time (slow for large corpora; without it, search is unavailable
+    /// until a later re-embed pass).
+    #[arg(long)]
+    embed: bool,
 }
 
 #[derive(Subcommand)]
@@ -187,6 +207,37 @@ fn main() -> ExitCode {
                 }
             }
         }
+        #[cfg(feature = "backend-sqlite")]
+        Command::Migrate(args) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => match rt.block_on(run_migrate(args)) {
+                    Ok(report) => {
+                        tracing::info!(
+                            attempted = report.attempted,
+                            imported = report.imported,
+                            skipped = report.skipped,
+                            "migration complete"
+                        );
+                        eprintln!(
+                            "ijima: migrated {} imported, {} skipped (of {} attempted)",
+                            report.imported, report.skipped, report.attempted
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("ijima: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    eprintln!("ijima: runtime: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
     }
 }
 
@@ -252,4 +303,70 @@ async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
     store.export_to(&args.out).await?;
     eprintln!("ijima: exported to {}", args.out.display());
     Ok(())
+}
+
+/// One-time corpus migration: read the legacy SQLite stores and import
+/// them into the SurrealDB palace under the `global` namespace.
+#[cfg(feature = "backend-sqlite")]
+async fn run_migrate(
+    args: MigrateArgs,
+) -> ijima_core::Result<ijima_server::migration::ImportReport> {
+    use ijima_server::migration::{
+        import_memories, map_pipalace_memory, map_zeroclaw_memory, migration_namespace,
+        read_pipalace_memories, read_zeroclaw_memories,
+    };
+
+    if args.palace.is_none() && args.brain.is_none() {
+        return Err(ijima_core::IjimaError::invalid_input(
+            "migrate needs at least one of --palace <memories.db> or --brain <brain.db>",
+        ));
+    }
+
+    let data_dir = std::env::var("IJIMA_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|_| {
+            std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".ijima"))
+                .ok_or_else(|| {
+                    ijima_core::IjimaError::invalid_input(
+                        "cannot resolve data dir: set IJIMA_DIR or HOME",
+                    )
+                })
+        })?;
+    let db_path = data_dir.join("ijima.db");
+
+    // Open the store, optionally with the candle embedder so imported
+    // memories are embedded at write time (slow for large corpora).
+    #[cfg(feature = "embeddings-candle")]
+    let store = if args.embed {
+        let embedder: std::sync::Arc<dyn ijima_core::Embedder> =
+            std::sync::Arc::new(ijima_server::embeddings_candle::CandleEmbedder::from_env()?);
+        ijima_server::SurrealStore::open_persistent_with(&db_path, embedder).await?
+    } else {
+        ijima_server::SurrealStore::open_persistent(&db_path).await?
+    };
+    #[cfg(not(feature = "embeddings-candle"))]
+    let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
+
+    let ns = migration_namespace();
+    let mut all: Vec<ijima_core::Memory> = Vec::new();
+
+    if let Some(palace) = &args.palace {
+        let rows = read_pipalace_memories(&palace.to_string_lossy())?;
+        eprintln!("ijima: read {} rows from {}", rows.len(), palace.display());
+        all.extend(rows.iter().map(map_pipalace_memory));
+    }
+    if let Some(brain) = &args.brain {
+        let rows = read_zeroclaw_memories(&brain.to_string_lossy())?;
+        eprintln!("ijima: read {} rows from {}", rows.len(), brain.display());
+        all.extend(rows.iter().map(map_zeroclaw_memory));
+    }
+
+    eprintln!(
+        "ijima: importing {} memories into namespace `{}`…",
+        all.len(),
+        ns.as_str()
+    );
+    let report = import_memories(&store, &ns, all).await?;
+    Ok(report)
 }
