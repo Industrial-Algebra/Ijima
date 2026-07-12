@@ -70,26 +70,26 @@ pub fn app(
         .route("/memories", post(store_memory))
         .route("/memories/check", post(check_duplicate))
         .route("/memories/search", post(search_memories))
-        .route("/memories/:id", get(recall_memory).delete(delete_memory))
-        .route("/memories/:id/promote", post(promote_memory))
+        .route("/memories/{id}", get(recall_memory).delete(delete_memory))
+        .route("/memories/{id}/promote", post(promote_memory))
         .route("/doctrine", post(ingest_doctrine))
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
-        .route("/kg/entities/:id", get(query_entity))
-        .route("/kg/triples/:id/invalidate", post(invalidate_triple))
+        .route("/kg/entities/{id}", get(query_entity))
+        .route("/kg/triples/{id}/invalidate", post(invalidate_triple))
         .route("/kg/timeline", get(kg_timeline))
         .route("/kg/stats", get(kg_stats))
         .route(
-            "/sessions/:session_id/turns",
+            "/sessions/{session_id}/turns",
             post(ingest_turn).get(session_turns),
         )
         .route("/sessions", post(create_session).get(list_sessions))
-        .route("/sessions/:session_id/end", post(end_session))
+        .route("/sessions/{session_id}/end", post(end_session))
         .route("/mining/queue", get(list_pending))
-        .route("/mining/queue/:id/accept", post(accept_extraction))
-        .route("/mining/queue/:id/reject", post(reject_extraction));
+        .route("/mining/queue/{id}/accept", post(accept_extraction))
+        .route("/mining/queue/{id}/reject", post(reject_extraction));
     #[cfg(feature = "mining")]
-    let router = router.route("/sessions/:session_id/mine", post(trigger_mine));
+    let router = router.route("/sessions/{session_id}/mine", post(trigger_mine));
     let router = router
         .layer(Extension(auth))
         .layer(Extension(store))

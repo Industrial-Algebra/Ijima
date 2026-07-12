@@ -11,7 +11,6 @@
 //! capability checks go through [`crate::IjimaAuth::require`] on the
 //! same shared state.
 
-use async_trait::async_trait;
 use axum::{
     Extension,
     extract::FromRequestParts,
@@ -60,7 +59,6 @@ impl IntoResponse for AuthRejection {
     }
 }
 
-#[async_trait]
 impl<S> FromRequestParts<S> for AuthPrincipal
 where
     S: Send + Sync,

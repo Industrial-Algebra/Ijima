@@ -122,10 +122,11 @@ impl IjimaAuth {
 
     /// Generates a fresh random 32-byte issuer seed (for first-time setup).
     pub fn generate_seed() -> [u8; 32] {
-        use rand::RngCore;
-        use rand::rngs::OsRng;
+        use rand::TryRngCore;
         let mut seed = [0u8; 32];
-        OsRng.fill_bytes(&mut seed);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut seed)
+            .expect("OsRng is infallible in practice");
         seed
     }
 

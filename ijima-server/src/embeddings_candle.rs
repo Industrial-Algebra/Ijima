@@ -24,8 +24,7 @@ use std::sync::Mutex;
 use candle_core::{Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::bert::{BertModel, Config, DTYPE, HiddenAct};
-use hf_hub::api::sync::Api;
-use hf_hub::{Repo, RepoType};
+use hf_hub::{HFClientSync, HFError, split_id};
 use ijima_core::embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
 use ijima_core::{IjimaError, Result};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
@@ -87,13 +86,29 @@ impl CandleEmbedder {
     }
 
     fn load(model_id: &str, revision: &str, device: Device) -> Result<Self> {
-        let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, revision.to_string());
-        let api = Api::new().map_err(hub_err)?;
-        let api = api.repo(repo);
+        let (owner, model_name) = split_id(model_id);
+        let client = HFClientSync::new().map_err(hub_err)?;
+        let repo = client.model(owner, model_name);
+        let rev = Some(revision.to_string());
 
-        let config_filename = api.get("config.json").map_err(hub_err)?;
-        let tokenizer_filename = api.get("tokenizer.json").map_err(hub_err)?;
-        let weights_filename = api.get("model.safetensors").map_err(hub_err)?;
+        let config_filename = repo
+            .download_file()
+            .filename("config.json")
+            .maybe_revision(rev.clone())
+            .send()
+            .map_err(hub_err)?;
+        let tokenizer_filename = repo
+            .download_file()
+            .filename("tokenizer.json")
+            .maybe_revision(rev.clone())
+            .send()
+            .map_err(hub_err)?;
+        let weights_filename = repo
+            .download_file()
+            .filename("model.safetensors")
+            .maybe_revision(rev)
+            .send()
+            .map_err(hub_err)?;
 
         let config_str = std::fs::read_to_string(&config_filename).map_err(io_err)?;
         let mut config: Config =
@@ -207,7 +222,7 @@ fn candle_err(e: candle_core::Error) -> IjimaError {
     }
 }
 
-fn hub_err(e: hf_hub::api::sync::ApiError) -> IjimaError {
+fn hub_err(e: HFError) -> IjimaError {
     IjimaError::Store {
         detail: format!("hf-hub: {e}"),
     }
