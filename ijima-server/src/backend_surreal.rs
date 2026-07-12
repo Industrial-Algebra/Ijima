@@ -113,8 +113,35 @@ impl SurrealStore {
             .map_err(|e| IjimaError::Store {
                 detail: format!("surrealdb use_ns/use_db: {e}"),
             })?;
+        // Define indexes on the hot query columns. SurrealDB is schemaless
+        // by default and does NOT auto-index fields, so without these every
+        // namespace-scoped SELECT and every dedup check is a full table scan
+        // (O(N²) for a bulk import). `IF NOT EXISTS` makes this idempotent
+        // on existing stores.
+        db.query(Self::INDEX_DDL)
+            .await
+            .map_err(|e| IjimaError::Store {
+                detail: format!("surrealdb define indexes: {e}"),
+            })?;
         Ok(Self { db, embedder })
     }
+
+    /// The `DEFINE INDEX` statements run at store open. Covers the columns
+    /// every query filters on: `namespace` (all scoped reads),
+    /// `(namespace, content_hash)` (dedup), `(namespace, session_id)`
+    /// (session turns), and the knowledge-graph traversal keys.
+    const INDEX_DDL: &str = r#"
+        DEFINE INDEX IF NOT EXISTS mem_ns        ON TABLE memories       FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS mem_ns_hash   ON TABLE memories       FIELDS namespace, content_hash;
+        DEFINE INDEX IF NOT EXISTS turns_ns_sess ON TABLE session_turns   FIELDS namespace, session_id;
+        DEFINE INDEX IF NOT EXISTS sess_ns       ON TABLE sessions        FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS diary_ns_ag   ON TABLE diaries         FIELDS namespace, agent;
+        DEFINE INDEX IF NOT EXISTS queue_ns      ON TABLE mining_queue    FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS ent_ns        ON TABLE entities        FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS trip_ns       ON TABLE triples         FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS trip_subj     ON TABLE triples         FIELDS subject;
+        DEFINE INDEX IF NOT EXISTS trip_obj      ON TABLE triples         FIELDS object;
+    "#;
 
     /// Fetches all `(project, topic)` cells in `ns` with their memory counts.
     /// One query, aggregated in Rust (consistent with `store_stats`).
@@ -1367,6 +1394,37 @@ mod tests {
             .store_memory(&other, sample_memory("mx", "identical content"))
             .await
             .expect("same content, different namespace");
+    }
+
+    #[tokio::test]
+    async fn index_definitions_are_idempotent_and_dedup_still_works() {
+        // SurrealDB is schemaless with no auto-indexes; open_with_db defines
+        // them. Re-running the DDL (as on every store open against an
+        // existing database) must not error — IF NOT EXISTS guards it. This
+        // is the fix for the O(N²) full-scan migration hang.
+        let store = fresh().await;
+        store
+            .db
+            .query(SurrealStore::INDEX_DDL)
+            .await
+            .expect("re-defining indexes on an already-indexed store");
+        // Dedup is still correct after indexing (namespace + content_hash).
+        let ns = NamespaceId::new("ns_idx");
+        store
+            .store_memory(&ns, sample_memory("m1", "indexed-content"))
+            .await
+            .expect("store");
+        let dup = store
+            .check_duplicate(&ns, "indexed-content")
+            .await
+            .expect("check");
+        assert_eq!(dup.as_ref().unwrap().0, "m1");
+        // Different namespace, same content: not a duplicate (composite index).
+        let other = NamespaceId::new("ns_idx_other");
+        store
+            .store_memory(&other, sample_memory("m2", "indexed-content"))
+            .await
+            .expect("same content, different ns");
     }
 
     #[tokio::test]
