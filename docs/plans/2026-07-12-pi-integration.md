@@ -15,20 +15,35 @@ for Phase 5's multi-workstation cross-talk).
 this integration is a single-workstation pi→Ijima client. Federation comes
 for free once each workstation runs Ijima + this integration.
 
-## 2. Architecture
+## 2. Architecture (Rust core → WebAssembly + thin TS shim)
 
-```
-   pi  ──(extension: integrations/pi/index.ts)──▶  IjimaClient (TS, HTTP)
-                                                       │  Bearer capability token
-                                                       ▼
-                                              ijima daemon (HTTP, SurrealDB)
+```text
+   pi  ──(integrations/pi/index.ts: thin TS shim)──▶  Rust core (wasm)
+        registers tools / lifecycle, holds pi's ctx/ui           │
+                                                                 ▼
+                                                          ijima daemon (HTTP)
 ```
 
-- A TypeScript pi extension (pi extensions are TS modules using
-  `@…/pi-coding-agent`'s `ExtensionAPI`).
-- An `IjimaClient` class that maps each memory operation to Ijima's REST API.
-- Same tool surface + lifecycle hooks as `pi-mempalace`, so pi's behavior is
-  unchanged from the agent's POV — only the backend swaps.
+**Decision (2026-07-12): build the core in Rust, compile to WebAssembly.**
+Both pi runtimes (Node, Bun) load wasm. This reuses `ijima-client` +
+`ijima-core` types directly (no TS re-port of the client surface), unifies
+CI under `cargo`, and keeps the type-safe mapping logic in Rust.
+
+- **Thin TS shim** (`index.ts`) — the only part that *must* be TS: it calls
+  `pi.registerTool` / `pi.on(...)` and holds the TS `ExtensionContext`
+  (sessionManager, ui). Its handlers marshal params/results across the wasm
+  boundary and call the Rust core.
+- **Rust core** (new crate `ijima-pi`, or a `wasm/` target in the workspace)
+— the `IjimaClient` + every tool's request/response mapping, compiled to
+  `wasm32-unknown-unknown` and bound to JS via `wasm-bindgen`.
+
+**The seam to de-risk first (phase-0 spike):** `ijima-client` is async over
+`reqwest`+`tokio`, and tokio doesn't run on wasm. Two viable paths —
+(a) make `ijima-client` wasm-compatible (reqwest js/fetch backend +
+`wasm-bindgen-futures`), giving full client reuse; or (b) keep HTTP in the
+TS shim (host fetch, native to Node/Bun) and put only the **pure mapping +
+types** in the wasm core. Path (b) sidesteps the tokio/reqwest-wasm port but
+reuses less. The spike decides; (b) is the safe fallback.
 
 ## 3. Tool surface mapping (17 tools → Ijima routes)
 
@@ -58,6 +73,28 @@ namespace-scoped list with project/topic filters; Ijima `Memory` fields →
 pi's `{text, project, topic, timestamp, …}` result shape). A thin adapter
 layer per tool.
 
+### 3.5 Search scope — the one real design gap
+
+**The mismatch:** pi-mempalace's `memory_search` is **global** (every
+memory, every project). Ijima's `POST /memories/search` resolves to the
+principal's **single** namespace. So a pi search in `ns_elliott_private`
+will not see the migrated `global` corpus or anything in `shared` — a
+visible regression ("search used to find X, now it doesn't").
+
+**Decision: Ijima gains a visible-scope search.** A principal's readable
+scope is `{own private, shared, global}` (Ijima's `resolve_ns` already
+permits these reads). Add a search mode that queries each readable
+namespace and **merges results server-side** with proper cosine ranking
+(client-side fan-out would re-rank N lists less accurately and add N round
+trips). Concretely: `POST /memories/search` accepts a `scope` param
+(`personal` | `visible`, default `visible` for the pi integration); the
+daemon expands `visible` to the readable set, queries each, and merges.
+
+This is a small, bounded daemon addition (a search-aggregation path over
+existing per-namespace search) and it preserves pi-mempalace's global-search
+semantics. The pi extension calls with `scope=visible`. `recall`/`status`/
+palace browsing get the same visible-scope treatment where it matters.
+
 ## 4. Lifecycle hooks (preserve from pi-mempalace)
 
 - **`session_start` / `session_tree`**: reconstruct state — ping Ijima
@@ -71,11 +108,16 @@ layer per tool.
 
 ## 5. Auth & config
 
-- `IJIMA_URL` (default `http://127.0.0.1:7373`), `IJIMA_TOKEN` (a Schubert
-  capability bearer). **One token can't hold every capability** (Schubert
-  tokens are one-cap-each) — so the integration holds a **small bundle of
-  tokens** (`IJIMA_TOKEN_MEMORY_WRITE`, `…_MEMORY_READ`, `…_KNOWLEDGE_*`,
-  `…_MINING_*`) and picks the right one per call. *Open question §11.*
+- `IJIMA_URL` (default `http://127.0.0.1:7373`).
+- **Decision (2026-07-12): env-bundle of one-cap Schubert tokens for 0.1.0.**
+  Schubert tokens are one-cap-each today, so the integration holds a small
+  bundle — `IJIMA_TOKEN_MEMORY_WRITE`, `…_MEMORY_READ`, `…_KNOWLEDGE_*`,
+  `…_MINING_*` — and picks per call. This is a deliberate stopgap: Elliott
+  will add **multi-capability tokens** to Schubert's next release (one
+  token = a grant of many caps), after which the bundle collapses to one
+  token. Requirements captured in
+  [`../Schubert/docs/handoff-multi-capability-tokens.md`](../../Schubert/docs/handoff-multi-capability-tokens.md)
+  (Schubert PR #29).
 - Config file (`~/.pi/agent/memory/config.json`) for autoCapture/wake-up
   toggles — same as today.
 
@@ -95,45 +137,58 @@ layer per tool.
 
 ## 7. Packaging / how pi loads it
 
-Two viable options (decide in §11):
-- **(A) Load by path**: `settings.json` `extensions` array points at
-  `<ijima-repo>/integrations/pi/index.ts`. Simplest, dev-friendly, no publish.
-- **(B) npm package**: publish `@anima/ijima-pi` (or similar) and load via
-  `npm:…` like today's `pi-mempalace`. Cleaner for installing across
-  workstations without a repo checkout.
+**Decision (2026-07-12): load-by-path for v1.** `settings.json` `extensions`
+points at `<ijima-repo>/integrations/pi/index.ts`. Dev-simple, no publish.
+Revisit npm packaging (`@anima/ijima-pi`) when distributing across
+workstations.
 
-Either way: `integrations/pi/` holds `package.json`, `index.ts`, `ijima_client.ts`,
-`tsconfig.json`; `fetch`/`undici` for HTTP (no native deps).
+Contents: `integrations/pi/` holds `package.json`, `index.ts` (the thin TS
+shim), `tsconfig.json`, and the built wasm artifact (`ijima_pi.wasm` +
+`ijima_pi.js` glue from `wasm-pack`). The Rust core lives in a workspace
+crate (`ijima-pi` or `integrations/pi-core/`) and is built into the
+artifact; CI (`cargo`) type-checks/tests the Rust core.
 
 ## 8. Cutover
 
-1. Build the integration + an `ijima-client` TS module.
-2. On one workstation: run `ijima serve`; `ijima migrate` the local corpus in
-   (already done for this machine); point pi at it via the extension.
+0. **Prerequisites:** add `--namespace` to `ijima migrate`; add the
+   `scope=visible` search mode to the daemon (§3.5).
+1. Build the integration (wasm core + TS shim).
+2. On one workstation: run `ijima serve`; `ijima migrate --namespace
+   ns_<principal>_private` so the corpus lands where pi writes.
 3. Verify parity (search/save/wake-up/KG) against the migrated data.
 4. Swap `npm:pi-mempalace` → the Ijima integration in `settings.json`.
 5. Repeat per workstation (each runs its own Ijima; federation lands in Phase 5).
 
 ## 9. Implementation phases
 
-1. **Scaffold** `integrations/pi/` (package.json, tsconfig, index.ts skeleton).
-2. **IjimaClient (TS)** — one method per route, bearer auth, error mapping.
-   Unit-test the mapping against a stubbed fetch (Vitest or node:test).
-3. **Memory tools** (search/save/recall/status/delete/check_duplicate) — the
-   highest-value slice; ship + verify before the rest.
-4. **Lifecycle hooks** (auto-capture + wake-up) — the "feels like mempalace"
+0. **Prerequisites / de-risk.**
+   - `ijima migrate --namespace <ns>` (small; unblocks private-namespace cutover).
+   - `scope=visible` search mode on the daemon (§3.5).
+   - **Wasm spike:** decide path (a) wasm-compatible `ijima-client` vs (b) HTTP
+     in the TS shim + pure mapping in wasm. Build a one-call proof (e.g.
+     `memory_search`) end-to-end through wasm before committing.
+1. **Scaffold** `integrations/pi/` + the Rust core crate (wasm-bindgen setup).
+2. **Core + memory tools** (search/save/recall/status/delete/check_duplicate)
+   — the highest-value slice; ship + verify before the rest.
+3. **Lifecycle hooks** (auto-capture + wake-up) — the "feels like mempalace"
    behavior.
-5. **Knowledge graph + palace + diary tools** — parity completeness.
-6. **`/memory` command + stats widget** — port.
+4. **Knowledge graph + palace + diary tools** — parity completeness.
+5. **`/memory` command + stats widget** — port.
 7. **Cutover** on one workstation; document the per-workstation setup.
 
 ## 10. Risks / watch-items
 
-- **Capability-token bundle** — Schubert's one-cap-per-token model means the
-  integration juggles several tokens. A future "scoped multi-cap token" in
-  Schubert would simplify this; until then, a token bundle + per-call pick.
+- **Wasm HTTP path** (the de-risk spike, §9.0) — `ijima-client` is async over
+  reqwest+tokio, and tokio doesn't run on wasm. Verify path (a) wasm client
+  reuse vs (b) HTTP-in-shim before committing; (b) is the safe fallback.
+  Bun's wasm support lags Node's — test on both runtimes.
+- **Search scope** — the §3.5 `scope=visible` daemon change is required for
+  parity; without it pi search silently misses `global`/`shared` memories.
+- **Capability-token bundle** — env-bundle for 0.1.0 (§5); collapses to one
+  token once Schubert ships multi-cap grants (handoff: Schubert PR #29).
 - **Shape drift** — Ijima's REST shapes ≠ pi-mempalace's exactly; the adapter
-  layer must be tested, not assumed.
+  layer must be tested, not assumed. Verify the `recall` and `wakeup` route
+  shapes before building tools on them.
 - **Latency** — every memory op is now HTTP (was in-process). Wake-up adds a
   round-trip to session start. Acceptable; cache aggressively.
 - **Offline** — if Ijima is down, pi's memory tools degrade (graceful: tools
@@ -141,16 +196,16 @@ Either way: `integrations/pi/` holds `package.json`, `index.ts`, `ijima_client.t
 - **SurrealDB perf** — the index fix (#33) is in; verify search/recall stay
   snappy over HTTP with the full corpus.
 
-## 11. Decisions (2026-07-12) + remaining defaults
+## 11. Decisions (2026-07-12)
 
-1. **Namespace: PRIVATE** (decided) — pi writes to `ns_<principal>_private`.
-   Cutover re-migrates the corpus into private so history + new writes
-   coexist (§6).
-2. **Packaging: load-by-path for v1** (default) — `settings.json` extensions
-   points at `<ijima-repo>/integrations/pi/index.ts`. Dev-simple, no publish.
-   Revisit npm packaging when distributing across workstations.
-3. **Token strategy: env-bundle of one-cap Schubert tokens** (default) —
-   `IJIMA_TOKEN_MEMORY_WRITE/READ`, `…_KNOWLEDGE_*`, etc., picked per call.
-   A future Schubert multi-capability token would simplify this; deferred.
-4. **Stats widget + `/memory` command: port verbatim** (default) — full
-   parity with pi-mempalace for v1.
+1. **Architecture: Rust core → WebAssembly + thin TS shim.** Reuses
+   `ijima-client`/`ijima-core`, unifies CI under cargo. Phase-0 wasm spike
+   de-risks the HTTP path (§2, §9.0).
+2. **Namespace: PRIVATE** — pi writes to `ns_<principal>_private`; cutover
+   re-migrates the corpus there (`ijima migrate --namespace`, §8.0).
+3. **Search scope: Ijima `scope=visible`** — multi-namespace server-side
+   merge so pi search matches pi-mempalace's global semantics (§3.5).
+4. **Packaging: load-by-path for v1** — revisit npm when distributing.
+5. **Tokens: env-bundle for 0.1.0** — collapses to one token after Schubert
+   multi-cap grants land (Schubert PR #29).
+6. **Stats widget + `/memory` command: port verbatim** for v1 parity.
