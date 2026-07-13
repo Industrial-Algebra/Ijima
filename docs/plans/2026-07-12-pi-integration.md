@@ -162,11 +162,14 @@ artifact; CI (`cargo`) type-checks/tests the Rust core.
 ## 9. Implementation phases
 
 0. **Prerequisites / de-risk.**
-   - `ijima migrate --namespace <ns>` (small; unblocks private-namespace cutover).
-   - `scope=visible` search mode on the daemon (§3.5).
-   - **Wasm spike:** decide path (a) wasm-compatible `ijima-client` vs (b) HTTP
-     in the TS shim + pure mapping in wasm. Build a one-call proof (e.g.
-     `memory_search`) end-to-end through wasm before committing.
+   - `ijima migrate --namespace <ns>` (small; unblocks private-namespace cutover). **DONE.**
+   - `scope=visible` search mode on the daemon (§3.5). *(Next.)*
+   - **Wasm spike: RESOLVED → path (b).** Path (a) (full ijima-client wasm
+     reuse) is blocked — the workspace tokio (`net`/`rt-multi-thread`) drags
+     `mio`, native-only. Path (b) confirmed: `ijima-core` (+serde) compiles to
+     `wasm32-unknown-unknown` clean (3.3s). So the wasm core reuses the domain
+     types + serde for type-safe request/response mapping; HTTP stays native in
+     the TS shim (host fetch). No tokio/reqwest in the wasm core.
 1. **Scaffold** `integrations/pi/` + the Rust core crate (wasm-bindgen setup).
 2. **Core + memory tools** (search/save/recall/status/delete/check_duplicate)
    — the highest-value slice; ship + verify before the rest.
