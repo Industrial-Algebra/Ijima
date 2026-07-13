@@ -163,7 +163,12 @@ artifact; CI (`cargo`) type-checks/tests the Rust core.
 
 0. **Prerequisites / de-risk.**
    - `ijima migrate --namespace <ns>` (small; unblocks private-namespace cutover). **DONE.**
-   - `scope=visible` search mode on the daemon (§3.5). *(Next.)*
+   - `scope=visible` search mode on the daemon (§3.5). **DONE** — required
+     scored search, so `Store::search_memories` now returns
+     `Vec<SearchHit>` (memory + cosine similarity; SurrealStore already
+     computed the score, was discarding it); `scope=visible` merges the
+     principal's private namespace + `global` via a pure, tested
+     `merge_search_hits`.
    - **Wasm spike: RESOLVED → path (b).** Path (a) (full ijima-client wasm
      reuse) is blocked — the workspace tokio (`net`/`rt-multi-thread`) drags
      `mio`, native-only. Path (b) confirmed: `ijima-core` (+serde) compiles to

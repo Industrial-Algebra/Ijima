@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use ijima_core::{
     AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
-    QueuedExtraction, Session, SessionId, SessionTurn, Store,
+    NamespaceId, QueuedExtraction, SearchHit, Session, SessionId, SessionTurn, Store,
     capabilities::{
         KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER, SESSION_INGEST,
         TRUST_PROMOTE,
@@ -312,11 +312,16 @@ struct SearchRequest {
     /// vector compatibility with stored memories.
     text: String,
     limit: Option<usize>,
+    /// Search scope: `personal` (default — the resolved namespace only) or
+    /// `visible` (the principal's private namespace + the `global` commons,
+    /// merged by similarity). The pi integration uses `visible` for parity
+    /// with pi-mempalace's global search.
+    scope: Option<String>,
 }
 
 #[derive(Serialize)]
 struct SearchResponse {
-    memories: Vec<Memory>,
+    memories: Vec<SearchHit>,
 }
 
 async fn search_memories(
@@ -331,13 +336,55 @@ async fn search_memories(
     }
     let embedder = embedder
         .ok_or_else(|| ApiError::Internal("search unavailable: daemon has no embedder".into()))?;
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
     let query = embedder.embed(&req.text).map_err(internal)?;
-    let hits = store
-        .search_memories(&ns, &query, req.limit.unwrap_or(10))
-        .await
-        .map_err(internal)?;
+    let limit = req.limit.unwrap_or(10);
+
+    // `visible` scope: merge the principal's private namespace + the global
+    // commons, ranked by similarity across both (pi-mempalace parity). The
+    // `personal` default searches only the resolved namespace.
+    let hits = if req.scope.as_deref() == Some("visible") {
+        let own_ns = principal.0.personal_namespace();
+        let global_ns = NamespaceId::new("global");
+        let own_hits = store
+            .search_memories(&own_ns, &query, limit)
+            .await
+            .map_err(internal)?;
+        let global_hits = if own_ns == global_ns {
+            Vec::new()
+        } else {
+            store
+                .search_memories(&global_ns, &query, limit)
+                .await
+                .map_err(internal)?
+        };
+        merge_search_hits(own_hits, global_hits, limit)
+    } else {
+        let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+        store
+            .search_memories(&ns, &query, limit)
+            .await
+            .map_err(internal)?
+    };
     Ok(Json(SearchResponse { memories: hits }))
+}
+
+/// Merges two scored hit lists by similarity (desc), deduplicating by memory
+/// id (the highest-similarity instance wins — NOT `dedup_by`, which only
+/// drops adjacent dups) and truncating to `limit`. Pure — the `scope=visible`
+/// path uses this to combine private + global results.
+fn merge_search_hits(a: Vec<SearchHit>, b: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+    use std::collections::HashSet;
+    let mut all: Vec<SearchHit> = a.into_iter().chain(b).collect();
+    all.sort_by(|x, y| {
+        y.similarity
+            .partial_cmp(&x.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // Keep the first (highest-similarity, post-sort) instance of each id.
+    let mut seen: HashSet<String> = HashSet::new();
+    all.retain(|h| seen.insert(h.memory.id.0.clone()));
+    all.truncate(limit);
+    all
 }
 
 // ---------- promotion (personal → shared, D9 §2) ----------
@@ -1777,6 +1824,51 @@ mod tests {
         )
         .unwrap();
         assert!(body.as_array().unwrap().is_empty());
+    }
+
+    fn hit_mem(id: &str, sim: f32) -> SearchHit {
+        SearchHit {
+            memory: Memory {
+                id: MemoryId(id.into()),
+                content: id.into(),
+                project: "p".into(),
+                topic: "t".into(),
+                source: ijima_core::MemorySource::Explicit,
+                harness: ijima_core::harness::Harness::Pi,
+                session_id: None,
+                origin: ijima_core::InstanceId::local(),
+                authority: ijima_core::AuthorityScope::local(),
+                importance: 0.5,
+                created_at: "0".into(),
+            },
+            similarity: sim,
+        }
+    }
+
+    #[test]
+    fn merge_search_hits_ranks_desc_dedups_and_truncates() {
+        // scope=visible merge: two ranked lists combine by similarity, dedup
+        // by memory id (first wins), truncate to limit.
+        let a = vec![hit_mem("a", 0.9), hit_mem("b", 0.5)];
+        let b = vec![hit_mem("c", 0.8), hit_mem("a", 0.7)]; // 'a' dup, lower sim
+        let merged = merge_search_hits(a, b, 3);
+        // Sorted by similarity desc: a(0.9), c(0.8), b(0.5) — the dup a(0.7)
+        // is dropped (first wins).
+        assert_eq!(merged.len(), 3);
+        assert_eq!(merged[0].memory.id.0, "a");
+        assert_eq!((merged[0].similarity * 10.0).round() as i32, 9);
+        assert_eq!(merged[1].memory.id.0, "c");
+        assert_eq!(merged[2].memory.id.0, "b");
+    }
+
+    #[test]
+    fn merge_search_hits_respects_limit() {
+        let a = vec![hit_mem("a", 0.9), hit_mem("b", 0.8)];
+        let b = vec![hit_mem("c", 0.7), hit_mem("d", 0.6)];
+        let merged = merge_search_hits(a, b, 2);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].memory.id.0, "a");
+        assert_eq!(merged[1].memory.id.0, "b");
     }
 
     #[cfg(feature = "mining")]

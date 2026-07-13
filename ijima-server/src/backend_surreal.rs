@@ -30,9 +30,9 @@ use async_trait::async_trait;
 use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
     IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
-    PalaceGraph, ProjectTaxon, QueuedExtraction, Result, Room, Session, SessionId, SessionTurn,
-    Store, StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder, harness::Harness,
-    memory::MemorySource,
+    PalaceGraph, ProjectTaxon, QueuedExtraction, Result, Room, SearchHit, Session, SessionId,
+    SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder,
+    harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -767,10 +767,10 @@ impl Store for SurrealStore {
         ns: &NamespaceId,
         embedding: &Embedding,
         limit: usize,
-    ) -> Result<Vec<Memory>> {
+    ) -> Result<Vec<SearchHit>> {
         if self.embedder.is_none() {
             return Err(IjimaError::Store {
-                detail: "search requires the store to be opened with an Embedder".into(),
+                detail: "search requires the store to opened with an Embedder".into(),
             });
         }
         // Cosine similarity ranking, brute-force over the namespace.
@@ -780,6 +780,7 @@ impl Store for SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
+                        origin, authority, importance, created_at,
                         vector::similarity::cosine(embedding, $query) AS score
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND embedding IS NOT NONE
@@ -791,8 +792,22 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
-        Ok(records.into_iter().map(|r| r.into_memory()).collect())
+        // Deserialize each row as a MemoryRecord (missing fields default)
+        // flattened alongside the computed `score`.
+        #[derive(Deserialize)]
+        struct ScoredRecord {
+            #[serde(flatten)]
+            rec: MemoryRecord,
+            score: f64,
+        }
+        let rows: Vec<ScoredRecord> = result.take(0).map_err(store_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SearchHit {
+                memory: r.rec.into_memory(),
+                similarity: r.score as f32,
+            })
+            .collect())
     }
 
     async fn ingest_turn(&self, ns: &NamespaceId, turn: SessionTurn) -> Result<()> {
@@ -1716,7 +1731,9 @@ mod tests {
         assert!(!hits.is_empty(), "must find at least one memory");
         // The nearest hit must be the rust/memory one (m1), not the
         // unrelated text.
-        assert_eq!(hits[0].content, "rust memory store");
+        assert_eq!(hits[0].memory.content, "rust memory store");
+        // Scored search: each hit carries its cosine similarity.
+        assert!(hits[0].similarity > 0.0);
     }
 
     #[tokio::test]
