@@ -217,9 +217,10 @@ pub fn parse_knowledge_add_response(json_str: String) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parse the entity query response into a pi-friendly result.
-/// Uses raw JSON access to avoid depending on EntityRecord
-/// deserialization (Entity/EntityId serde shapes can be fragile
-/// across feature gates).
+/// Uses raw JSON access for resilience — avoids coupling to Entity's
+/// exact field set (the daemon includes fields like `namespace` that
+/// pi doesn't need). This also sidesteps the strict-deserialization
+/// requirement that all Entity fields be present.
 #[wasm_bindgen]
 pub fn parse_knowledge_query_response(json_str: String) -> String {
     let v: serde_json::Value = match serde_json::from_str(&json_str) {
@@ -336,7 +337,13 @@ mod tests {
 
     #[test]
     fn build_save_request_defaults() {
-        let json = build_save_request("mem_x".into(), "hello".into(), "proj".into(), "top".into(), None);
+        let json = build_save_request(
+            "mem_x".into(),
+            "hello".into(),
+            "proj".into(),
+            "top".into(),
+            None,
+        );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["id"], "mem_x");
         assert_eq!(v["content"], "hello");
