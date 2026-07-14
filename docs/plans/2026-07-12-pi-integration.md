@@ -73,6 +73,38 @@ namespace-scoped list with project/topic filters; Ijima `Memory` fields →
 pi's `{text, project, topic, timestamp, …}` result shape). A thin adapter
 layer per tool.
 
+### 3.6 VALIDATED capability map + backend gaps (2026-07-13 e2e checkpoint)
+
+The table above was written from assumption, not inspection. A live
+e2e checkpoint (`ijima serve` + `memory_search` via the wasm shim, fully
+working) corrected it by reading the actual `principal.0.may(...)` checks
+in `api.rs`. **Corrections:**
+
+- **`memory_status` → `/status` requires `admin`, NOT `memory:read`.**
+  Either the pi tool carries an admin token, or Ijima adds a
+  `memory:read`-accessible status/count endpoint. Until then this tool is
+  blocked or needs the admin capability.
+- **Six tools map to routes that DO NOT EXIST in Ijima** (the table
+  assumed pi-mempalace parity): `memory_graph`, `memory_tunnel`,
+  `memory_list_rooms`, `memory_taxonomy` (`/palace/*`, `/rooms`,
+  `/taxonomy`) and `memory_diary_write`, `memory_diary_read` (`/diaries`).
+  These need Ijima backend work before the integration can port them.
+
+**Validated map (from `may()` inspection):** `/memories/search`,
+`/memories/check`, `GET /memories/{id}`, `/wakeup`, `GET /sessions`,
+`GET /sessions/{id}/turns` → `memory:read`. `POST /memories`, `DELETE
+/memories/{id}` → `memory:write`. `/status`, `/doctrine` → `admin`.
+`/memories/{id}/promote` → `trust:promote`. `/kg/triples` POST +
+`/kg/triples/{id}/invalidate` → `knowledge:write`; `/kg/entities/{id}`,
+`GET /kg/triples`, `/kg/timeline`, `/kg/stats` → `knowledge:read`.
+`POST /sessions`, `/sessions/{id}/end`, `POST /sessions/{id}/turns` →
+`session:ingest`. `/mining/queue` + accept/reject → `mining:review`;
+`/sessions/{id}/mine` → `mining:trigger`.
+
+**Net: 11 of 17 tools have working backends; 6 are blocked on Ijima
+backend additions.** Phase 2 can ship the memory tools (minus status);
+phase 4 must add the palace/diary endpoints first.
+
 ### 3.5 Search scope — the one real design gap
 
 **The mismatch:** pi-mempalace's `memory_search` is **global** (every
@@ -175,12 +207,16 @@ artifact; CI (`cargo`) type-checks/tests the Rust core.
      `wasm32-unknown-unknown` clean (3.3s). So the wasm core reuses the domain
      types + serde for type-safe request/response mapping; HTTP stays native in
      the TS shim (host fetch). No tokio/reqwest in the wasm core.
-1. **Scaffold** `integrations/pi/` + the Rust core crate (wasm-bindgen setup).
+1. **Scaffold** `integrations/pi/` + the Rust core crate (wasm-bindgen setup). **DONE** (e2e-validated 2026-07-13: jiti loads index.ts, memory_search runs against a live daemon, ranked results correct).
 2. **Core + memory tools** (search/save/recall/status/delete/check_duplicate)
-   — the highest-value slice; ship + verify before the rest.
+   — the highest-value slice. search **DONE + e2e-proven**; status blocked on
+   the admin-vs-read issue (§3.6); the rest are mechanical repetition of the
+   proven pattern.
 3. **Lifecycle hooks** (auto-capture + wake-up) — the "feels like mempalace"
    behavior.
-4. **Knowledge graph + palace + diary tools** — parity completeness.
+4. **Knowledge graph + palace + diary tools** — ⚠️ **BLOCKED**: the 4 palace +
+   2 diary routes do not exist in Ijima yet (§3.6). KG tools (5) are
+   unblocked. Add the missing backend endpoints before porting the other 6.
 5. **`/memory` command + stats widget** — port.
 7. **Cutover** on one workstation; document the per-workstation setup.
 
