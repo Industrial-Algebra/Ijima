@@ -4,6 +4,7 @@ members = [
     "ijima-server",
     "ijima-miner",
     "ijima-client",
+    "ijima-pi",
 ]
 resolver = "2"
 
