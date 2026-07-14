@@ -56,7 +56,9 @@ export default function (pi: ExtensionAPI) {
 
       try {
         const response = await fetch(
-          `${ijimaUrl}/memories/search?scope=visible`,
+          // Scope travels in the JSON body (scope=visible, set by the wasm
+          // core); no query param needed.
+          `${ijimaUrl}/memories/search`,
           {
             method: "POST",
             headers: {
@@ -98,24 +100,37 @@ export default function (pi: ExtensionAPI) {
           };
         }
 
-        if (!Array.isArray(hits) || hits.length === 0) {
+        if (!Array.isArray(hits)) {
           return {
             content: [
-              {
-                type: "text",
-                text: "No memories found matching your query.",
-              },
+              { type: "text", text: "No memories found matching your query." },
             ],
             details: {},
           };
         }
 
-        const lines = (hits as Array<Record<string, unknown>>).map(
-          (h, i) => {
-            const pct = ((h.similarity as number) * 100).toFixed(1);
-            return `${i + 1}. [${pct}%] ${h.text} (${h.project}/${h.topic}, ${h.timestamp})`;
-          },
-        );
+        // Client-side project/topic filter: Ijima search is namespace-wide
+        // vector similarity; these refine the retrieved set afterwards.
+        let matched = hits as Array<Record<string, unknown>>;
+        if (params.project) {
+          matched = matched.filter((h) => h.project === params.project);
+        }
+        if (params.topic) {
+          matched = matched.filter((h) => h.topic === params.topic);
+        }
+        if (matched.length === 0) {
+          return {
+            content: [
+              { type: "text", text: "No memories found matching your query." },
+            ],
+            details: {},
+          };
+        }
+
+        const lines = matched.map((h, i) => {
+          const pct = ((h.similarity as number) * 100).toFixed(1);
+          return `${i + 1}. [${pct}%] ${h.text} (${h.project}/${h.topic}, ${h.timestamp})`;
+        });
 
         return {
           content: [{ type: "text", text: lines.join("\n") }],
