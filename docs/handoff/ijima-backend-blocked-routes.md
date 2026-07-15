@@ -1,7 +1,12 @@
-# Handoff: Ijima backend — the 8 blocked routes (unblock the remaining pi tools)
+# Handoff: Ijima backend — the blocked routes (unblock the remaining pi tools + 1 Dominic dep)
 
 **Status:** ready to execute. **Branch:** work off `feature/pi-integration`.
 **Prerequisite read:** [`docs/plans/2026-07-12-pi-integration.md`](../plans/2026-07-12-pi-integration.md) §3.6 (the validated capability map + which tools are blocked and why).
+
+> Groups A–C unblock the 8 pi tools. **Group D** (RepoDirectory) is a separate
+driver — a Dominic/Tsume dependency (CWD → project resolution), tracked
+in [`../../Dominic/docs/handoff/ijima-backend-dependencies.md`](../../Dominic/docs/handoff/ijima-backend-dependencies.md).
+It's the same store+route gap pattern, so it rides in this handoff.
 
 ## The key finding — this is mostly mechanical route-wiring, NOT new backend logic
 
@@ -115,6 +120,33 @@ struct NamespaceStats { total: usize, projects: Vec<ProjectCount> }
 struct ProjectCount { project: String, count: usize }
 ```
 (Or reuse `ProjectTaxon` from palace.rs if its shape fits.) **Cap: memory:read.**
+
+## Group D — RepoDirectory (Dominic dependency; global, NOT namespace-scoped)
+
+Driven by the Dominic/Tsume use case (CWD → project resolution for dispatch
+context), not the pi tools. Tracked cross-project in
+[`../Dominic/docs/handoff/ijima-backend-dependencies.md`](../../Dominic/docs/handoff/ijima-backend-dependencies.md).
+
+The value type exists (`ijima-core/src/repo.rs`: `Repository { name, path,
+remote, role }` + `normalize_path`), but there is **no Store persistence
+and no HTTP route** — the same gap pattern as the palace/diary routes.
+Unlike those, the registry is **global** (not namespace-scoped — per the
+`repo.rs` doc comment), so the Store methods take no `ns` param.
+
+Add to the `Store` trait (ijima-core) + `SurrealStore` impl (backend_surreal.rs):
+```rust
+async fn register_repo(&self, repo: Repository) -> Result<()>;
+async fn resolve_repo(&self, cwd: &str) -> Result<Option<Repository>>;  // normalize_path first
+async fn list_repos(&self) -> Result<Vec<Repository>>;
+```
+Routes (new, memory:read for queries; memory:write or a new admin cap for
+register — pick consistent with the existing policy):
+- `POST /repos` (body: `Repository`) → register/upsert
+- `GET /repos/resolve?cwd=<path>` → `Repository` or 404
+- `GET /repos` → `Vec<Repository>` (the canonical Anima member list)
+
+`Repository` already derives Serialize; check it derives Deserialize (needs
+it for the POST body + a `DEFINE INDEX` on `path` for the resolve lookup).
 
 ---
 
