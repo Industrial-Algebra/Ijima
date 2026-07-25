@@ -48,7 +48,7 @@ candle-transformers = { git = "https://github.com/huggingface/candle", default-f
 tokenizers = { version = "0.21", optional = true }
 hf-hub = { version = "0.5", optional = true }
 schubert = { version = "0.3", features = ["std", "crypto", "policy"], optional = true }
-base64 = { version = "0.22", optional = true }
+base64 = { version = "0.23", optional = true }
 surrealdb = { version = "2", default-features = false, features = ["kv-mem"], optional = true }
 rusqlite = { workspace = true, optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
