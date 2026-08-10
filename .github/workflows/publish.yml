@@ -1,17 +1,24 @@
 name: Publish
 
-# Publishes the Ijima workspace to crates.io when a version tag is pushed.
-# Crates are published in dependency order, pausing between crates so the
-# crates.io index propagates before dependents resolve (ijima-server
-# depends on ijima-core + ijima-miner; ijima-pi is `publish = false`).
+# Publishes the Ijima workspace to crates.io. Crates are published in
+# dependency order, pausing between crates so the crates.io index
+# propagates before dependents resolve (ijima-server depends on
+# ijima-core + ijima-miner; ijima-pi is `publish = false`).
+#
+# Triggers:
+#   - tag v* push (the release flow)
+#   - workflow_dispatch (manual re-run — recovers from a partial failure;
+#     already-published crates are skipped, not errors)
 #
 # Requires the `CARGO_REGISTRY_TOKEN` repository secret.
-# Definition of shipped: this workflow succeeding + the tag existing.
+# Definition of shipped: this workflow succeeding (all crates published) +
+# the tag existing.
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 jobs:
   publish:
@@ -28,10 +35,25 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          set -e
-          cargo publish -p ijima-core
+          set -o pipefail
+          # Publish in dependency order. Tolerates crates already published
+          # (a re-run after a partial failure skips the done ones) but fails
+          # hard on any other error.
+          publish_crate() {
+            local crate="$1"
+            if cargo publish -p "$crate" 2>&1 | tee /tmp/pub.log; then
+              echo "::notice::published $crate"
+            elif grep -qiE "already exists|already been published|already uploaded" /tmp/pub.log; then
+              echo "::notice::$crate already published — skipping"
+            else
+              echo "::error::$crate failed to publish"
+              cat /tmp/pub.log
+              exit 1
+            fi
+          }
+          publish_crate ijima-core
           sleep 25
-          cargo publish -p ijima-miner
-          cargo publish -p ijima-client
+          publish_crate ijima-miner
+          publish_crate ijima-client
           sleep 25
-          cargo publish -p ijima-server
+          publish_crate ijima-server
