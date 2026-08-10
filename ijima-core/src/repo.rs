@@ -44,6 +44,7 @@ pub struct RepoDirectory {
     pub is_anima_member: bool,
 }
 
+#[cfg(feature = "serde")]
 fn default_anima_member() -> bool {
     true
 }
