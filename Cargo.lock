@@ -2873,6 +2873,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ijima-pi"
+version = "0.1.0"
+dependencies = [
+ "ijima-core",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "ijima-server"
 version = "0.1.0"
 dependencies = [
@@ -5140,9 +5150,9 @@ dependencies = [
 
 [[package]]
 name = "schubert"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22076e8e46ad13f7dcec3cfcba081c94b4e59200f3a30f1ed4e9cb27369963c3"
+checksum = "47131b5663abda426cc9b1c7167688d31de1ba719a0f31d8b8d9d6ea6eab2d79"
 dependencies = [
  "amari-enumerative",
  "clap",
