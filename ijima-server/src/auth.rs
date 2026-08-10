@@ -31,7 +31,6 @@
 //! transport — verification re-checks the signature cryptographically.
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use ed25519_dalek::SigningKey;
 use ijima_core::{IjimaError, Result};
 use schubert::{
     AccessController, AccessDecision, PrincipalId,
@@ -111,7 +110,7 @@ impl IjimaAuth {
     pub fn from_embedded_policy_with_seed(seed: [u8; 32]) -> Result<Self> {
         let controller = AccessController::from_policy_toml(POLICY_TOML)
             .map_err(|e| IjimaError::invalid_input(format!("policy load: {e}")))?;
-        let issuer = CapabilityIssuer::from_key(SigningKey::from_bytes(&seed));
+        let issuer = CapabilityIssuer::from_seed(seed);
         let verifier = CapabilityVerifier::new(issuer.public_key());
         Ok(Self {
             controller,
