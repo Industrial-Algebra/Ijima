@@ -238,7 +238,7 @@ Ijima (no direct dep) — they affect Minuet + Schubert's own internal deps.
 |---|---|---|
 | **A. Land done work** | Merge `feature/pi-integration` → develop (11 commits: wasm core + 9 tools + handoffs); close redundant dependabot PRs. | PR #42 open |
 | **B. Backend routes** | Build Groups A–C (8 pi-tool routes: palace/KG/diary/recall/status) + Group D (RepoDirectory). Unblocks the 8 pi tools AND Dominic dispatch. | DeepSeek handoff ready (`docs/handoff/ijima-backend-blocked-routes.md`) |
-| **C. Schubert v0.4.0** | Bump `schubert = "0.3"` → `0.4`; replace custom auth.rs/extractor.rs/key_store.rs with upstream (axum extractor, KeyStore); evaluate GrantToken (multi-cap) vs per-capability tokens. | handoff TBD |
+| **C. Schubert v0.4.0** | Bump `schubert = "0.3"` → `0.4`; replace custom auth.rs/extractor.rs/key_store.rs with upstream (axum extractor, KeyStore); evaluate GrantToken (multi-cap) vs per-capability tokens. | [`docs/handoff/ijima-schubert-0.4-adoption.md`](../handoff/ijima-schubert-0.4-adoption.md) |
 | **D. Ship v0.1.0** | Release polish (`ia-release-polish`), public repo, dry-run publish, crates.io, tag. Learn from Amari's 9-hotfix publish. | post-merge |
 | **E. Anima unblocks** | Dominic dispatch, Tsume gateway, pi-mempalace cutover (plan §9 phases 3–4: lifecycle hooks, migration script). | downstream |
 
