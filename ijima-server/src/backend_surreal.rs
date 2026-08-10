@@ -30,9 +30,9 @@ use async_trait::async_trait;
 use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
     IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
-    PalaceGraph, ProjectTaxon, QueuedExtraction, Result, Room, SearchHit, Session, SessionId,
-    SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal, embeddings::Embedder,
-    harness::Harness, memory::MemorySource,
+    PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room, SearchHit, Session,
+    SessionId, SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal,
+    embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -51,6 +51,8 @@ const QUEUE_TABLE: &str = "mining_queue";
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
 const TRIPLES_TABLE: &str = "triples";
+/// Repo directory (global Context Mapper registry).
+const REPO_TABLE: &str = "repo_directory";
 
 /// A SurrealDB-backed [`Store`].
 pub struct SurrealStore {
@@ -1047,6 +1049,29 @@ impl Store for SurrealStore {
         let mut records: Vec<DiaryRecord> = result.take(0).map_err(store_err)?;
         records.reverse(); // chronological (DESC → reverse)
         Ok(records.into_iter().map(DiaryRecord::into_entry).collect())
+    }
+
+    // ===== Repo directory (global registry — Context Mapper) =====
+
+    async fn register_repo(&self, repo: RepoDirectory) -> Result<()> {
+        let name = repo.name.clone();
+        let _: Option<RepoDirectory> = self
+            .db
+            .upsert((REPO_TABLE, name))
+            .content(repo)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_repos(&self) -> Result<Vec<RepoDirectory>> {
+        let mut result = self
+            .db
+            .query(format!("SELECT * FROM {REPO_TABLE} ORDER BY name"))
+            .await
+            .map_err(store_err)?;
+        let repos: Vec<RepoDirectory> = result.take(0).map_err(store_err)?;
+        Ok(repos)
     }
 }
 

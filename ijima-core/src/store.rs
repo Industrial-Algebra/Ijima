@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 use crate::{
     AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
-    Result, Session, SessionId, SessionTurn,
+    RepoDirectory, Result, Session, SessionId, SessionTurn,
     harness::Harness,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
@@ -72,6 +72,34 @@ pub trait Store: Send + Sync {
     /// then recency DESC. Powers wake-up composition (L1a personal
     /// essentials, L1b doctrine baseline).
     async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
+    /// Lists memories in `ns`, optionally filtered to `project`/`topic`.
+    /// Powers `GET /memories` (the `memory_recall` browse path — distinct
+    /// from [`Self::list_memories`], which is the importance-ranked
+    /// wake-up feed). Default: fetch a cap, filter in Rust, truncate.
+    /// Backends MAY override with a native filtered query.
+    async fn list_memories_filtered(
+        &self,
+        ns: &NamespaceId,
+        project: Option<&str>,
+        topic: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Memory>> {
+        let cap = if project.is_some() || topic.is_some() {
+            500
+        } else {
+            limit
+        };
+        let mut mems = self.list_memories(ns, cap).await?;
+        if let Some(p) = project {
+            mems.retain(|m| m.project == p);
+        }
+        if let Some(t) = topic {
+            mems.retain(|m| m.topic == t);
+        }
+        mems.truncate(limit);
+        Ok(mems)
+    }
 
     /// Global store statistics across all namespaces (operator/admin
     /// view). Powers `GET /status`.
@@ -172,6 +200,27 @@ pub trait Store: Send + Sync {
         agent: &str,
         limit: usize,
     ) -> Result<Vec<DiaryEntry>>;
+
+    // ===== Repo directory (global — Context Mapper) =====
+
+    /// Registers or upserts a repository in the global registry (keyed by
+    /// `name`). Powers `POST /repos` — the canonical Anima roster.
+    async fn register_repo(&self, repo: RepoDirectory) -> Result<()>;
+
+    /// Lists every registered repository (the ecosystem roster).
+    async fn list_repos(&self) -> Result<Vec<RepoDirectory>>;
+
+    /// Reverse-resolves a working directory to its registered repo: the
+    /// most specific repo whose `path` is a prefix of `cwd` (after
+    /// normalizing). Powers `GET /repos/resolve` (CWD → project).
+    async fn resolve_repo(&self, cwd: &str) -> Result<Option<RepoDirectory>> {
+        let target = crate::repo::normalize_path(cwd);
+        let repos = self.list_repos().await?;
+        Ok(repos
+            .into_iter()
+            .filter(|r| target == r.path || target.starts_with(&format!("{}/", r.path)))
+            .max_by_key(|r| r.path.len()))
+    }
 
     // ===== Mining review queue (ADR M2, M3) =====
 
