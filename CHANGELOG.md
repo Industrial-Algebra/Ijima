@@ -6,14 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet — Ijima v0.1.0 is shipped._
+
+## [0.1.0] — 2026-08-10
+
 The first release of Ijima — the Anima ecosystem's centralized
 "company brain": a multi-tenant memory service (memory palace + knowledge
 graph + session-context repository) with Schubert capability auth, local
 candle embeddings, semantic search, and a session-mining pipeline.
-
-These changes are merged to the `develop` branch but **not yet released**
-— Ijima ships when the crates are published to crates.io and the release
-is tagged.
 
 ### Memory palace
 - CRUD + list, scoped to namespaces (`store_memory`, `recall_memory`,
@@ -105,4 +105,5 @@ is tagged.
 - `ijima migrate --namespace` — imports the legacy pi-mempalace / ZeroClaw
   SQLite corpora into a private namespace.
 
-[Unreleased]: https://github.com/Industrial-Algebra/Ijima/compare/HEAD...develop
+[Unreleased]: https://github.com/Industrial-Algebra/Ijima/compare/v0.1.0...develop
+[0.1.0]: https://github.com/Industrial-Algebra/Ijima/releases/tag/v0.1.0
