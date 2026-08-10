@@ -5,9 +5,10 @@
 //!
 //! The Schubert capability tokens Ijima mints are signed by a single
 //! Ed25519 issuer key. For the daemon and the `ijima token` CLI to agree,
-//! they must share the same 32-byte seed. This module loads it from
-//! `$IJIMA_DIR/issuer.key` (default `~/.ijima/issuer.key`), creating it
-//! with a fresh random seed on first use, mode `0600`.
+//! they must share the same 32-byte seed. This module resolves the path
+//! (`$IJIMA_DIR/issuer.key`, default `~/.ijima/issuer.key`) and delegates
+//! load/create to [`schubert::crypto::KeyStore`] (upstream since Schubert
+//! v0.4 — Ijima no longer reimplements the file/permission logic).
 
 use std::path::{Path, PathBuf};
 
@@ -40,39 +41,30 @@ fn home_dir() -> Option<PathBuf> {
 
 /// Loads the seed at `path`, or creates it with a fresh random value if
 /// absent (mode `0600` on Unix). Used by both the daemon (first start)
-/// and the `ijima token issue` CLI.
+/// and the `ijima token issue` CLI. Delegates to
+/// [`schubert::crypto::KeyStore::load_or_create`].
 ///
 /// # Errors
 ///
 /// Returns [`IjimaError::Store`] on I/O failure or
 /// [`IjimaError::InvalidInput`] if an existing file is not 32 bytes.
 pub fn load_or_create(path: &Path) -> Result<[u8; 32]> {
-    match std::fs::read(path) {
-        Ok(bytes) => seed_from_bytes(&bytes),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let seed = crate::IjimaAuth::generate_seed();
-            write_seed(path, &seed)?;
-            Ok(seed)
-        }
-        Err(e) => Err(IjimaError::Store {
-            detail: format!("read {}: {e}", path.display()),
-        }),
-    }
+    schubert::crypto::KeyStore::load_or_create(path).map_err(|e| IjimaError::Store {
+        detail: format!("issuer key {}: {e}", path.display()),
+    })
 }
 
-/// Loads an existing seed without creating one.
+/// Loads an existing seed without creating one. Delegates to
+/// [`schubert::crypto::KeyStore::load`].
 ///
 /// # Errors
 ///
 /// Returns [`IjimaError::Store`] on I/O failure or
 /// [`IjimaError::InvalidInput`] if the file is absent or not 32 bytes.
 pub fn load(path: &Path) -> Result<[u8; 32]> {
-    match std::fs::read(path) {
-        Ok(bytes) => seed_from_bytes(&bytes),
-        Err(e) => Err(IjimaError::Store {
-            detail: format!("read {}: {e}", path.display()),
-        }),
-    }
+    schubert::crypto::KeyStore::load(path).map_err(|e| IjimaError::Store {
+        detail: format!("issuer key {}: {e}", path.display()),
+    })
 }
 
 /// Formats a seed's derived public key as lowercase hex (for display).
@@ -84,56 +76,6 @@ pub fn public_key_hex(seed: &[u8; 32]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-fn seed_from_bytes(bytes: &[u8]) -> Result<[u8; 32]> {
-    let arr: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| IjimaError::invalid_input("issuer key file must be exactly 32 bytes"))?;
-    Ok(arr)
-}
-
-fn write_seed(path: &Path, seed: &[u8; 32]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| IjimaError::Store {
-            detail: format!("mkdir {}: {e}", parent.display()),
-        })?;
-    }
-    write_secret_file(path, seed).map_err(|e| IjimaError::Store {
-        detail: format!("write {}: {e}", path.display()),
-    })?;
-    #[cfg(unix)]
-    set_owner_only(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn set_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-        IjimaError::Store {
-            detail: format!("chmod {}: {e}", path.display()),
-        }
-    })?;
-    Ok(())
-}
-
-// On non-Unix we still write the file; POSIX permissions are best-effort.
-#[cfg(not(unix))]
-fn write_secret_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
-    std::fs::write(path, seed)
-}
-
-#[cfg(unix)]
-fn write_secret_file(path: &Path, seed: &[u8; 32]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(seed)
 }
 
 #[cfg(test)]
