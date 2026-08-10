@@ -40,11 +40,12 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use ijima_core::{
-    AcceptedExtraction, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId, NamespaceCount,
-    NamespaceId, QueuedExtraction, SearchHit, Session, SessionId, SessionTurn, Store,
+    AcceptedExtraction, DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId,
+    NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Room,
+    SearchHit, Session, SessionId, SessionTurn, Store, TunnelTraversal,
     capabilities::{
-        KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER, SESSION_INGEST,
-        TRUST_PROMOTE,
+        ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER,
+        SESSION_INGEST, TRUST_PROMOTE,
     },
     harness::Harness,
 };
@@ -67,11 +68,20 @@ pub fn app(
     let router = Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
-        .route("/memories", post(store_memory))
+        .route("/memories", get(browse_memories).post(store_memory))
         .route("/memories/check", post(check_duplicate))
         .route("/memories/search", post(search_memories))
+        .route("/memories/stats", get(memory_stats))
         .route("/memories/{id}", get(recall_memory).delete(delete_memory))
         .route("/memories/{id}/promote", post(promote_memory))
+        .route("/rooms", get(list_rooms))
+        .route("/taxonomy", get(taxonomy))
+        .route("/palace/graph", get(palace_graph))
+        .route("/palace/tunnel", get(traverse_tunnel))
+        .route("/diaries", post(write_diary))
+        .route("/diaries/{agent}", get(read_diary))
+        .route("/repos", get(list_repos).post(register_repo))
+        .route("/repos/resolve", get(resolve_repo))
         .route("/doctrine", post(ingest_doctrine))
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
@@ -952,6 +962,243 @@ fn build_mining_agent() -> Option<proserpina::backend::http::HttpAgent> {
             api_key,
         },
     ))
+}
+
+// ===== Palace organization (memory:read) =====
+
+#[derive(Deserialize)]
+struct NamespaceQuery {
+    namespace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RoomsQuery {
+    namespace: Option<String>,
+    project: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct TunnelQuery {
+    namespace: Option<String>,
+    topic: String,
+    project_a: String,
+    project_b: String,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct DiaryQuery {
+    namespace: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MemoryBrowseQuery {
+    namespace: Option<String>,
+    project: Option<String>,
+    topic: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ResolveRepoQuery {
+    cwd: String,
+}
+
+/// Lists rooms (topic cells), optionally filtered to a project. Auth: `memory:read`.
+async fn list_rooms(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<RoomsQuery>,
+) -> Result<Json<Vec<Room>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    let rooms = store
+        .list_rooms(&ns, q.project.as_deref(), limit)
+        .await
+        .map_err(internal)?;
+    Ok(Json(rooms))
+}
+
+/// Full project → topic → count taxonomy. Auth: `memory:read`.
+async fn taxonomy(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NamespaceQuery>,
+) -> Result<Json<Vec<ProjectTaxon>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    Ok(Json(store.taxonomy(&ns).await.map_err(internal)?))
+}
+
+/// The palace graph: projects as nodes, shared-topic tunnels as edges. Auth: `memory:read`.
+async fn palace_graph(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NamespaceQuery>,
+) -> Result<Json<PalaceGraph>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    Ok(Json(store.palace_graph(&ns).await.map_err(internal)?))
+}
+
+/// Traverses a tunnel — the memories from both projects on a shared topic. Auth: `memory:read`.
+async fn traverse_tunnel(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<TunnelQuery>,
+) -> Result<Json<TunnelTraversal>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    Ok(Json(
+        store
+            .traverse_tunnel(&ns, &q.topic, &q.project_a, &q.project_b, limit)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+/// Appends a diary entry to the caller's namespace. Auth: `memory:write`.
+async fn write_diary(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(entry): Json<DiaryEntry>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = principal.0.personal_namespace();
+    store.write_diary(&ns, entry).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Reads `agent`'s diary in the caller's namespace. Auth: `memory:read`.
+async fn read_diary(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Path(agent): Path<String>,
+    Query(q): Query<DiaryQuery>,
+) -> Result<Json<Vec<DiaryEntry>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    Ok(Json(
+        store
+            .read_diary(&ns, &agent, limit)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+/// Browses memories (the `memory_recall` path), optionally filtered to
+/// project/topic — distinct from the importance-ranked wake-up feed. Auth: `memory:read`.
+async fn browse_memories(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<MemoryBrowseQuery>,
+) -> Result<Json<Vec<Memory>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let limit = q.limit.unwrap_or(50).min(500);
+    Ok(Json(
+        store
+            .list_memories_filtered(&ns, q.project.as_deref(), q.topic.as_deref(), limit)
+            .await
+            .map_err(internal)?,
+    ))
+}
+
+#[derive(Serialize)]
+struct NamespaceStats {
+    total: usize,
+    projects: Vec<ProjectCount>,
+}
+
+#[derive(Serialize)]
+struct ProjectCount {
+    project: String,
+    count: usize,
+}
+
+/// Read-accessible namespace stats (derived from room counts; unlike
+/// `/status` which is admin-gated). Auth: `memory:read`.
+async fn memory_stats(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NamespaceQuery>,
+) -> Result<Json<NamespaceStats>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let rooms = store.list_rooms(&ns, None, 1000).await.map_err(internal)?;
+    let total: usize = rooms.iter().map(|r| r.count).sum();
+    let mut by_project: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+    for r in &rooms {
+        *by_project.entry(r.project.clone()).or_default() += r.count;
+    }
+    let projects = by_project
+        .into_iter()
+        .map(|(project, count)| ProjectCount { project, count })
+        .collect();
+    Ok(Json(NamespaceStats { total, projects }))
+}
+
+// ===== Repo directory (global registry — Context Mapper) =====
+
+/// Registers/upserts a repo in the global registry (operator action). Auth: `admin`.
+async fn register_repo(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(repo): Json<RepoDirectory>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    store.register_repo(repo).await.map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Lists every registered repo (the ecosystem roster). Auth: `memory:read`.
+async fn list_repos(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+) -> Result<Json<Vec<RepoDirectory>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(store.list_repos().await.map_err(internal)?))
+}
+
+/// Reverse-resolves a working directory to its registered repo. Auth: `memory:read`.
+async fn resolve_repo(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<ResolveRepoQuery>,
+) -> Result<Json<RepoDirectory>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    match store.resolve_repo(&q.cwd).await.map_err(internal)? {
+        Some(repo) => Ok(Json(repo)),
+        None => Err(ApiError::NotFound),
+    }
 }
 
 #[cfg(test)]
@@ -1945,5 +2192,335 @@ mod tests {
             report.archived >= 1,
             "rules tier should archive the decision: {report:?}"
         );
+    }
+
+    // ===== Palace / diary / repo route tests (Phase B) =====
+
+    async fn body_json(res: axum::response::Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn seed_memory(app: &Router, auth: &IjimaAuth, id: &str, project: &str, topic: &str) {
+        let body = serde_json::json!({
+            "id": id,
+            "content": format!("{project}/{topic} note"),
+            "project": project,
+            "topic": topic,
+            "source": "Explicit",
+            "harness": "Pi",
+            "session_id": "sess_1",
+            "importance": 0.5,
+            "created_at": "0",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", bearer(auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "seed {id} failed");
+    }
+
+    #[tokio::test]
+    async fn rooms_taxonomy_stats_reflect_seeded_memories() {
+        let (app, auth) = app_with_store().await;
+        seed_memory(&app, &auth, "mem_a", "ijima", "api").await;
+        seed_memory(&app, &auth, "mem_b", "ijima", "auth").await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // /rooms
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rooms")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let rooms = body_json(res).await;
+        let topics: std::collections::HashSet<&str> = rooms
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["topic"].as_str().unwrap())
+            .collect();
+        assert!(
+            topics.contains("api") && topics.contains("auth"),
+            "rooms: {rooms}"
+        );
+
+        // /memories/stats
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/stats")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let stats = body_json(res).await;
+        assert_eq!(stats["total"], 2, "stats: {stats}");
+        assert_eq!(stats["projects"][0]["project"], "ijima");
+        assert_eq!(stats["projects"][0]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn browse_memories_filters_by_project() {
+        let (app, auth) = app_with_store().await;
+        seed_memory(&app, &auth, "mem_a", "ijima", "api").await;
+        seed_memory(&app, &auth, "mem_b", "possum", "efficiency").await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories?project=possum")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mems = body_json(res).await;
+        let arr = mems.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["project"], "possum");
+    }
+
+    #[tokio::test]
+    async fn palace_graph_and_tunnel_link_shared_topic() {
+        let (app, auth) = app_with_store().await;
+        seed_memory(&app, &auth, "mem_a", "ijima", "efficiency").await;
+        seed_memory(&app, &auth, "mem_b", "possum", "efficiency").await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/palace/graph")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let graph = body_json(res).await;
+        let projects: std::collections::HashSet<&str> = graph["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert!(
+            projects.contains("ijima") && projects.contains("possum"),
+            "graph: {graph}"
+        );
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/palace/tunnel?topic=efficiency&project_a=ijima&project_b=possum")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let trav = body_json(res).await;
+        assert_eq!(trav["memories_a"].as_array().unwrap().len(), 1);
+        assert_eq!(trav["memories_b"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn diary_write_then_read_round_trips() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        let body = serde_json::json!({
+            "agent": "pi",
+            "content": "shipped the routes",
+            "topic": "ijima",
+            "timestamp": "2026-08-09T12:00:00Z"
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diaries")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/diaries/pi")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let entries = body_json(res).await;
+        let arr = entries.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["content"], "shipped the routes");
+    }
+
+    #[tokio::test]
+    async fn diary_write_requires_memory_write_not_read() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let body = serde_json::json!({"agent": "pi", "content": "x", "timestamp": "t"}).to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/diaries")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn repo_register_list_resolve_round_trips() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "elliott", ADMIN);
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // register a repo (admin)
+        let body = serde_json::json!({
+            "name": "Ijima",
+            "path": "/home/x/Ijima",
+            "remote_url": "git@github.com:Industrial-Algebra/Ijima.git",
+            "role": "memory-service"
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // list (memory:read)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/repos")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let repos = body_json(res).await;
+        assert_eq!(repos[0]["name"], "Ijima");
+        assert_eq!(repos[0]["path"], "/home/x/Ijima");
+
+        // resolve a cwd inside the repo (memory:read)
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/repos/resolve?cwd=/home/x/Ijima/src")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let repo = body_json(res).await;
+        assert_eq!(repo["name"], "Ijima");
+
+        // resolve a cwd in no registered repo → 404
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/repos/resolve?cwd=/nowhere/here")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn repo_register_requires_admin() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let body = serde_json::json!({
+            "name": "X", "path": "/x", "remote_url": "u", "role": "r"
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 }
