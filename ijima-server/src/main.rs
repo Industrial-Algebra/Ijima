@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+use ijima_core::NamespaceId;
 use ijima_core::capabilities::ALL_CAPABILITIES;
 use ijima_server::{IjimaAuth, key_store};
 
@@ -71,6 +72,12 @@ struct MigrateArgs {
     /// until a later re-embed pass).
     #[arg(long)]
     embed: bool,
+    /// Target namespace for imported memories (default: `global`, the
+    /// pi-mempalace commons). Use a principal's private namespace
+    /// (e.g. `ns_elliott_private`) so migrated history lives where new
+    /// pi writes land.
+    #[arg(long, value_name = "NS", default_value = "global")]
+    namespace: String,
 }
 
 #[derive(Subcommand)]
@@ -312,8 +319,8 @@ async fn run_migrate(
     args: MigrateArgs,
 ) -> ijima_core::Result<ijima_server::migration::ImportReport> {
     use ijima_server::migration::{
-        import_memories, map_pipalace_memory, map_zeroclaw_memory, migration_namespace,
-        read_pipalace_memories, read_zeroclaw_memories,
+        import_memories, map_pipalace_memory, map_zeroclaw_memory, read_pipalace_memories,
+        read_zeroclaw_memories,
     };
 
     if args.palace.is_none() && args.brain.is_none() {
@@ -348,7 +355,7 @@ async fn run_migrate(
     #[cfg(not(feature = "embeddings-candle"))]
     let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
 
-    let ns = migration_namespace();
+    let ns = NamespaceId::new(&args.namespace);
     let mut all: Vec<ijima_core::Memory> = Vec::new();
 
     if let Some(palace) = &args.palace {

@@ -64,7 +64,7 @@ pub use namespace::{Namespace, NamespaceId, NamespaceKind};
 pub use palace::{PalaceGraph, ProjectTaxon, Room, Tunnel, TunnelTraversal};
 pub use provenance::{AuthorityScope, InstanceId};
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
-pub use store::{NamespaceCount, Store, StoreStats};
+pub use store::{NamespaceCount, SearchHit, Store, StoreStats};
 
 /// Convenience `Result` alias used throughout the Ijima crates.
 pub type Result<T, E = IjimaError> = core::result::Result<T, E>;

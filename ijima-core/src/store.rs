@@ -15,6 +15,20 @@ use crate::{
     harness::Harness,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
+
+/// A scored semantic-search hit: the matched [`Memory`] plus its cosine
+/// similarity to the query (0.0–1.0, higher = more relevant).
+///
+/// Required both for cross-namespace result merging (the pi integration's
+/// `scope=visible` search) and for downstream "% match" display.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SearchHit {
+    /// The matched memory.
+    pub memory: Memory,
+    /// Cosine similarity to the query (0.0–1.0).
+    pub similarity: f32,
+}
 /// Global memory-palace statistics (across all namespaces).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -77,7 +91,7 @@ pub trait Store: Send + Sync {
         ns: &NamespaceId,
         embedding: &Embedding,
         limit: usize,
-    ) -> Result<Vec<Memory>>;
+    ) -> Result<Vec<SearchHit>>;
 
     // ===== Palace organization (Phase 3.1 + 3.2) =====
 

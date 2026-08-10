@@ -73,6 +73,38 @@ namespace-scoped list with project/topic filters; Ijima `Memory` fields →
 pi's `{text, project, topic, timestamp, …}` result shape). A thin adapter
 layer per tool.
 
+### 3.6 VALIDATED capability map + backend gaps (2026-07-13 e2e checkpoint)
+
+The table above was written from assumption, not inspection. A live
+e2e checkpoint (`ijima serve` + `memory_search` via the wasm shim, fully
+working) corrected it by reading the actual `principal.0.may(...)` checks
+in `api.rs`. **Corrections:**
+
+- **`memory_status` → `/status` requires `admin`, NOT `memory:read`.**
+  Either the pi tool carries an admin token, or Ijima adds a
+  `memory:read`-accessible status/count endpoint. Until then this tool is
+  blocked or needs the admin capability.
+- **Six tools map to routes that DO NOT EXIST in Ijima** (the table
+  assumed pi-mempalace parity): `memory_graph`, `memory_tunnel`,
+  `memory_list_rooms`, `memory_taxonomy` (`/palace/*`, `/rooms`,
+  `/taxonomy`) and `memory_diary_write`, `memory_diary_read` (`/diaries`).
+  These need Ijima backend work before the integration can port them.
+
+**Validated map (from `may()` inspection):** `/memories/search`,
+`/memories/check`, `GET /memories/{id}`, `/wakeup`, `GET /sessions`,
+`GET /sessions/{id}/turns` → `memory:read`. `POST /memories`, `DELETE
+/memories/{id}` → `memory:write`. `/status`, `/doctrine` → `admin`.
+`/memories/{id}/promote` → `trust:promote`. `/kg/triples` POST +
+`/kg/triples/{id}/invalidate` → `knowledge:write`; `/kg/entities/{id}`,
+`GET /kg/triples`, `/kg/timeline`, `/kg/stats` → `knowledge:read`.
+`POST /sessions`, `/sessions/{id}/end`, `POST /sessions/{id}/turns` →
+`session:ingest`. `/mining/queue` + accept/reject → `mining:review`;
+`/sessions/{id}/mine` → `mining:trigger`.
+
+**Net: 11 of 17 tools have working backends; 6 are blocked on Ijima
+backend additions.** Phase 2 can ship the memory tools (minus status);
+phase 4 must add the palace/diary endpoints first.
+
 ### 3.5 Search scope — the one real design gap
 
 **The mismatch:** pi-mempalace's `memory_search` is **global** (every
@@ -162,19 +194,57 @@ artifact; CI (`cargo`) type-checks/tests the Rust core.
 ## 9. Implementation phases
 
 0. **Prerequisites / de-risk.**
-   - `ijima migrate --namespace <ns>` (small; unblocks private-namespace cutover).
-   - `scope=visible` search mode on the daemon (§3.5).
-   - **Wasm spike:** decide path (a) wasm-compatible `ijima-client` vs (b) HTTP
-     in the TS shim + pure mapping in wasm. Build a one-call proof (e.g.
-     `memory_search`) end-to-end through wasm before committing.
-1. **Scaffold** `integrations/pi/` + the Rust core crate (wasm-bindgen setup).
+   - `ijima migrate --namespace <ns>` (small; unblocks private-namespace cutover). **DONE.**
+   - `scope=visible` search mode on the daemon (§3.5). **DONE** — required
+     scored search, so `Store::search_memories` now returns
+     `Vec<SearchHit>` (memory + cosine similarity; SurrealStore already
+     computed the score, was discarding it); `scope=visible` merges the
+     principal's private namespace + `global` via a pure, tested
+     `merge_search_hits`.
+   - **Wasm spike: RESOLVED → path (b).** Path (a) (full ijima-client wasm
+     reuse) is blocked — the workspace tokio (`net`/`rt-multi-thread`) drags
+     `mio`, native-only. Path (b) confirmed: `ijima-core` (+serde) compiles to
+     `wasm32-unknown-unknown` clean (3.3s). So the wasm core reuses the domain
+     types + serde for type-safe request/response mapping; HTTP stays native in
+     the TS shim (host fetch). No tokio/reqwest in the wasm core.
+1. **Scaffold** `integrations/pi/` + the Rust core crate (wasm-bindgen setup). **DONE** (e2e-validated 2026-07-13: jiti loads index.ts, memory_search runs against a live daemon, ranked results correct).
 2. **Core + memory tools** (search/save/recall/status/delete/check_duplicate)
-   — the highest-value slice; ship + verify before the rest.
+   — the highest-value slice. search **DONE + e2e-proven**; status blocked on
+   the admin-vs-read issue (§3.6); the rest are mechanical repetition of the
+   proven pattern.
 3. **Lifecycle hooks** (auto-capture + wake-up) — the "feels like mempalace"
    behavior.
-4. **Knowledge graph + palace + diary tools** — parity completeness.
+4. **Knowledge graph + palace + diary tools** — ⚠️ **BLOCKED**: the 4 palace +
+   2 diary routes do not exist in Ijima yet (§3.6). KG tools (5) are
+   unblocked. Add the missing backend endpoints before porting the other 6.
 5. **`/memory` command + stats widget** — port.
 7. **Cutover** on one workstation; document the per-workstation setup.
+
+## 9a. Release scope — Complete v0.1.0 (decided 2026-08-09)
+
+**Decision: everything lands before the v0.1.0 tag** — pi-integration +
+backend routes + RepoDirectory + Schubert v0.4.0. One fully-polished release.
+Context: the Anima stack froze ~25 days (deps delivered, none consumed); Ijima
+gates everything downstream (`Ijima → Dominic dispatch → Tsume/Wallace`). The
+consolidated PULSE flags two Ijima killer items (each ~1hr, flagged 4×):
+RepoDirectory store+route (unblocks Dominic) and Schubert v0.4.0 adoption
+(production authz; Ijima reimplements on 0.3 what 0.4 upstreamed: axum
+extractor, GrantToken, KeyStore). Minuet/Amari version bumps do **not** block
+Ijima (no direct dep) — they affect Minuet + Schubert's own internal deps.
+
+### Shipping path (Complete v0.1.0)
+
+| Phase | Work | Status / owner |
+|---|---|---|
+| **A. Land done work** | Merge `feature/pi-integration` → develop (11 commits: wasm core + 9 tools + handoffs); close redundant dependabot PRs. | PR #42 open |
+| **B. Backend routes** | Build Groups A–C (8 pi-tool routes: palace/KG/diary/recall/status) + Group D (RepoDirectory). Unblocks the 8 pi tools AND Dominic dispatch. | DeepSeek handoff ready (`docs/handoff/ijima-backend-blocked-routes.md`) |
+| **C. Schubert v0.4.0** | Bump `schubert = "0.3"` → `0.4`; replace custom auth.rs/extractor.rs/key_store.rs with upstream (axum extractor, KeyStore); evaluate GrantToken (multi-cap) vs per-capability tokens. | [`docs/handoff/ijima-schubert-0.4-adoption.md`](../handoff/ijima-schubert-0.4-adoption.md) |
+| **D. Ship v0.1.0** | Release polish (`ia-release-polish`), public repo, dry-run publish, crates.io, tag. Learn from Amari's 9-hotfix publish. | post-merge |
+| **E. Anima unblocks** | Dominic dispatch, Tsume gateway, pi-mempalace cutover (plan §9 phases 3–4: lifecycle hooks, migration script). | downstream |
+
+**Note on the PULSE perception gap:** the PULSE reports track `develop`, so
+they flag "pi↔Ijima wasm spike: never started" — that work is actually done on
+`feature/pi-integration` (Phase A merges it and closes the perceived gap).
 
 ## 10. Risks / watch-items
 
