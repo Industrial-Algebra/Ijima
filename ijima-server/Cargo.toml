@@ -11,7 +11,7 @@ readme = "README.md"
 description = "HTTP daemon and store backends for the Ijima centralized agentic memory backend"
 
 [features]
-default = ["std", "http"]
+default = ["std", "http", "server-auth", "backend-surreal"]
 std = []
 # HTTP/JSON transport (axum). Disable to embed the store without a server.
 http = ["dep:axum", "dep:tokio", "dep:tracing", "dep:tracing-subscriber", "ijima-core/serde"]
