@@ -62,6 +62,7 @@ pub struct Memory {
     pub created_at: String,
 }
 
+#[cfg(feature = "serde")]
 fn default_importance() -> f32 {
     0.5
 }

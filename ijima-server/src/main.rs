@@ -13,6 +13,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 
+#[cfg(feature = "backend-sqlite")]
 use ijima_core::NamespaceId;
 use ijima_core::capabilities::ALL_CAPABILITIES;
 use ijima_server::{IjimaAuth, key_store};
