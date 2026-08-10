@@ -220,6 +220,32 @@ artifact; CI (`cargo`) type-checks/tests the Rust core.
 5. **`/memory` command + stats widget** — port.
 7. **Cutover** on one workstation; document the per-workstation setup.
 
+## 9a. Release scope — Complete v0.1.0 (decided 2026-08-09)
+
+**Decision: everything lands before the v0.1.0 tag** — pi-integration +
+backend routes + RepoDirectory + Schubert v0.4.0. One fully-polished release.
+Context: the Anima stack froze ~25 days (deps delivered, none consumed); Ijima
+gates everything downstream (`Ijima → Dominic dispatch → Tsume/Wallace`). The
+consolidated PULSE flags two Ijima killer items (each ~1hr, flagged 4×):
+RepoDirectory store+route (unblocks Dominic) and Schubert v0.4.0 adoption
+(production authz; Ijima reimplements on 0.3 what 0.4 upstreamed: axum
+extractor, GrantToken, KeyStore). Minuet/Amari version bumps do **not** block
+Ijima (no direct dep) — they affect Minuet + Schubert's own internal deps.
+
+### Shipping path (Complete v0.1.0)
+
+| Phase | Work | Status / owner |
+|---|---|---|
+| **A. Land done work** | Merge `feature/pi-integration` → develop (11 commits: wasm core + 9 tools + handoffs); close redundant dependabot PRs. | PR #42 open |
+| **B. Backend routes** | Build Groups A–C (8 pi-tool routes: palace/KG/diary/recall/status) + Group D (RepoDirectory). Unblocks the 8 pi tools AND Dominic dispatch. | DeepSeek handoff ready (`docs/handoff/ijima-backend-blocked-routes.md`) |
+| **C. Schubert v0.4.0** | Bump `schubert = "0.3"` → `0.4`; replace custom auth.rs/extractor.rs/key_store.rs with upstream (axum extractor, KeyStore); evaluate GrantToken (multi-cap) vs per-capability tokens. | handoff TBD |
+| **D. Ship v0.1.0** | Release polish (`ia-release-polish`), public repo, dry-run publish, crates.io, tag. Learn from Amari's 9-hotfix publish. | post-merge |
+| **E. Anima unblocks** | Dominic dispatch, Tsume gateway, pi-mempalace cutover (plan §9 phases 3–4: lifecycle hooks, migration script). | downstream |
+
+**Note on the PULSE perception gap:** the PULSE reports track `develop`, so
+they flag "pi↔Ijima wasm spike: never started" — that work is actually done on
+`feature/pi-integration` (Phase A merges it and closes the perceived gap).
+
 ## 10. Risks / watch-items
 
 - **Wasm HTTP path** (the de-risk spike, §9.0) — `ijima-client` is async over
