@@ -38,7 +38,7 @@ use schubert::{
 };
 
 /// Ijima's Schubert policy, embedded at compile time.
-const POLICY_TOML: &str = include_str!("../../policy/policy.toml");
+const POLICY_TOML: &str = include_str!("../policy/policy.toml");
 
 const ISSUER_KEY_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
