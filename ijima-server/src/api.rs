@@ -39,13 +39,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "mining")]
+use ijima_core::capabilities::MINING_TRIGGER;
 use ijima_core::{
     AcceptedExtraction, DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId,
     NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Room,
     SearchHit, Session, SessionId, SessionTurn, Store, TunnelTraversal,
     capabilities::{
-        ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, MINING_TRIGGER,
-        SESSION_INGEST, TRUST_PROMOTE,
+        ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST,
+        TRUST_PROMOTE,
     },
     harness::Harness,
 };
