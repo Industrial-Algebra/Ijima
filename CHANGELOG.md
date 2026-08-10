@@ -54,7 +54,7 @@ is tagged.
   `spawn_blocking` bridges the sync miner to the async HTTP daemon.
 
 ### Context Mapper
-- Global repo directory (`POST /repos`, `GET /repos/resolve?path=`) —
+- Global repo directory (`POST /repos`, `GET /repos/resolve?cwd=`) —
   longest-prefix CWD→project resolution. The canonical Anima ecosystem
   roster; solves the "repos move / sessions start elsewhere" problem.
 
@@ -62,6 +62,10 @@ is tagged.
 - **Schubert capability auth**: proof-carrying tokens on **Gr(4,8)**
   (dimension 16). 11 capabilities as Schubert partitions; `intersection_number`
   doubles as rate-limit capacity.
+- **Schubert v0.4.0**: key-store persistence delegated to upstream
+  `schubert::crypto::KeyStore` (deletes Ijima's reimplemented seed/permission
+  logic); per-capability `CapabilityToken` model (multi-cap `GrantToken`
+  deferred to a later release).
 - **Rate limiting**: capacity scales with capability codimension
   (`memory:read`→1×, `memory:write`→2×, `admin`→16×); 429 on exhaustion.
 - **Trust-tier transitions as capabilities**: `trust:promote` (codim 4)
@@ -87,5 +91,18 @@ is tagged.
 - `ijima serve` — run the HTTP daemon.
 - `ijima ingest` / `ijima doctrine` — load content.
 - `ijima export` — backup/export the store.
+
+### pi integration (pi-mempalace replacement)
+- **`ijima-pi`** wasm core (WebAssembly): builds Ijima HTTP requests +
+  parses responses for the pi coding agent — search, save, delete,
+  check_duplicate, knowledge graph (add/query/status/invalidate/timeline).
+  Client-side memory-id generation; `scope=visible` merges personal +
+  global/shared results.
+- **`integrations/pi/`** TypeScript shim: registers the Ijima tools as pi
+  memory capabilities, token-per-capability via
+  `IJIMA_TOKEN_{MEMORY,KNOWLEDGE}_{READ,WRITE}`. The path to replacing
+  pi-mempalace's in-process store with a federated Ijima service.
+- `ijima migrate --namespace` — imports the legacy pi-mempalace / ZeroClaw
+  SQLite corpora into a private namespace.
 
 [Unreleased]: https://github.com/Industrial-Algebra/Ijima/compare/HEAD...develop
