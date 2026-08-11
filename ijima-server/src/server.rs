@@ -123,6 +123,8 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
         std::sync::Arc::new(crate::redaction::Redactor::new()),
         #[cfg(feature = "rate-limit")]
         rate_limiter,
+        #[cfg(feature = "federation")]
+        std::sync::Arc::new(ijima_core::federation::InstanceFederationConfig::default()),
     );
 
     let addr = format!("{}:{}", config.host, config.port);

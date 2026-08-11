@@ -54,6 +54,11 @@ pub mod repo;
 pub mod session;
 pub mod store;
 
+/// Federation control-API wire contract (scaffold). Gated behind the
+/// `federation` feature; see `docs/adr/federation-control-api.md`.
+#[cfg(feature = "federation")]
+pub mod federation;
+
 pub use capabilities::intersection_number;
 pub use diary::DiaryEntry;
 pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
