@@ -55,6 +55,12 @@ use ijima_core::{
 use crate::extractor::AuthPrincipal;
 use crate::redaction::Redactor;
 
+#[cfg(feature = "federation")]
+use ijima_core::federation::{
+    AuthoritativeScope, ConflictSignal, FederationState, InstanceFederationConfig, RoutedWrite,
+    RoutedWriteReceipt,
+};
+
 /// Builds the Ijima HTTP application router.
 ///
 /// `auth` and `store` are shared via axum's [`Extension`] layer; the
@@ -66,6 +72,7 @@ pub fn app(
     embedder: Option<Arc<dyn Embedder>>,
     redactor: Arc<Redactor>,
     #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
+    #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
@@ -102,12 +109,21 @@ pub fn app(
         .route("/mining/queue/{id}/reject", post(reject_extraction));
     #[cfg(feature = "mining")]
     let router = router.route("/sessions/{session_id}/mine", post(trigger_mine));
+
+    #[cfg(feature = "federation")]
+    let router = router
+        .route("/federation/state", get(federation_state))
+        .route("/federation/routed-write", post(routed_write))
+        .route("/federation/conflict-signal", post(conflict_signal));
     let router = router
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
         .layer(Extension(redactor));
+
+    #[cfg(feature = "federation")]
+    let router = router.layer(Extension(federation_config));
 
     #[cfg(feature = "rate-limit")]
     let router = match rate_limiter {
@@ -1203,6 +1219,74 @@ async fn resolve_repo(
     }
 }
 
+// ---------- federation control API (scaffold; feature `federation`) ----------
+
+/// `GET /federation/state` — the instance's federated self-description.
+#[cfg(feature = "federation")]
+async fn federation_state(
+    Extension(cfg): Extension<Arc<InstanceFederationConfig>>,
+) -> Json<FederationState> {
+    Json(cfg.to_state())
+}
+
+/// `POST /federation/routed-write` — apply a write under an authoritative scope.
+///
+/// Scaffold: applies the write locally with provenance stamping (origin =
+/// this instance, authority = the scope) but performs **no** boundary
+/// enforcement — no trust-tier egress filtering, scope/airgap deny, or
+/// boundary transformation. Ijima's non-bypassable safety floor is the
+/// follow-on (ADR `federation-control-api` §Deferred).
+#[cfg(feature = "federation")]
+async fn routed_write(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(cfg): Extension<Arc<InstanceFederationConfig>>,
+    Json(write): Json<RoutedWrite>,
+) -> Result<Json<RoutedWriteReceipt>, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let RoutedWrite {
+        target: _,
+        scope,
+        operation: _,
+        payload,
+    } = write;
+    let mut memory: Memory = serde_json::from_value(payload)
+        .map_err(|e| ApiError::BadRequest(format!("payload is not a Memory: {e}")))?;
+    // Stamp federation provenance: this instance applied it; the routed scope
+    // is the source-of-truth authority for the record.
+    memory.origin = ijima_core::provenance::InstanceId::local();
+    memory.authority =
+        ijima_core::provenance::AuthorityScope(format!("{}/{}", scope.namespace, scope.project));
+    if memory.created_at.is_empty() {
+        memory.created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+    }
+    let ns = principal.0.personal_namespace();
+    let id = store.store_memory(&ns, memory).await.map_err(internal)?;
+    Ok(Json(RoutedWriteReceipt {
+        accepted: true,
+        instance: cfg.instance_id.clone(),
+        scope,
+        commit: Some(id.0),
+        warnings: vec!["scaffold: applied locally; egress enforcement deferred".into()],
+    }))
+}
+
+/// `POST /federation/conflict-signal` — poll for a conflict on a scope.
+///
+/// Scaffold: no conflict detection yet. Returns `404` (no active conflict);
+/// the single-instance deployment has no peer to conflict with.
+#[cfg(feature = "federation")]
+async fn conflict_signal(
+    Json(_scope): Json<AuthoritativeScope>,
+) -> Result<Json<ConflictSignal>, ApiError> {
+    Err(ApiError::NotFound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1310,8 @@ mod tests {
                 Arc::new(crate::redaction::Redactor::new()),
                 #[cfg(feature = "rate-limit")]
                 None,
+                #[cfg(feature = "federation")]
+                Arc::new(InstanceFederationConfig::default()),
             ),
             auth,
         )
@@ -1236,6 +1322,115 @@ mod tests {
             "Bearer {}",
             auth.issue_bearer(principal, cap).expect("issue")
         )
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn federation_state_returns_local_config() {
+        let (app, _auth) = app_with_store().await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/federation/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let state = body_json(res).await;
+        assert_eq!(state["instance_id"], "local");
+        assert_eq!(state["role"], "Unifying");
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_applies_a_memory() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "shared", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "mem_fed_test",
+                "content": "federated hello",
+                "project": "Dominic",
+                "topic": "federated",
+                "source": "Explicit",
+                "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["accepted"], true);
+        assert!(receipt["commit"].as_str().is_some());
+        assert_eq!(
+            receipt["warnings"][0],
+            "scaffold: applied locally; egress enforcement deferred"
+        );
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_requires_memory_write() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ); // read cap, not write
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "shared", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "x", "content": "c", "project": "p",
+                "topic": "t", "source": "Explicit", "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn conflict_signal_returns_404_when_none() {
+        let (app, _auth) = app_with_store().await;
+        let body = serde_json::json!({"namespace": "shared", "project": "Dominic"}).to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/conflict-signal")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     fn sample_memory_json(id: &str) -> String {

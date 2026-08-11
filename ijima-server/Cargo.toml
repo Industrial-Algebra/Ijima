@@ -42,6 +42,9 @@ mining = ["dep:ijima-miner", "dep:proserpina", "backend-surreal", "ijima-miner/l
 # Optional TLS for the HTTP daemon. Env-driven (`IJIMA_TLS_CERT` +
 # `IJIMA_TLS_KEY` PEM paths). Plain HTTP remains the default.
 tls = ["dep:axum-server", "http"]
+# Federation control-API scaffold (ADR federation-control-api). The 3
+# /federation/* routes + instance config; boundary enforcement deferred.
+federation = ["ijima-core/federation", "http"]
 
 [dependencies]
 ijima-core = { workspace = true }

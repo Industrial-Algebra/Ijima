@@ -16,10 +16,14 @@ std = []
 # Serialize/Deserialize impls for all domain types. Required by the
 # store backends (SurrealDB, Postgres) and the HTTP API.
 serde = ["dep:serde"]
+# Federation control-API wire contract (DTOs + instance config). Scaffold;
+# the federation control routes in ijima-server enable this.
+federation = ["serde", "dep:serde_json"]
 
 [dependencies]
 thiserror = { workspace = true }
 serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 async-trait = "0.1"
 
 [dev-dependencies]
