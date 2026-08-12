@@ -50,6 +50,7 @@ use ijima_core::{
         TRUST_PROMOTE,
     },
     harness::Harness,
+    memory::MemorySource,
 };
 
 use crate::extractor::AuthPrincipal;
@@ -1252,6 +1253,21 @@ async fn routed_write(
         operation: _,
         payload,
     } = write;
+
+    // === Boundary enforcement (non-bypassable; the federation ingress path) ===
+    // (1) Airgap: a sovereign instance rejects all federation writes.
+    if cfg.role == ijima_core::federation::InstanceRole::Airgapped {
+        return Err(ApiError::Forbidden);
+    }
+    // (2) Scope filter: accept only writes for scopes this instance is
+    //     authoritative for (default-deny for sovereignty).
+    if !cfg.accepts_scope(&scope) {
+        return Err(ApiError::BadRequest(format!(
+            "out of authoritative scope: {}/{}",
+            scope.namespace, scope.project
+        )));
+    }
+
     let mut memory: Memory = serde_json::from_value(payload)
         .map_err(|e| ApiError::BadRequest(format!("payload is not a Memory: {e}")))?;
     // Stamp federation provenance: this instance applied it; the routed scope
@@ -1266,13 +1282,30 @@ async fn routed_write(
             .unwrap_or_default();
     }
     let ns = principal.0.personal_namespace();
-    let id = store.store_memory(&ns, memory).await.map_err(internal)?;
+
+    // (3) Trust-tier ingress: doctrine arriving via federation is never
+    //     auto-trusted — stage it as PendingReview (never auto-promoted).
+    //     Lower tiers (Explicit/Mined/AutoCapture) cross as-is.
+    let (commit, mut warnings) = if memory.source == MemorySource::Doctrine {
+        let pending = store
+            .enqueue_extraction(&ns, memory, 0.5)
+            .await
+            .map_err(internal)?;
+        (
+            pending,
+            vec!["doctrine downgraded to PendingReview (trust-tier ingress rule)".into()],
+        )
+    } else {
+        let id = store.store_memory(&ns, memory).await.map_err(internal)?;
+        (id.0, Vec::new())
+    };
+    warnings.push("boundary enforcement: scope + airgap + doctrine-downgrade applied".into());
     Ok(Json(RoutedWriteReceipt {
         accepted: true,
         instance: cfg.instance_id.clone(),
         scope,
-        commit: Some(id.0),
-        warnings: vec!["scaffold: applied locally; egress enforcement deferred".into()],
+        commit: Some(commit),
+        warnings,
     }))
 }
 
@@ -1317,6 +1350,31 @@ mod tests {
         )
     }
 
+    /// Like [`app_with_store`] but with a custom federation config — for
+    /// boundary-enforcement tests (airgap, out-of-scope).
+    #[cfg(feature = "federation")]
+    async fn app_with_federation_config(
+        config: InstanceFederationConfig,
+    ) -> (Router, Arc<IjimaAuth>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        (
+            app(
+                auth.clone(),
+                store,
+                kg,
+                None,
+                Arc::new(crate::redaction::Redactor::new()),
+                #[cfg(feature = "rate-limit")]
+                None,
+                Arc::new(config),
+            ),
+            auth,
+        )
+    }
+
     fn bearer(auth: &IjimaAuth, principal: &str, cap: &str) -> String {
         format!(
             "Bearer {}",
@@ -1350,7 +1408,7 @@ mod tests {
         let write = bearer(&auth, "elliott", MEMORY_WRITE);
         let body = serde_json::json!({
             "target": "local",
-            "scope": {"namespace": "shared", "project": "Dominic"},
+            "scope": {"namespace": "local", "project": "Dominic"},
             "operation": "Create",
             "payload": {
                 "id": "mem_fed_test",
@@ -1380,7 +1438,7 @@ mod tests {
         assert!(receipt["commit"].as_str().is_some());
         assert_eq!(
             receipt["warnings"][0],
-            "scaffold: applied locally; egress enforcement deferred"
+            "boundary enforcement: scope + airgap + doctrine-downgrade applied"
         );
     }
 
@@ -1391,7 +1449,7 @@ mod tests {
         let read = bearer(&auth, "elliott", MEMORY_READ); // read cap, not write
         let body = serde_json::json!({
             "target": "local",
-            "scope": {"namespace": "shared", "project": "Dominic"},
+            "scope": {"namespace": "local", "project": "Dominic"},
             "operation": "Create",
             "payload": {
                 "id": "x", "content": "c", "project": "p",
@@ -1412,6 +1470,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_rejects_out_of_scope() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        // default config is authoritative for {local, *}; {shared, ...} is out of scope
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "shared", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "x", "content": "c", "project": "p",
+                "topic": "t", "source": "Explicit", "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_rejects_when_airgapped() {
+        let cfg = InstanceFederationConfig {
+            role: ijima_core::federation::InstanceRole::Airgapped,
+            ..InstanceFederationConfig::default()
+        };
+        let (app, auth) = app_with_federation_config(cfg).await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "local", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "x", "content": "c", "project": "p",
+                "topic": "t", "source": "Explicit", "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_downgrades_doctrine_to_pending() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "local", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "mem_doctrine",
+                "content": "peer-claimed doctrine",
+                "project": "Dominic",
+                "topic": "federated",
+                "source": "Doctrine",
+                "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["accepted"], true);
+        assert_eq!(
+            receipt["warnings"][0],
+            "doctrine downgraded to PendingReview (trust-tier ingress rule)"
+        );
     }
 
     #[cfg(feature = "federation")]
