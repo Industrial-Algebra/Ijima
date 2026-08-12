@@ -51,6 +51,53 @@ impl Default for DaemonConfig {
 /// # Errors
 ///
 /// Returns [`IjimaError`] if the key, store, or socket cannot be opened.
+/// Build the federation instance config from environment variables (the
+/// `IJIMA_INSTANCE_*` family), falling back to the single-instance default.
+/// Core stays env-free; this is the server-boundary binding (ADR
+/// `federation-control-api`).
+///
+/// - `IJIMA_INSTANCE_ID` — stable instance id (default `local`).
+/// - `IJIMA_INSTANCE_ROLE` — `unifying` | `archive` | `domain-authority` |
+///   `edge` | `airgapped` (default `unifying`).
+/// - `IJIMA_INSTANCE_SCOPES` — comma-separated `namespace:project` pairs,
+///   e.g. `local:*,shared:Dominic` (default `local:*`).
+/// - `IJIMA_CAPABILITY_POLICY_REF` — capability-policy hash/ref (default none).
+///
+/// Outbound links are not yet configurable (no peer-topology config format).
+#[cfg(feature = "federation")]
+fn federation_config_from_env() -> ijima_core::federation::InstanceFederationConfig {
+    use ijima_core::federation::{
+        AuthoritativeScope, InstanceFederationConfig, InstanceId, InstanceRole,
+    };
+    use std::str::FromStr;
+    let instance_id = std::env::var("IJIMA_INSTANCE_ID")
+        .map(InstanceId::new)
+        .unwrap_or_default();
+    let role = std::env::var("IJIMA_INSTANCE_ROLE")
+        .ok()
+        .and_then(|r| InstanceRole::from_str(&r).ok())
+        .unwrap_or(InstanceRole::Unifying);
+    let authoritative_scopes = std::env::var("IJIMA_INSTANCE_SCOPES")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|p| AuthoritativeScope::from_str(p.trim()).ok())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| vec![AuthoritativeScope::new("local", "*")]);
+    let capability_policy_ref = std::env::var("IJIMA_CAPABILITY_POLICY_REF")
+        .ok()
+        .filter(|s| !s.is_empty());
+    InstanceFederationConfig {
+        instance_id,
+        role,
+        authoritative_scopes,
+        outbound_links: Vec::new(),
+        capability_policy_ref,
+    }
+}
+
 pub async fn serve(config: &DaemonConfig) -> Result<()> {
     init_tracing();
     let key_path = key_store::default_key_path()?;
@@ -124,7 +171,7 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
         #[cfg(feature = "rate-limit")]
         rate_limiter,
         #[cfg(feature = "federation")]
-        std::sync::Arc::new(ijima_core::federation::InstanceFederationConfig::default()),
+        std::sync::Arc::new(federation_config_from_env()),
     );
 
     let addr = format!("{}:{}", config.host, config.port);
