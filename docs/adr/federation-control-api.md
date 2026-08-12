@@ -85,9 +85,10 @@ or the full transformation pipeline. Still deferred:
   yet); non-doctrine tier thresholds; re-embedding when dimensions differ.
 - **Conflict detection** — `conflict_signal` always returns `404` today; real
   multi-writer-same-scope detection + `source-authority` adjudication is future.
-- **Real instance config** — `InstanceFederationConfig::default()` is hardcoded
-  (local / `Unifying`); env/config-file driven role, scopes, and outbound links
-  (incl. the `IJIMA_INSTANCE_ID` override) are a follow-on.
+- **Real instance config** — `IJIMA_INSTANCE_*` env vars now drive id, role,
+  scopes, and policy-ref at server startup (`federation_config_from_env`).
+  Still deferred: outbound-links config (needs a peer-topology config format)
+  and a TOML/file-based config surface beyond env vars.
 - **`capability_policy_ref` + `etag`** — left `None`; policy-hash population and
   cache validation land with the config surface.
 

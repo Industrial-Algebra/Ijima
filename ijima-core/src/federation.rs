@@ -276,6 +276,32 @@ impl Default for InstanceFederationConfig {
     }
 }
 
+impl std::str::FromStr for InstanceRole {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "unifying" => Ok(Self::Unifying),
+            "archive" => Ok(Self::Archive),
+            "domain-authority" | "domain_authority" => Ok(Self::DomainAuthority),
+            "edge" => Ok(Self::Edge),
+            "airgapped" => Ok(Self::Airgapped),
+            other => Err(format!(
+                "unknown instance role '{other}' (expected unifying | archive | domain-authority | edge | airgapped)"
+            )),
+        }
+    }
+}
+
+impl std::str::FromStr for AuthoritativeScope {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let (ns, proj) = s
+            .split_once(':')
+            .ok_or_else(|| format!("authoritative scope '{s}' must be 'namespace:project'"))?;
+        Ok(Self::new(ns, proj))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,6 +379,33 @@ mod tests {
             ..InstanceFederationConfig::default()
         };
         assert!(open.accepts_scope(&AuthoritativeScope::new("shared", "X")));
+    }
+
+    #[test]
+    fn instance_role_from_str_is_lowercase_tolerant() {
+        use std::str::FromStr;
+        assert_eq!(
+            InstanceRole::from_str("unifying").unwrap(),
+            InstanceRole::Unifying
+        );
+        assert_eq!(
+            InstanceRole::from_str("Airgapped").unwrap(),
+            InstanceRole::Airgapped
+        );
+        assert_eq!(
+            InstanceRole::from_str("domain-authority").unwrap(),
+            InstanceRole::DomainAuthority
+        );
+        assert!(InstanceRole::from_str("bogus").is_err());
+    }
+
+    #[test]
+    fn authoritative_scope_from_str_parses_namespace_project() {
+        use std::str::FromStr;
+        let s = AuthoritativeScope::from_str("shared:Dominic").unwrap();
+        assert_eq!(s.namespace, "shared");
+        assert_eq!(s.project, "Dominic");
+        assert!(AuthoritativeScope::from_str("nocolon").is_err());
     }
 
     #[test]
