@@ -247,6 +247,19 @@ impl InstanceFederationConfig {
             etag: None,
         }
     }
+
+    /// Whether this instance is authoritative for `scope` — the non-bypassable
+    /// scope filter on federation ingress. Matches if any declared
+    /// authoritative scope agrees on namespace and project, where `*` is a
+    /// wildcard on either axis (so `{"local","*"}` accepts any project in the
+    /// `local` namespace, and `{"*","*"}` accepts everything).
+    #[must_use]
+    pub fn accepts_scope(&self, scope: &AuthoritativeScope) -> bool {
+        self.authoritative_scopes.iter().any(|s| {
+            (s.namespace == scope.namespace || s.namespace == "*")
+                && (s.project == scope.project || s.project == "*")
+        })
+    }
 }
 
 impl Default for InstanceFederationConfig {
@@ -324,6 +337,22 @@ mod tests {
         assert_eq!(state.instance_id, InstanceId::local());
         assert_eq!(state.role, InstanceRole::Unifying);
         assert!(state.etag.is_none());
+    }
+
+    #[test]
+    fn accepts_scope_matches_namespace_and_wildcard_project() {
+        let cfg = InstanceFederationConfig::default(); // authoritative for {local, *}
+        // in scope: local namespace, any project
+        assert!(cfg.accepts_scope(&AuthoritativeScope::new("local", "Dominic")));
+        assert!(cfg.accepts_scope(&AuthoritativeScope::new("local", "anything")));
+        // out of scope: different namespace
+        assert!(!cfg.accepts_scope(&AuthoritativeScope::new("shared", "Dominic")));
+        // a fully-wildcard config accepts everything
+        let open = InstanceFederationConfig {
+            authoritative_scopes: vec![AuthoritativeScope::new("*", "*")],
+            ..InstanceFederationConfig::default()
+        };
+        assert!(open.accepts_scope(&AuthoritativeScope::new("shared", "X")));
     }
 
     #[test]
