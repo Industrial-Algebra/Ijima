@@ -3,7 +3,7 @@
 
 //! `ijima` — the Ijima daemon and admin CLI.
 //!
-//! Today: `ijima token issue` mints a Schubert capability token from the
+//! Today: `ijima token issue` mints a Schubert grant token from the
 //! persistent issuer key (see [`ijima_server::key_store`]). The HTTP
 //! daemon (`ijima serve`) lands once the store + auth HTTP routes are
 //! wired.
@@ -113,7 +113,7 @@ struct ServeArgs {
 
 #[derive(Subcommand)]
 enum TokenAction {
-    /// Issue a bearer capability token for a principal.
+    /// Issue a bearer grant token for a principal.
     Issue(IssueArgs),
 }
 
@@ -122,15 +122,21 @@ struct IssueArgs {
     /// The principal to issue the token to (e.g. `elliott`, `tsume-discord`).
     #[arg(long)]
     principal: String,
-    /// The capability to grant. One of the Ijima vocabulary
+    /// The single capability to grant (use `--capabilities` for a
+    /// multi-capability grant token). One of the Ijima vocabulary
     /// (memory:read, memory:write, ...). See `ijima-core::capabilities`.
     #[arg(long)]
-    capability: String,
+    capability: Option<String>,
+    /// Comma-separated capabilities for a multi-capability grant token,
+    /// e.g. `memory:read,memory:write,knowledge:read`. Exactly one of
+    /// `--capability` / `--capabilities` is required.
+    #[arg(long, value_name = "CSV")]
+    capabilities: Option<String>,
     /// Path to the issuer key file. Defaults to `$IJIMA_DIR/issuer.key`
     /// or `~/.ijima/issuer.key`. Created with a fresh seed on first use.
     #[arg(long, value_name = "PATH")]
     key_file: Option<PathBuf>,
-    /// Emit a JSON object (token, principal, capability, public_key)
+    /// Emit a JSON object (token, principal, capabilities, public_key)
     /// instead of just the bearer string.
     #[arg(long)]
     json: bool,
@@ -250,7 +256,29 @@ fn main() -> ExitCode {
 }
 
 fn run_issue(args: IssueArgs) -> ijima_core::Result<()> {
-    validate_capability(&args.capability)?;
+    // Exactly one of --capability / --capabilities.
+    let caps: Vec<String> = match (args.capability.as_deref(), args.capabilities.as_deref()) {
+        (Some(_), Some(_)) => {
+            return Err(ijima_core::IjimaError::invalid_input(
+                "pass either --capability or --capabilities, not both",
+            ));
+        }
+        (Some(c), None) => vec![c.to_string()],
+        (None, Some(csv)) => csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        (None, None) => {
+            return Err(ijima_core::IjimaError::invalid_input(
+                "missing required --capability (or --capabilities for a multi-cap grant)",
+            ));
+        }
+    };
+    for cap in &caps {
+        validate_capability(cap)?;
+    }
+    let cap_refs: Vec<&str> = caps.iter().map(String::as_str).collect();
 
     let key_path = match args.key_file {
         Some(p) => p,
@@ -258,13 +286,14 @@ fn run_issue(args: IssueArgs) -> ijima_core::Result<()> {
     };
     let seed = key_store::load_or_create(&key_path)?;
     let auth = IjimaAuth::from_embedded_policy_with_seed(seed)?;
-    let token = auth.issue_bearer(args.principal.as_str(), &args.capability)?;
+    let token = auth.issue_grant_bearer(args.principal.as_str(), &cap_refs)?;
     let public_key = auth.issuer_public_key_hex();
 
     if args.json {
+        let caps_json = caps.join(",");
         println!(
-            "{{\"token\":\"{token}\",\"principal\":\"{}\",\"capability\":\"{}\",\"public_key\":\"{public_key}\"}}",
-            args.principal, args.capability
+            "{{\"token\":\"{token}\",\"principal\":\"{}\",\"capabilities\":\"{caps_json}\",\"public_key\":\"{public_key}\"}}",
+            args.principal
         );
     } else {
         println!("{token}");
