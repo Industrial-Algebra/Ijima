@@ -31,9 +31,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ijima_core::{IjimaError, Result};
 use schubert::{
     AccessController, CapabilityId, PrincipalId,
-    crypto::{
-        CapabilityIssuer, GrantToken, GrantVerifier, KeyStore,
-    },
+    crypto::{CapabilityIssuer, GrantToken, GrantVerifier, KeyStore},
 };
 
 /// Ijima's Schubert policy, embedded at compile time.
@@ -273,17 +271,25 @@ mod tests {
     #[test]
     fn issue_then_verify_round_trips() {
         let auth = fresh();
-        let bearer = auth.issue_bearer("elliott", MEMORY_READ).expect("must issue");
+        let bearer = auth
+            .issue_bearer("elliott", MEMORY_READ)
+            .expect("must issue");
         let principal = auth.verify_bearer(&bearer).expect("must verify");
         assert_eq!(principal.principal.as_str(), "elliott");
-        assert_eq!(principal.granted_capabilities(), vec![MEMORY_READ.to_string()]);
+        assert_eq!(
+            principal.granted_capabilities(),
+            vec![MEMORY_READ.to_string()]
+        );
     }
 
     #[test]
     fn tampered_signature_is_rejected() {
         let auth = fresh();
         let mut buf = B64
-            .decode(auth.issue_bearer("elliott", MEMORY_READ).expect("must issue"))
+            .decode(
+                auth.issue_bearer("elliott", MEMORY_READ)
+                    .expect("must issue"),
+            )
             .unwrap();
         // Flip the last byte (part of the 64-byte signature).
         let last = buf.len() - 1;
