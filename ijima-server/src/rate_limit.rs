@@ -11,12 +11,12 @@
 //!
 //! Schubert's [`RateLimiter`](schubert::rate_limit::RateLimiter) gives each
 //! principal a token bucket whose **capacity = intersection_number ×
-//! multiplier × base_rate**. The intersection number is the codimension of
-//! the principal's capability (see
-//! [`ijima_core::capabilities::intersection_number`]): a `memory:write`
-//! holder (codim 2) gets 2× the throughput of a `memory:read` holder (codim
-//! 1); `admin` (point class, codim 16) gets 16×. *The geometry of access
-//! maps to the geometry of throughput.*
+//! multiplier × base_rate**. The intersection number is the **max
+//! codimension across the grant's capabilities** — the token's
+//! highest-privilege class: a `memory:write` grant (codim 2) gets 2× the
+//! throughput of a `memory:read` grant (codim 1); an `admin` grant (point
+//! class, codim 16) gets 16×. *The geometry of access maps to the geometry
+//! of throughput.*
 //!
 //! Rate limiting is enforced inside the [`crate::extractor::AuthPrincipal`]
 //! extractor — the capability token drives authentication, authorization,
@@ -32,7 +32,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use ijima_core::capabilities::intersection_number;
 use schubert::PrincipalId;
 use schubert::rate_limit::RateLimiter;
 
@@ -73,8 +72,17 @@ pub fn consume(
     let pid: PrincipalId = principal.principal.clone();
     // Configure on first sight only — configure_principal resets the
     // bucket to full, so calling it every request would defeat limiting.
+    // Weight = the max codimension across the grant's capabilities: a
+    // token's rate-limit "weight class" reflects its highest-privilege
+    // capability (admin [4,4,4,4] = 16, memory:write [2] = 2, read [1] = 1).
     if rl.capacity(pid.clone()).is_none() {
-        let weight = intersection_number(&principal.capability);
+        let weight = principal
+            .grant
+            .capabilities
+            .iter()
+            .map(|c| c.partition.iter().sum::<usize>() as u64)
+            .max()
+            .unwrap_or(1);
         rl.configure_principal(pid.clone(), weight);
     }
     rl.try_consume(pid).map(|_| ())
@@ -83,20 +91,25 @@ pub fn consume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::IjimaAuth;
     use ijima_core::capabilities::{ADMIN, MEMORY_READ, MEMORY_WRITE};
 
-    fn principal(cap: &str) -> AuthenticatedPrincipal {
-        AuthenticatedPrincipal {
-            principal: PrincipalId::new("elliott"),
-            capability: cap.to_string(),
-        }
+    fn auth() -> IjimaAuth {
+        IjimaAuth::from_embedded_policy().expect("policy must load")
+    }
+
+    /// Issue + verify a single-capability grant for `name`.
+    fn principal(auth: &IjimaAuth, name: &str, cap: &str) -> AuthenticatedPrincipal {
+        let bearer = auth.issue_bearer(name, cap).expect("issue");
+        auth.verify_bearer(&bearer).expect("verify")
     }
 
     #[test]
     fn first_request_configures_and_consumes() {
         // base 1.0, multiplier 1.0 → memory:read (codim 1) gets capacity 1.
         let state = make_rate_limiter(1.0, 1.0);
-        let p = principal(MEMORY_READ);
+        let auth = auth();
+        let p = principal(&auth, "elliott", MEMORY_READ);
         assert!(consume(&state, &p).is_ok()); // 1 token, now 0
         assert!(consume(&state, &p).is_err()); // exhausted
     }
@@ -106,14 +119,9 @@ mod tests {
         // memory:write (codim 2) at base 5 → capacity 10; memory:read
         // (codim 1) → capacity 5. Write holder survives twice as many.
         let state = make_rate_limiter(5.0, 1.0);
-        let reader = AuthenticatedPrincipal {
-            principal: PrincipalId::new("reader"),
-            capability: MEMORY_READ.into(),
-        };
-        let writer = AuthenticatedPrincipal {
-            principal: PrincipalId::new("writer"),
-            capability: MEMORY_WRITE.into(),
-        };
+        let auth = auth();
+        let reader = principal(&auth, "reader", MEMORY_READ);
+        let writer = principal(&auth, "writer", MEMORY_WRITE);
         // exhaust reader in 5, writer in 10
         for _ in 0..5 {
             assert!(consume(&state, &reader).is_ok());
@@ -129,7 +137,8 @@ mod tests {
     fn admin_gets_point_class_capacity() {
         // admin (codim 16) at base 1, multiplier 1 → capacity 16.
         let state = make_rate_limiter(1.0, 1.0);
-        let admin = principal(ADMIN);
+        let auth = auth();
+        let admin = principal(&auth, "admin", ADMIN);
         for _ in 0..16 {
             assert!(consume(&state, &admin).is_ok());
         }
@@ -141,14 +150,9 @@ mod tests {
         // multiplier 0.1 → admin (codim 16) capacity = 16 * 0.1 * base.
         // At base 10: capacity 16, reader capacity 1.
         let state = make_rate_limiter(10.0, 0.1);
-        let reader = AuthenticatedPrincipal {
-            principal: PrincipalId::new("reader"),
-            capability: MEMORY_READ.into(),
-        };
-        let admin = AuthenticatedPrincipal {
-            principal: PrincipalId::new("admin"),
-            capability: ADMIN.into(),
-        };
+        let auth = auth();
+        let reader = principal(&auth, "reader", MEMORY_READ);
+        let admin = principal(&auth, "admin", ADMIN);
         // reader: codim 1 * 0.1 * 10 = 1 token
         assert!(consume(&state, &reader).is_ok());
         assert!(consume(&state, &reader).is_err());
@@ -157,5 +161,23 @@ mod tests {
             assert!(consume(&state, &admin).is_ok());
         }
         assert!(consume(&state, &admin).is_err());
+    }
+
+    #[test]
+    fn multi_cap_grant_uses_max_codimension() {
+        // A grant carrying memory:read (codim 1) + memory:write (codim 2)
+        // is weighted by the max — 2 — so it gets write-class throughput
+        // even though read is also present.
+        let state = make_rate_limiter(5.0, 1.0);
+        let auth = auth();
+        let bearer = auth
+            .issue_grant_bearer("pi", &[MEMORY_READ, MEMORY_WRITE])
+            .expect("issue");
+        let p = auth.verify_bearer(&bearer).expect("verify");
+        // weight 2 * base 5 = capacity 10
+        for _ in 0..10 {
+            assert!(consume(&state, &p).is_ok());
+        }
+        assert!(consume(&state, &p).is_err());
     }
 }

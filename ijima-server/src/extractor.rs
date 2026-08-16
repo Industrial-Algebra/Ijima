@@ -127,7 +127,7 @@ mod tests {
             .await
             .expect("must extract");
         assert_eq!(got.0.principal.as_str(), "elliott");
-        assert_eq!(got.0.capability, MEMORY_READ);
+        assert!(got.0.may(MEMORY_READ));
     }
 
     #[tokio::test]

@@ -29,12 +29,9 @@ type Capability =
   | "knowledge:read"
   | "knowledge:write";
 
-const TOKEN_ENV: Record<Capability, string> = {
-  "memory:read": "IJIMA_TOKEN_MEMORY_READ",
-  "memory:write": "IJIMA_TOKEN_MEMORY_WRITE",
-  "knowledge:read": "IJIMA_TOKEN_KNOWLEDGE_READ",
-  "knowledge:write": "IJIMA_TOKEN_KNOWLEDGE_WRITE",
-};
+// One multi-capability Schubert GrantToken (env `IJIMA_TOKEN`) admits
+// every route below; the server's geometric `may()` checks containment
+// per-request. See ijimaFetch().
 
 interface FetchResult {
   ok: boolean;
@@ -49,13 +46,12 @@ async function ijimaFetch(
   signal?: AbortSignal,
 ): Promise<FetchResult> {
   const ijimaUrl = process.env.IJIMA_URL ?? "http://127.0.0.1:7373";
-  const envName = TOKEN_ENV[cap];
-  const token = process.env[envName];
+  const token = process.env.IJIMA_TOKEN;
   if (!token) {
     return {
       ok: false,
       status: 0,
-      text: `Error: ${envName} not set. Configure your Schubert capability token.`,
+      text: `Error: IJIMA_TOKEN not set. Mint a grant token (route requires '${cap}') with: ijima token issue --principal <p> --capabilities memory:read,memory:write,knowledge:read,knowledge:write`,
     };
   }
   try {

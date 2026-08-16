@@ -150,6 +150,11 @@ palace browsing get the same visible-scope treatment where it matters.
   token. Requirements captured in
   [`../Schubert/docs/handoff-multi-capability-tokens.md`](../../Schubert/docs/handoff-multi-capability-tokens.md)
   (Schubert PR #29).
+
+  **(SUPERSEDED 2026-08-10):** done — the GrantToken migration
+  (`docs/adr/grant-token-migration.md`) collapsed the bundle to a single
+  `IJIMA_TOKEN` multi-capability grant; Schubert's geometric `may()` admits
+  each route by containment.
 - Config file (`~/.pi/agent/memory/config.json`) for autoCapture/wake-up
   toggles — same as today.
 
