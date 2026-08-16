@@ -1,0 +1,29 @@
+# Ijima daemon configuration — laniakea central instance.
+#
+# Resolution order: built-in defaults < this file < env vars < CLI flags.
+# Install at /etc/ijima/ijima.toml (or point IJIMA_CONFIG at it).
+
+# Bind: tailscale interface for tailnet-only access, or 127.0.0.1 with
+# `tailscale serve` / an HTTPS reverse proxy in front.
+host = "127.0.0.1"
+port = 7373
+
+# Data directory: SurrealDB store (ijima.db) + issuer key land here.
+# On laniakea this is the NVMe pool (fast random IO for SurrealKv).
+data_dir = "/var/lib/ijima"
+
+# Issuer key (default: <data_dir>/issuer.key). BACK THIS UP — losing it
+# invalidates every issued grant token; leaking it lets anyone mint them.
+issuer_key = "/var/lib/ijima/issuer.key"
+
+# Schubert geometric rate limiting: capacity per principal scales with
+# their grant's max codimension (read [1] -> 1x, write [2] -> 2x,
+# admin [4,4,4,4] -> 16x) times rate_multiplier, refilled at rate_base/s.
+rate_base = 10.0
+rate_multiplier = 1.0
+
+# Candle embedding model (Hugging Face id). The default is the
+# 384-dim MiniLM sentence-transformer; cached under HF_HOME after first
+# fetch. Changing this after memories are stored changes the embedding
+# space — re-embed or accept mixed-space search until re-mined.
+embedding_model = "sentence-transformers/all-MiniLM-L6-v2"

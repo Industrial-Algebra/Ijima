@@ -24,19 +24,13 @@ const KEY_FILENAME: &str = "issuer.key";
 /// Returns [`IjimaError::InvalidInput`] if `IJIMA_DIR` is unset and the
 /// home directory cannot be determined.
 pub fn default_key_path() -> Result<PathBuf> {
-    if let Ok(dir) = std::env::var("IJIMA_DIR") {
-        return Ok(PathBuf::from(dir).join(KEY_FILENAME));
+    // Env IJIMA_KEY / config `issuer_key` override the data-dir default;
+    // the data dir itself resolves env > file > ~/.ijima (see `config`).
+    let file = crate::config::load().ok();
+    if let Some(p) = crate::config::resolve_path("IJIMA_KEY", file.and_then(|c| c.issuer_key)) {
+        return Ok(p);
     }
-    let home = home_dir().ok_or_else(|| {
-        IjimaError::invalid_input("cannot resolve Ijima data dir: set IJIMA_DIR or HOME")
-    })?;
-    Ok(home.join(".ijima").join(KEY_FILENAME))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    Ok(crate::config::resolve_data_dir()?.join(KEY_FILENAME))
 }
 
 /// Loads the seed at `path`, or creates it with a fresh random value if

@@ -88,3 +88,5 @@ pub mod mining_pipeline;
 
 #[cfg(feature = "http")]
 pub mod server;
+
+pub mod config;

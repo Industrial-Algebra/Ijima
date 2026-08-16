@@ -210,12 +210,22 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Process start marker — captured once, when `/status` is first hit
+/// (equivalently: daemon boot, since the router is built at boot).
+static STARTED_AT: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
 #[derive(Serialize)]
 struct StatusResponse {
     memories: usize,
     namespaces: Vec<NamespaceCount>,
     entities: usize,
     triples: usize,
+    /// Server version (crate version at compile time).
+    version: &'static str,
+    /// Wall-clock process start (unix seconds).
+    started_at_unix: u64,
+    /// Seconds since process start.
+    uptime_secs: u64,
 }
 
 /// Global store statistics across all namespaces. Admin-gated (it spans
@@ -231,11 +241,20 @@ async fn status(
     }
     let store_stats = store.store_stats().await.map_err(internal)?;
     let kg_stats = kg.kg_global_stats().await.map_err(internal)?;
+    let started = *STARTED_AT.get_or_init(std::time::SystemTime::now);
+    let uptime_secs = started.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let started_at_unix = started
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Ok(Json(StatusResponse {
         memories: store_stats.total_memories,
         namespaces: store_stats.namespaces,
         entities: kg_stats.entities,
         triples: kg_stats.triples,
+        version: env!("CARGO_PKG_VERSION"),
+        started_at_unix,
+        uptime_secs,
     }))
 }
 
@@ -2276,6 +2295,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["memories"], 1);
+        // Deploy-kit fields: version pinned to the crate version, sane
+        // uptime, real start time.
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        let uptime = body["uptime_secs"].as_u64().expect("uptime is u64");
+        assert!(uptime < 60, "fresh test app should have tiny uptime");
+        assert!(
+            body["started_at_unix"].as_u64().expect("started_at is u64") > 1_000_000_000,
+            "started_at looks like a unix timestamp"
+        );
         assert!(!body["namespaces"].as_array().unwrap().is_empty());
     }
 

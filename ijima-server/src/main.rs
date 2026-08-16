@@ -324,17 +324,7 @@ async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
 }
 
 async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
-    let data_dir = std::env::var("IJIMA_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".ijima"))
-                .ok_or_else(|| {
-                    ijima_core::IjimaError::invalid_input(
-                        "cannot resolve data dir: set IJIMA_DIR or HOME",
-                    )
-                })
-        })?;
+    let data_dir = ijima_server::config::resolve_data_dir()?;
     let db_path = data_dir.join("ijima.db");
     let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
     store.export_to(&args.out).await?;
@@ -359,17 +349,7 @@ async fn run_migrate(
         ));
     }
 
-    let data_dir = std::env::var("IJIMA_DIR")
-        .map(std::path::PathBuf::from)
-        .or_else(|_| {
-            std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".ijima"))
-                .ok_or_else(|| {
-                    ijima_core::IjimaError::invalid_input(
-                        "cannot resolve data dir: set IJIMA_DIR or HOME",
-                    )
-                })
-        })?;
+    let data_dir = ijima_server::config::resolve_data_dir()?;
     let db_path = data_dir.join("ijima.db");
 
     // Open the store, optionally with the candle embedder so imported
