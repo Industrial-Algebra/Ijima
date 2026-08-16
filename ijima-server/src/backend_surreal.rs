@@ -31,7 +31,7 @@ use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
     IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
     PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room, SearchHit, Session,
-    SessionId, SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal,
+    SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel, TunnelTraversal,
     embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
@@ -47,6 +47,7 @@ const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
 const DIARY_TABLE: &str = "diaries";
 const QUEUE_TABLE: &str = "mining_queue";
+const REVOCATIONS_TABLE: &str = "token_revocations";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -1072,6 +1073,31 @@ impl Store for SurrealStore {
             .map_err(store_err)?;
         let repos: Vec<RepoDirectory> = result.take(0).map_err(store_err)?;
         Ok(repos)
+    }
+
+    // ===== Token revocation (WS1b) =====
+
+    async fn revoke_token(&self, revocation: TokenRevocation) -> Result<()> {
+        let hash = revocation.token_hash.clone();
+        let _: Option<TokenRevocation> = self
+            .db
+            .upsert((REVOCATIONS_TABLE, hash))
+            .content(revocation)
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_revocations(&self) -> Result<Vec<TokenRevocation>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {REVOCATIONS_TABLE} ORDER BY revoked_at_unix"
+            ))
+            .await
+            .map_err(store_err)?;
+        let revs: Vec<TokenRevocation> = result.take(0).map_err(store_err)?;
+        Ok(revs)
     }
 }
 
@@ -2176,4 +2202,29 @@ mod tests {
         // Clean up.
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// The revocation round-trip is covered full-stack in api::tests
+// (token_revocation_kills_the_bearer_immediately); here we pin the store
+// contract directly: upsert idempotence + oldest-first ordering.
+#[tokio::test]
+async fn revocation_upsert_and_ordering() {
+    use ijima_core::TokenRevocation;
+    let store = SurrealStore::open_embedded().await.expect("open");
+    let mk = |hash: &str, at: u64| TokenRevocation {
+        token_hash: hash.to_string(),
+        revoked_at_unix: at,
+        reason: None,
+    };
+    store.revoke_token(mk("bbb", 20)).await.expect("revoke b");
+    store.revoke_token(mk("aaa", 10)).await.expect("revoke a");
+    // Idempotent re-upsert of the same hash.
+    store
+        .revoke_token(mk("bbb", 20))
+        .await
+        .expect("re-revoke b");
+    let revs = store.list_revocations().await.expect("list");
+    assert_eq!(revs.len(), 2, "upsert keeps one row per hash");
+    assert_eq!(revs[0].token_hash, "aaa", "oldest first");
+    assert_eq!(revs[1].token_hash, "bbb");
 }

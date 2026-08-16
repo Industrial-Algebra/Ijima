@@ -44,7 +44,7 @@ use ijima_core::capabilities::MINING_TRIGGER;
 use ijima_core::{
     AcceptedExtraction, DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId,
     NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Room,
-    SearchHit, Session, SessionId, SessionTurn, Store, TunnelTraversal,
+    SearchHit, Session, SessionId, SessionTurn, Store, TokenRevocation, TunnelTraversal,
     capabilities::{
         ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST,
         TRUST_PROMOTE,
@@ -92,6 +92,8 @@ pub fn app(
         .route("/diaries/{agent}", get(read_diary))
         .route("/repos", get(list_repos).post(register_repo))
         .route("/repos/resolve", get(resolve_repo))
+        .route("/tokens/revoke", post(revoke_token_route))
+        .route("/tokens/revocations", get(list_token_revocations))
         .route("/doctrine", post(ingest_doctrine))
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
@@ -256,6 +258,58 @@ async fn status(
         started_at_unix,
         uptime_secs,
     }))
+}
+
+// ===== Token revocation (WS1b — grant kill-switch) =====
+
+/// Body for `POST /tokens/revoke`.
+#[derive(Deserialize)]
+struct RevokeRequest {
+    /// The bearer token to revoke (the raw string; only its SHA-256 is
+    /// persisted).
+    token: String,
+    /// Optional operator note (e.g. `"leaked in CI log"`).
+    reason: Option<String>,
+}
+
+/// Revokes a grant token: persists the hash (survives restarts) and adds
+/// it to the live rejection set. Auth: `admin`. Idempotent.
+async fn revoke_token_route(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(auth): Extension<Arc<crate::IjimaAuth>>,
+    Json(req): Json<RevokeRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let revocation = TokenRevocation {
+        token_hash: crate::auth::bearer_hash(&req.token),
+        revoked_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        reason: req.reason,
+    };
+    // Persist first, then arm the in-memory check: a crash between the two
+    // re-arms at boot (store is source of truth).
+    store
+        .revoke_token(revocation.clone())
+        .await
+        .map_err(internal)?;
+    auth.revoke(&revocation.token_hash);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Lists every recorded revocation, oldest first. Auth: `admin`.
+async fn list_token_revocations(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+) -> Result<Json<Vec<TokenRevocation>>, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(store.list_revocations().await.map_err(internal)?))
 }
 
 #[derive(Serialize)]
@@ -2910,5 +2964,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_revocation_kills_the_bearer_immediately() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "op", ADMIN);
+        let victim = bearer(&auth, "victim", MEMORY_READ);
+
+        // Victim can read before revocation.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories")
+                    .header("authorization", &victim)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Non-admin cannot revoke.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tokens/revoke")
+                    .header("authorization", &victim)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": victim, "reason": "test" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin revokes the victim's bearer.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tokens/revoke")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": victim, "reason": "leaked in test" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // The same bearer is now exactly as dead as a bad signature.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories")
+                    .header("authorization", &victim)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Admin can list the revocation — hash only, never the bearer.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/tokens/revocations")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let revs = body.as_array().expect("list response");
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0]["reason"], "leaked in test");
+        assert_eq!(
+            revs[0]["token_hash"].as_str().expect("hash"),
+            crate::auth::bearer_hash(&victim)
+        );
+        assert!(!revs[0].to_string().contains(&victim), "no raw bearer");
+
+        // Revocation survives restart-by-rehydration: a fresh auth over
+        // the same store re-arms (simulated via hydrate from the store).
+        let listed: Vec<TokenRevocation> =
+            serde_json::from_value(body).expect("deserializes as TokenRevocation");
+        auth.hydrate_revocations(&listed);
+        assert!(auth.is_revoked(&victim));
     }
 }

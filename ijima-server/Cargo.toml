@@ -24,7 +24,7 @@ backend-sqlite = ["dep:rusqlite", "ijima-core/serde"]
 # Authentication + authorization via Schubert proof-carrying capability
 # tokens on Gr(4,8). Loads policy/policy.toml. When off, the store runs
 # in unauthenticated single-process mode (tests, embedded use).
-server-auth = ["dep:schubert", "dep:base64", "dep:ed25519-dalek", "dep:rand"]
+server-auth = ["dep:schubert", "dep:base64", "dep:ed25519-dalek", "dep:rand", "dep:sha2"]
 # Schubert geometric rate limiting (Phase 3.4). Per-principal token
 # buckets whose capacity scales with the capability's Schubert
 # intersection number (codimension). Composes with `server-auth`.

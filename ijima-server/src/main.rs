@@ -115,6 +115,11 @@ struct ServeArgs {
 enum TokenAction {
     /// Issue a bearer grant token for a principal.
     Issue(IssueArgs),
+    /// Revoke a grant token on a running daemon (the kill-switch).
+    /// Requires an admin bearer.
+    Revoke(RevokeArgs),
+    /// List recorded token revocations on a running daemon.
+    Revocations(RevocationsArgs),
 }
 
 #[derive(Args)]
@@ -142,6 +147,32 @@ struct IssueArgs {
     json: bool,
 }
 
+#[derive(Args)]
+struct RevokeArgs {
+    /// The bearer token to revoke — raw or full `Bearer ...` form.
+    #[arg(long)]
+    token: String,
+    /// Daemon base URL.
+    #[arg(long, default_value = "http://127.0.0.1:7373")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long)]
+    auth: String,
+    /// Operator note recorded with the revocation (e.g. `"leaked in CI log"`).
+    #[arg(long)]
+    reason: Option<String>,
+}
+
+#[derive(Args)]
+struct RevocationsArgs {
+    /// Daemon base URL.
+    #[arg(long, default_value = "http://127.0.0.1:7373")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long)]
+    auth: String,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     ijima_server::server::init_tracing();
@@ -154,6 +185,32 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            TokenAction::Revoke(args) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                match rt.block_on(run_revoke(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "token revoke failed");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            TokenAction::Revocations(args) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                match rt.block_on(run_revocations(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "token revocations failed");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
         },
         Command::Doctrine { action } => match action {
             DoctrineAction::Ingest(args) => {
@@ -309,6 +366,77 @@ fn validate_capability(cap: &str) -> ijima_core::Result<()> {
             "unknown capability '{cap}'. Valid: {}",
             ALL_CAPABILITIES.join(", ")
         )))
+    }
+}
+
+/// `ijima token revoke` — kills a bearer on a running daemon (admin).
+async fn run_revoke(args: RevokeArgs) -> ijima_core::Result<()> {
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/tokens/revoke", args.url.trim_end_matches('/'));
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(args.auth.trim())
+        .json(&serde_json::json!({
+            "token": args.token,
+            "reason": args.reason,
+        }))
+        .send()
+        .await
+        .map_err(|e| ijima_core::IjimaError::Transport {
+            detail: format!("revoke: {e}"),
+        })?;
+    match resp.status() {
+        reqwest::StatusCode::NO_CONTENT => {
+            eprintln!(
+                "ijima: token revoked (hash {}).",
+                ijima_server::auth::bearer_hash(&args.token)
+            );
+            Ok(())
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(ijima_core::IjimaError::invalid_input(
+            "daemon rejected: the --auth token does not carry admin",
+        )),
+        status => Err(ijima_core::IjimaError::Transport {
+            detail: format!("daemon returned {status}"),
+        }),
+    }
+}
+
+/// `ijima token revocations` — lists the kill-switch ledger (admin).
+async fn run_revocations(args: RevocationsArgs) -> ijima_core::Result<()> {
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/tokens/revocations", args.url.trim_end_matches('/'));
+    let resp = client
+        .get(&endpoint)
+        .bearer_auth(args.auth.trim())
+        .send()
+        .await
+        .map_err(|e| ijima_core::IjimaError::Transport {
+            detail: format!("revocations: {e}"),
+        })?;
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            let revs: Vec<ijima_core::TokenRevocation> =
+                resp.json()
+                    .await
+                    .map_err(|e| ijima_core::IjimaError::Transport {
+                        detail: format!("decode: {e}"),
+                    })?;
+            if revs.is_empty() {
+                eprintln!("ijima: no revocations recorded.");
+            }
+            for r in revs {
+                let reason = r.reason.as_deref().unwrap_or("-");
+                eprintln!("{}\t{}\t{}", r.revoked_at_unix, r.token_hash, reason);
+            }
+            Ok(())
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(ijima_core::IjimaError::invalid_input(
+            "daemon rejected: the --auth token does not carry admin",
+        )),
+        status => Err(ijima_core::IjimaError::Transport {
+            detail: format!("daemon returned {status}"),
+        }),
     }
 }
 
