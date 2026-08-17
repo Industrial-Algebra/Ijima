@@ -18,13 +18,13 @@ rules = []
 # LLM-backed extraction via Proserpina (Agent trait + personas). The Agent
 # is synchronous, so no async runtime is needed in this crate; the HTTP
 # backend lives in Proserpina's `backend-http` (used by the daemon).
-llm = ["dep:proserpina"]
+llm = ["dep:proserpina-agent"]
 
 [dependencies]
 ijima-core = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-proserpina = { workspace = true, optional = true }
+proserpina-agent = { workspace = true, optional = true }
 
 [dev-dependencies]

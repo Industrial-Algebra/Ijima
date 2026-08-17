@@ -29,7 +29,7 @@
 //! returns canned JSON.
 
 use ijima_core::{AuthorityScope, IjimaError, InstanceId, Memory, MemoryId, MemorySource, Result};
-use proserpina::{Agent, AgentId, Message, MessageKind, Persona};
+use proserpina_agent::{Agent, AgentId, Message, MessageKind, Persona};
 use serde::Deserialize;
 
 use crate::{Extraction, MiningContext};
@@ -211,7 +211,7 @@ fn short_hash(s: &str) -> String {
     format!("{h:x}")
 }
 
-fn mining_err(e: proserpina::ProserpinaError) -> IjimaError {
+fn mining_err(e: proserpina_agent::ProserpinaError) -> IjimaError {
     IjimaError::Mining {
         detail: format!("llm extraction: {e}"),
     }
@@ -249,7 +249,7 @@ mod tests {
         fn respond(
             &mut self,
             _msg: &Message,
-        ) -> std::result::Result<Message, proserpina::ProserpinaError> {
+        ) -> std::result::Result<Message, proserpina_agent::ProserpinaError> {
             Ok(Message::new(
                 self.id.clone(),
                 Some(AgentId::new("ijima-miner")),
