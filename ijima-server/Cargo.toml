@@ -72,7 +72,7 @@ surrealdb = { version = "2", default-features = false, features = ["kv-mem", "kv
 rusqlite = { workspace = true, optional = true }
 sha2 = { version = "0.10", optional = true }
 ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"], optional = true }
-axum-server = { version = "0.7", features = ["tls-rustls"], optional = true }
+axum-server = { version = "0.8", features = ["tls-rustls"], optional = true }
 rand = { version = "0.9", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 regex = "1"
