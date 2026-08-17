@@ -121,7 +121,7 @@ pub fn mine(turns: &[String], ctx: &MiningContext) -> Result<Vec<Extraction>> {
 pub fn mine_all(
     turns: &[String],
     ctx: &MiningContext,
-    agent: Option<&mut dyn proserpina::Agent>,
+    agent: Option<&mut dyn proserpina_agent::Agent>,
 ) -> Result<Vec<Extraction>> {
     let mut extractions = mine(turns, ctx)?;
     if let Some(agent) = agent {
@@ -234,25 +234,26 @@ mod tests {
     fn mine_all_merges_rules_and_llm() {
         // Scripted agent that emits a fact the rules tier won't catch.
         struct Stub;
-        impl proserpina::Agent for Stub {
-            fn id(&self) -> &proserpina::AgentId {
+        impl proserpina_agent::Agent for Stub {
+            fn id(&self) -> &proserpina_agent::AgentId {
                 use std::sync::OnceLock;
-                static ID: OnceLock<proserpina::AgentId> = OnceLock::new();
-                ID.get_or_init(|| proserpina::AgentId::new("stub"))
+                static ID: OnceLock<proserpina_agent::AgentId> = OnceLock::new();
+                ID.get_or_init(|| proserpina_agent::AgentId::new("stub"))
             }
-            fn persona(&self) -> &proserpina::Persona {
+            fn persona(&self) -> &proserpina_agent::Persona {
                 use std::sync::OnceLock;
-                static P: OnceLock<proserpina::Persona> = OnceLock::new();
-                P.get_or_init(|| proserpina::Persona::new("stub"))
+                static P: OnceLock<proserpina_agent::Persona> = OnceLock::new();
+                P.get_or_init(|| proserpina_agent::Persona::new("stub"))
             }
             fn respond(
                 &mut self,
-                _msg: &proserpina::Message,
-            ) -> std::result::Result<proserpina::Message, proserpina::ProserpinaError> {
-                Ok(proserpina::Message::new(
-                    proserpina::AgentId::new("stub"),
+                _msg: &proserpina_agent::Message,
+            ) -> std::result::Result<proserpina_agent::Message, proserpina_agent::ProserpinaError>
+            {
+                Ok(proserpina_agent::Message::new(
+                    proserpina_agent::AgentId::new("stub"),
                     None,
-                    proserpina::MessageKind::Critique,
+                    proserpina_agent::MessageKind::Critique,
                     "{\"content\":\"a model-judged fact\",\"confidence\":0.6}".to_string(),
                 ))
             }

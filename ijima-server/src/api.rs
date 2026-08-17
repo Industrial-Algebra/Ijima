@@ -972,7 +972,7 @@ async fn trigger_mine(
     Path(session_id): Path<String>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<crate::mining_pipeline::MiningReport>, ApiError> {
-    use proserpina::backend::http::HttpAgent;
+    use proserpina_agent::http::HttpAgent;
 
     if !principal.0.may(MINING_TRIGGER) {
         return Err(ApiError::Forbidden);
@@ -995,8 +995,9 @@ async fn trigger_mine(
     // the move into the spawned task.
     let extractions = tokio::task::spawn_blocking(move || {
         let mut agent: Option<HttpAgent> = build_mining_agent();
-        let agent_dyn: Option<&mut dyn proserpina::Agent> =
-            agent.as_mut().map(|a| a as &mut dyn proserpina::Agent);
+        let agent_dyn: Option<&mut dyn proserpina_agent::Agent> = agent
+            .as_mut()
+            .map(|a| a as &mut dyn proserpina_agent::Agent);
         ijima_miner::mine_all(&turn_texts, &ctx, agent_dyn)
     })
     .await
@@ -1023,10 +1024,10 @@ async fn trigger_mine(
 /// single-shot). Returns a concrete [`HttpAgent`] (not a trait object) so it
 /// remains `Send` for the blocking-thread move.
 #[cfg(feature = "mining")]
-fn build_mining_agent() -> Option<proserpina::backend::http::HttpAgent> {
-    use proserpina::{
+fn build_mining_agent() -> Option<proserpina_agent::http::HttpAgent> {
+    use proserpina_agent::{
         AgentId, Persona,
-        backend::http::{HttpAgent, HttpConfig},
+        http::{HttpAgent, HttpConfig},
     };
 
     let base_url = std::env::var("IJIMA_LLM_BASE_URL")

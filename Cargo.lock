@@ -2870,7 +2870,7 @@ name = "ijima-miner"
 version = "0.1.0"
 dependencies = [
  "ijima-core",
- "proserpina",
+ "proserpina-agent",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2902,7 +2902,7 @@ dependencies = [
  "hf-hub",
  "ijima-core",
  "ijima-miner",
- "proserpina",
+ "proserpina-agent",
  "rand 0.9.4",
  "regex",
  "reqwest 0.13.4",
@@ -3498,12 +3498,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ndk-context"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
-
-[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3636,37 +3630,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
-name = "objc2"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a12a8ed07aefc768292f076dc3ac8c48f3781c8f2d5851dd3d98950e8c5a89f"
-dependencies = [
- "objc2-encode",
-]
-
-[[package]]
 name = "objc2-core-foundation"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a180dd8642fa45cdb7dd721cd4c11b1cadd4929ce112ebd8b9f5803cc79d536"
 dependencies = [
  "bitflags",
-]
-
-[[package]]
-name = "objc2-encode"
-version = "4.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
-
-[[package]]
-name = "objc2-foundation"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
-dependencies = [
- "bitflags",
- "objc2",
 ]
 
 [[package]]
@@ -4157,22 +4126,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "proserpina"
-version = "0.3.0"
+name = "proserpina-agent"
+version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54616a0e77105b5990aa734440830648bd01a210e3e9f595a2b80c993abf220b"
+checksum = "779037d2eb59a656eed8e76e4e7e67110efc4704386c08d695c7b17efa8143c2"
 dependencies = [
- "base64 0.22.1",
- "hex",
  "rand 0.9.4",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "webbrowser",
 ]
 
 [[package]]
@@ -6865,22 +6830,6 @@ dependencies = [
  "phf_codegen",
  "string_cache 0.9.0",
  "string_cache_codegen",
-]
-
-[[package]]
-name = "webbrowser"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fc95580916af1e68ff6a7be07446fc5db73ebf71cf092de939bbf5f7e189f72"
-dependencies = [
- "core-foundation 0.10.1",
- "jni",
- "log",
- "ndk-context",
- "objc2",
- "objc2-foundation",
- "url",
- "web-sys",
 ]
 
 [[package]]
