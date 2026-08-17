@@ -142,6 +142,14 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let store: Arc<dyn Store> = store_inner.clone();
     let kg: Arc<dyn ijima_core::KnowledgeGraph> = store_inner;
 
+    // Hydrate the grant-revocation set from the store (WS1b): any bearer
+    // revoked on a previous boot stays dead across restarts.
+    let revocations = store.list_revocations().await?;
+    if !revocations.is_empty() {
+        tracing::info!(count = revocations.len(), "hydrated token revocations");
+    }
+    auth.hydrate_revocations(&revocations);
+
     // Schubert geometric rate limiting (Phase 3.4). Configurable via env
     // or config file; disabled when IJIMA_RATE_DISABLE is set (tests, CI).
     // Capacity scales with the capability's Schubert intersection number.

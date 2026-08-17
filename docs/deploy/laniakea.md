@@ -69,9 +69,19 @@ Service feeds (Minoru, Quantizon) get narrower grants:
 directly). `admin` grants are minted rarely, stored in the operator's
 password manager, and never exported into shell envs that log.
 
-Revocation (kill-switch): `ijima token revoke` lands with the 0.2.0
-revocation PR — until then, rotating the issuer key (replace the seed
-file + restart + re-mint all grants) is the emergency lever.
+Revocation (kill-switch):
+
+```bash
+# revoke a leaked bearer (raw or `Bearer ...` form; hash-only is persisted)
+ijima token revoke --token <bearer> --auth <admin-bearer> --reason "leaked in CI log"
+# inspect the ledger
+ijima token revocations --auth <admin-bearer>
+```
+
+Revocation arms immediately (in-memory) and survives restarts (boot
+hydration from the store). Issuer-key rotation (replace the seed file +
+restart + re-mint all grants) remains the emergency lever for
+compromise-of-the-key — see `docs/adr/token-revocation.md`.
 
 ## 5. Backups
 

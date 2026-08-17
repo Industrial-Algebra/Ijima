@@ -28,14 +28,29 @@
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use ijima_core::{IjimaError, Result};
+use ijima_core::{IjimaError, Result, TokenRevocation};
 use schubert::{
     AccessController, CapabilityId, PrincipalId,
     crypto::{CapabilityIssuer, GrantToken, GrantVerifier, KeyStore},
 };
+use sha2::{Digest, Sha256};
 
 /// Ijima's Schubert policy, embedded at compile time.
 const POLICY_TOML: &str = include_str!("../policy/policy.toml");
+
+/// Computes the revocation key for a bearer: SHA-256 hex of the trimmed
+/// bearer string, with an optional `Bearer ` scheme prefix stripped — so
+/// operators (and CLIs) can paste either the raw token or the full
+/// `Authorization` header value and hit the same revocation key. Storing
+/// hashes instead of raw bearers keeps live credentials out of store
+/// dumps, logs, and backups.
+pub fn bearer_hash(bearer: &str) -> String {
+    let trimmed = bearer.trim();
+    let raw = trimmed.strip_prefix("Bearer ").unwrap_or(trimmed);
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
 
 /// The authenticated principal + the verified grant carried by a bearer
 /// token.
@@ -92,15 +107,23 @@ impl AuthenticatedPrincipal {
 
 /// Ijima's auth core: an [`AccessController`] (capability → partition
 /// resolver) plus a capability issuer and a grant verifier sharing one
-/// Ed25519 key.
+/// Ed25519 key, **and an in-memory revocation set** (the grant
+/// kill-switch — see `docs/adr/token-revocation.md`).
 ///
-/// A daemon constructs one of these at startup; an admin CLI uses the
-/// issuer to mint grant tokens via [`IjimaAuth::issue_grant_bearer`].
+/// A daemon constructs one of these at startup, hydrates the revocation
+/// set from the store
+/// ([`hydrate_revocations`](Self::hydrate_revocations)), and serves; an
+/// admin CLI uses the issuer to mint grant tokens via
+/// [`IjimaAuth::issue_grant_bearer`].
 #[derive(Debug)]
 pub struct IjimaAuth {
     controller: Arc<AccessController>,
     issuer: CapabilityIssuer,
     grant_verifier: Arc<GrantVerifier>,
+    /// SHA-256 hashes of revoked bearers. Mutex (not RwLock): the critical
+    /// section is a hash-set lookup, too short to be worth reader
+    /// parallelism.
+    revocations: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl IjimaAuth {
@@ -136,6 +159,7 @@ impl IjimaAuth {
             controller: Arc::new(controller),
             issuer,
             grant_verifier: Arc::new(grant_verifier),
+            revocations: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -210,14 +234,42 @@ impl IjimaAuth {
         self.issue_grant_bearer(principal, &[capability.as_ref()])
     }
 
+    /// Hydrates the in-memory revocation set from store-backed records
+    /// (daemon boot). Replaces any prior set.
+    pub fn hydrate_revocations(&self, revocations: &[TokenRevocation]) {
+        let mut set = self.revocations.lock().expect("revocations poisoned");
+        *set = revocations.iter().map(|r| r.token_hash.clone()).collect();
+    }
+
+    /// Adds a revocation to the in-memory set (after the store write — the
+    /// admin route persists first, then calls this). Idempotent.
+    pub fn revoke(&self, hash: &str) {
+        self.revocations
+            .lock()
+            .expect("revocations poisoned")
+            .insert(hash.to_string());
+    }
+
+    /// True if the bearer's hash is revoked.
+    pub fn is_revoked(&self, bearer: &str) -> bool {
+        self.revocations
+            .lock()
+            .expect("revocations poisoned")
+            .contains(&bearer_hash(bearer))
+    }
+
     /// Decodes + cryptographically verifies a bearer grant token, returning
-    /// the authenticated principal and the verified grant.
+    /// the authenticated principal and the verified grant. A revoked bearer
+    /// is rejected here — exactly as dead as a bad signature.
     ///
     /// # Errors
     ///
-    /// Returns [`IjimaError::InvalidInput`] on a malformed or
-    /// bad-signature token.
+    /// Returns [`IjimaError::InvalidInput`] on a malformed,
+    /// bad-signature, or **revoked** token.
     pub fn verify_bearer(&self, bearer: &str) -> Result<AuthenticatedPrincipal> {
+        if self.is_revoked(bearer) {
+            return Err(IjimaError::invalid_input("token revoked"));
+        }
         let buf = B64
             .decode(bearer.trim())
             .map_err(|e| IjimaError::invalid_input(format!("base64 decode: {e}")))?;
@@ -385,5 +437,48 @@ mod tests {
         let principal = daemon.verify_bearer(&bearer).expect("must verify");
         assert_eq!(principal.principal.as_str(), "elliott");
         assert_eq!(daemon.issuer_public_key_hex(), public_key);
+    }
+
+    // ---------- revocation (WS1b) ----------
+
+    #[test]
+    fn revoked_bearer_is_rejected_after_crypto_verify_passes() {
+        let auth = fresh();
+        let bearer = auth
+            .issue_bearer("elliott", MEMORY_READ)
+            .expect("must issue");
+        assert!(auth.verify_bearer(&bearer).is_ok()); // before: fine
+        auth.revoke(&bearer_hash(&bearer));
+        let err = auth.verify_bearer(&bearer).expect_err("must reject");
+        assert!(err.to_string().contains("revoked"));
+    }
+
+    #[test]
+    fn hydration_replaces_prior_set() {
+        let auth = fresh();
+        let b1 = auth.issue_bearer("a", MEMORY_READ).expect("issue");
+        let b2 = auth.issue_bearer("b", MEMORY_READ).expect("issue");
+        auth.revoke(&bearer_hash(&b1));
+        assert!(auth.is_revoked(&b1));
+        // Hydrate with only b2's revocation → b1 is live again (the store
+        // is the source of truth, not the union).
+        auth.hydrate_revocations(&[TokenRevocation {
+            token_hash: bearer_hash(&b2),
+            revoked_at_unix: 0,
+            reason: None,
+        }]);
+        assert!(!auth.is_revoked(&b1));
+        assert!(auth.is_revoked(&b2));
+    }
+
+    #[test]
+    fn bearer_hash_is_sha256_hex_of_trimmed_bearer() {
+        let h1 = bearer_hash("  abc  ");
+        let h2 = bearer_hash("abc");
+        let h3 = bearer_hash("Bearer abc");
+        assert_eq!(h1, h2); // trimmed
+        assert_eq!(h2, h3); // scheme prefix tolerated
+        assert_eq!(h1.len(), 64); // sha256 hex
+        assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
     }
 }
