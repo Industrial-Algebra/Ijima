@@ -49,7 +49,13 @@ pub fn bearer_hash(bearer: &str) -> String {
     let raw = trimmed.strip_prefix("Bearer ").unwrap_or(trimmed);
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
-    format!("{:x}", hasher.finalize())
+    // sha2 0.11's `finalize()` output is not `{:x}`-formattable; hex it
+    // byte-by-byte (same lowercase encoding as before).
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// The authenticated principal + the verified grant carried by a bearer

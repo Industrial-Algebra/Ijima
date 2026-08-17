@@ -199,12 +199,10 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
                 .map_err(|e| IjimaError::Store {
                     detail: format!("tls config: {e}"),
                 })?;
-        let listener = axum_server::bind_rustls(
-            addr.parse().map_err(|e| IjimaError::Store {
-                detail: format!("parse {addr}: {e}"),
-            })?,
-            tls_config,
-        );
+        let socket_addr: std::net::SocketAddr = addr.parse().map_err(|e| IjimaError::Store {
+            detail: format!("parse {addr}: {e}"),
+        })?;
+        let listener = axum_server::bind_rustls(socket_addr, tls_config);
         eprintln!("ijima: listening on https://{addr}");
         listener
             .serve(app.into_make_service())
