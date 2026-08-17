@@ -320,12 +320,16 @@ struct IdResponse {
 async fn store_memory(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
     Json(memory): Json<Memory>,
 ) -> Result<Json<IdResponse>, ApiError> {
     if !principal.0.may(MEMORY_WRITE) {
         return Err(ApiError::Forbidden);
     }
-    let ns = principal.0.personal_namespace();
+    // WS2: `?namespace=` routes the write into a shared/import namespace
+    // (grant-checked by resolve_ns — another principal's `_private` is
+    // still forbidden); without it, the caller's personal namespace.
+    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
     let mut memory = memory;
     if memory.created_at.is_empty() {
         memory.created_at = std::time::SystemTime::now()
@@ -2673,6 +2677,107 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK, "seed {id} failed");
+    }
+
+    #[tokio::test]
+    async fn store_memory_honors_namespace_query() {
+        let (app, auth) = app_with_store().await;
+        let body = serde_json::json!({
+            "id": "mem_nsimp",
+            "content": "imported via namespace query",
+            "project": "ijima",
+            "topic": "import",
+            "source": "AutoCapture",
+            "harness": "Pi",
+            "importance": 0.5,
+            "created_at": "0",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories?namespace=ns_import_testbox")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Dedup check in that namespace finds it; the caller's personal
+        // namespace does not (isolation held).
+        let read_token = bearer(&auth, "elliott", MEMORY_READ);
+        let check = |uri: &str| {
+            let uri = uri.to_string();
+            let app = app.clone();
+            let body = serde_json::json!({
+                "content": "imported via namespace query"
+            })
+            .to_string();
+            let auth_header = read_token.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", auth_header)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let res = check("/memories/check?namespace=ns_import_testbox").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let found = body_json(res).await;
+        assert_eq!(
+            found["duplicate"].as_str(),
+            Some("mem_nsimp"),
+            "same-namespace dedup check must find the import"
+        );
+        let res = check("/memories/check").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let personal = body_json(res).await;
+        assert_eq!(
+            personal["duplicate"].as_str(),
+            None,
+            "personal namespace must not see the import"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_memory_rejects_foreign_private_namespace() {
+        let (app, auth) = app_with_store().await;
+        let body = serde_json::json!({
+            "id": "mem_sneaky",
+            "content": "cross-tenant write attempt",
+            "project": "ijima",
+            "topic": "security",
+            "source": "Explicit",
+            "harness": "Pi",
+            "importance": 0.5,
+            "created_at": "0",
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories?namespace=ns_bob_private")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

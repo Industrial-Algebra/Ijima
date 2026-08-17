@@ -49,6 +49,11 @@ enum Command {
     /// SurrealDB store (one-time import).
     #[cfg(feature = "backend-sqlite")]
     Migrate(MigrateArgs),
+    /// Import an external SQLite corpus into a running daemon over HTTP
+    /// (WS2 multi-source import: per-source namespace, provenance
+    /// tagging, dedup pre-checks).
+    #[cfg(feature = "backend-sqlite")]
+    Import(ImportArgs),
 }
 
 /// Arguments to `ijima export`.
@@ -57,6 +62,41 @@ struct ExportArgs {
     /// Output path for the SurrealDB SQL dump.
     #[arg(long, short)]
     out: std::path::PathBuf,
+}
+
+/// Which SQLite corpus `ijima import` reads.
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ImportKind {
+    /// pi-mempalace `memories.db` (memories + knowledge graph rows).
+    Mempalace,
+    /// ZeroClaw `brain.db` (Sara's Discord memories).
+    Zeroclaw,
+}
+
+/// Arguments to `ijima import <kind>`.
+#[derive(Args, Debug)]
+struct ImportArgs {
+    /// Source corpus kind to read.
+    #[arg(value_enum)]
+    kind: ImportKind,
+    /// Path to the source SQLite database.
+    #[arg(long, value_name = "PATH")]
+    db: std::path::PathBuf,
+    /// Source name: stamped as the `origin` provenance of every imported
+    /// memory and used to derive the default target namespace
+    /// (`ns_import_<source>`).
+    #[arg(long, value_name = "NAME")]
+    source: String,
+    /// Target namespace override (default: `ns_import_<source>`).
+    #[arg(long, value_name = "NS")]
+    namespace: Option<String>,
+    /// Daemon base URL (default: `$IJIMA_URL` or
+    /// `http://127.0.0.1:7373`).
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    /// Bearer grant with memory:write (default: `$IJIMA_TOKEN`).
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 }
 
 /// Arguments to `ijima migrate`.
@@ -279,6 +319,25 @@ fn main() -> ExitCode {
             }
         }
         #[cfg(feature = "backend-sqlite")]
+        Command::Import(args) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => match rt.block_on(run_import(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        eprintln!("ijima: import failed: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    eprintln!("ijima: runtime: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(feature = "backend-sqlite")]
         Command::Migrate(args) => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -462,6 +521,70 @@ async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
 
 /// One-time corpus migration: read the legacy SQLite stores and import
 /// them into the SurrealDB palace under the `global` namespace.
+/// `ijima import <kind> --db <path> --source <name>` — WS2 multi-source
+/// import against a running daemon over HTTP. Reads the source SQLite
+/// rows, retags provenance (origin = source, AutoCapture trust), and
+/// streams them through the daemon's dedup-checked store path into
+/// `ns_import_<source>` (or `--namespace`).
+async fn run_import(args: ImportArgs) -> ijima_core::Result<()> {
+    use ijima_server::migration::{
+        default_import_ns, map_pipalace_memory, map_zeroclaw_memory, read_pipalace_memories,
+        read_zeroclaw_memories, retag_imported,
+    };
+
+    let url = args
+        .url
+        .or_else(|| std::env::var("IJIMA_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:7373".to_string());
+    let token = args
+        .token
+        .or_else(|| std::env::var("IJIMA_TOKEN").ok())
+        .ok_or_else(|| {
+            ijima_core::IjimaError::invalid_input(
+                "import needs --token or $IJIMA_TOKEN (a memory:write grant)",
+            )
+        })?;
+
+    let memories: Vec<_> = match args.kind {
+        ImportKind::Mempalace => {
+            let rows = read_pipalace_memories(&args.db.to_string_lossy())?;
+            eprintln!("ijima: read {} rows from {}", rows.len(), args.db.display());
+            rows.iter().map(map_pipalace_memory).collect::<Vec<_>>()
+        }
+        ImportKind::Zeroclaw => {
+            let rows = read_zeroclaw_memories(&args.db.to_string_lossy())?;
+            eprintln!("ijima: read {} rows from {}", rows.len(), args.db.display());
+            rows.iter().map(map_zeroclaw_memory).collect::<Vec<_>>()
+        }
+    }
+    .into_iter()
+    .map(|m| retag_imported(m, &args.source))
+    .collect();
+
+    let ns = args
+        .namespace
+        .unwrap_or_else(|| default_import_ns(&args.source).as_str().to_string());
+
+    let client = ijima_client::Client::new(
+        ijima_client::ClientConfig::new(url, ijima_core::harness::Harness::Pi).with_token(token),
+    );
+    eprintln!(
+        "ijima: importing {} memories from `{}` into namespace `{ns}`…",
+        memories.len(),
+        args.source
+    );
+    let counts = client.import_memories(&ns, memories).await?;
+    eprintln!(
+        "ijima: import `{}` complete — {} added, {} deduped, {} skipped (of {} attempted)",
+        args.source, counts.added, counts.deduped, counts.skipped, counts.attempted
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&counts).unwrap_or_default()
+    );
+    Ok(())
+}
+
 #[cfg(feature = "backend-sqlite")]
 async fn run_migrate(
     args: MigrateArgs,
