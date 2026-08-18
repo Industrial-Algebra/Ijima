@@ -185,7 +185,8 @@ impl SurrealStore {
         let mut result = self
             .db
             .query(format!(
-                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace, importance, created_at
+                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
+                        origin, authority, importance, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND project = $proj AND topic = $topic
                  ORDER BY importance DESC, created_at DESC LIMIT $lim"
@@ -521,6 +522,15 @@ fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
     Ok(Some(embedder.embed(text)?.0))
 }
 
+/// Surreal record key for a memory: `<namespace>:<memory-id>`. Record
+/// ids are global per table in SurrealDB, so the namespace must be part
+/// of the key — otherwise the same logical id (e.g. the same pi-mempalace
+/// row imported from two workstations, WS2) collides across namespaces.
+/// The logical id stays in `memory_id` for wire responses.
+fn memory_key(ns: &NamespaceId, id: &MemoryId) -> String {
+    format!("{}:{}", ns.as_str(), id.0)
+}
+
 #[async_trait]
 impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
@@ -543,11 +553,10 @@ impl Store for SurrealStore {
             }
             None => (None, None),
         };
-        let id_str = memory.id.0.clone();
         let record = MemoryRecord::from_memory(&memory, ns, embedding, embed_model);
         let _: Option<MemoryRecord> = self
             .db
-            .create((MEMORIES_TABLE, id_str.clone()))
+            .create((MEMORIES_TABLE, memory_key(ns, &memory.id)))
             .content(record)
             .await
             .map_err(store_err)?;
@@ -578,23 +587,18 @@ impl Store for SurrealStore {
     async fn recall_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<Option<Memory>> {
         let record: Option<MemoryRecord> = self
             .db
-            .select((MEMORIES_TABLE, id.0.clone()))
+            .select((MEMORIES_TABLE, memory_key(ns, id)))
             .await
             .map_err(store_err)?;
-        Ok(record
-            .filter(|r| r.namespace == ns.as_str())
-            .map(|r| r.into_memory()))
+        Ok(record.map(|r| r.into_memory()))
     }
 
     async fn delete_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<()> {
-        // Verify ownership before deleting (isolation).
-        let existing = self.recall_memory(ns, id).await?;
-        if existing.is_none() {
-            return Ok(()); // absent or wrong namespace — nothing to delete
-        }
+        // The namespaced record key is unique, so delete is naturally
+        // isolated (no-op when the record is absent).
         let _: Option<MemoryRecord> = self
             .db
-            .delete((MEMORIES_TABLE, id.0.clone()))
+            .delete((MEMORIES_TABLE, memory_key(ns, id)))
             .await
             .map_err(store_err)?;
         Ok(())
@@ -604,7 +608,8 @@ impl Store for SurrealStore {
         let mut result = self
             .db
             .query(format!(
-                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace, importance, created_at
+                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
+                        origin, authority, importance, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns
                  ORDER BY importance DESC, created_at DESC
@@ -1425,6 +1430,65 @@ mod tests {
         // (ADR provenance-tier): origin/authority survive SurrealDB.
         assert_eq!(got.origin, InstanceId::local());
         assert_eq!(got.authority, AuthorityScope::local());
+    }
+
+    #[tokio::test]
+    async fn same_memory_id_in_two_namespaces_does_not_collide() {
+        // WS2: the same source corpus imported under two sources carries
+        // the same logical ids into different namespaces. Record keys must
+        // be namespaced or the second store 500s on `already exists`.
+        let store = fresh().await;
+        let ns_a = NamespaceId::new("ns_import_laptop");
+        let ns_b = NamespaceId::new("ns_import_desktop");
+        store
+            .store_memory(&ns_a, sample_memory("mem_fx1", "laptop copy"))
+            .await
+            .expect("store into ns_a");
+        store
+            .store_memory(&ns_b, sample_memory("mem_fx1", "desktop copy"))
+            .await
+            .expect("same id into ns_b must not collide");
+        // Each namespace recalls its own record under the same logical id.
+        let a = store
+            .recall_memory(&ns_a, &MemoryId("mem_fx1".into()))
+            .await
+            .expect("recall a")
+            .expect("present a");
+        let b = store
+            .recall_memory(&ns_b, &MemoryId("mem_fx1".into()))
+            .await
+            .expect("recall b")
+            .expect("present b");
+        assert_eq!(a.content, "laptop copy");
+        assert_eq!(b.content, "desktop copy");
+        // Deleting in one namespace leaves the other intact.
+        store
+            .delete_memory(&ns_a, &MemoryId("mem_fx1".into()))
+            .await
+            .expect("delete a");
+        assert!(
+            store
+                .recall_memory(&ns_b, &MemoryId("mem_fx1".into()))
+                .await
+                .expect("recall b after a delete")
+                .is_some(),
+            "ns_b record must survive ns_a deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_memories_projects_origin_and_authority() {
+        // The browse SELECT must project origin/authority or the
+        // deserializer defaults them to `local`, silently erasing import
+        // provenance (WS2).
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_originproj");
+        let mut m = sample_memory("m_op", "origin projection probe");
+        m.origin = InstanceId("elliotthall-laptop".into());
+        store.store_memory(&ns, m).await.expect("store");
+        let listed = store.list_memories(&ns, 10).await.expect("list");
+        let got = listed.first().expect("one row");
+        assert_eq!(got.origin.0, "elliotthall-laptop");
     }
 
     #[tokio::test]

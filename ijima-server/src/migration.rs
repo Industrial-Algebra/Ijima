@@ -112,6 +112,37 @@ pub fn migration_namespace() -> NamespaceId {
     NamespaceId::new(MIGRATION_NAMESPACE)
 }
 
+/// Retags a mapped memory for remote multi-source import (WS2): stamps
+/// the origin as the source workstation and drops the trust tier to
+/// [`MemorySource::AutoCapture`] regardless of the row's original
+/// classification — imported content is unverified until promoted via
+/// `trust:promote` (provenance-tier ADR). Harness provenance is
+/// preserved (`Pi` for mempalace rows, `Other` for ZeroClaw).
+pub fn retag_imported(mut memory: Memory, source: &str) -> Memory {
+    memory.origin = InstanceId(source.to_string());
+    memory.source = MemorySource::AutoCapture;
+    memory
+}
+
+/// Default namespace for a remote import from `source` (WS2): one
+/// namespace per source, `ns_import_<sanitized>` — never the global
+/// commons. Sanitization: lowercase, ASCII alphanumerics kept, every
+/// other run of characters collapsed to a single `_`.
+pub fn default_import_ns(source: &str) -> NamespaceId {
+    let mut sanitized = String::with_capacity(source.len());
+    let mut pending_underscore = false;
+    for ch in source.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitized.push(ch.to_ascii_lowercase());
+            pending_underscore = false;
+        } else if !pending_underscore {
+            sanitized.push('_');
+            pending_underscore = true;
+        }
+    }
+    NamespaceId::new(format!("ns_import_{sanitized}"))
+}
+
 // ===== SQLite read path (rusqlite, bundled) =====
 
 /// Reads the `memories` table from a pi-mempalace `memories.db`.
@@ -249,6 +280,56 @@ mod tests {
         assert_eq!(map_zeroclaw_source("core"), MemorySource::Explicit);
         assert_eq!(map_zeroclaw_source("daily"), MemorySource::Explicit);
         assert_eq!(map_zeroclaw_source("identity"), MemorySource::Explicit);
+    }
+
+    #[test]
+    fn retag_imported_stamps_origin_and_drops_to_autocapture() {
+        // manual-save maps to Explicit, but WS2 import policy says
+        // imported content lands unverified (AutoCapture) until promoted.
+        let row = PiPalaceRow {
+            id: "mem_imp1".into(),
+            content: "saved on the laptop".into(),
+            project: "ijima".into(),
+            topic: "import".into(),
+            source: "manual-save".into(),
+            timestamp: "1755400000".into(),
+            session_id: String::new(),
+            importance: 0.5,
+        };
+        let tagged = retag_imported(map_pipalace_memory(&row), "elliotthall-laptop");
+        assert_eq!(tagged.origin.0, "elliotthall-laptop");
+        assert_eq!(tagged.source, MemorySource::AutoCapture);
+        assert_eq!(tagged.harness, Harness::Pi);
+    }
+
+    #[test]
+    fn retag_imported_preserves_zeroclaw_harness() {
+        let row = ZeroClawRow {
+            id: "zc1".into(),
+            content: "discord memory".into(),
+            category: "core".into(),
+            created_at: "1755400000".into(),
+            session_id: None,
+        };
+        let tagged = retag_imported(map_zeroclaw_memory(&row), "zeroclaw-archive");
+        assert_eq!(tagged.origin.0, "zeroclaw-archive");
+        assert_eq!(tagged.harness, Harness::Other);
+    }
+
+    #[test]
+    fn default_import_ns_sanitizes_source() {
+        assert_eq!(
+            default_import_ns("elliotthall-laptop").as_str(),
+            "ns_import_elliotthall_laptop"
+        );
+        assert_eq!(
+            default_import_ns("Laptop 01").as_str(),
+            "ns_import_laptop_01"
+        );
+        assert_eq!(
+            default_import_ns("weird!!name").as_str(),
+            "ns_import_weird_name"
+        );
     }
 
     #[test]

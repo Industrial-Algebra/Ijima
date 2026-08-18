@@ -30,7 +30,7 @@ server-auth = ["dep:schubert", "dep:base64", "dep:ed25519-dalek", "dep:sha2"]
 # intersection number (codimension). Composes with `server-auth`.
 rate-limit = ["server-auth", "http"]
 # The `ijima` CLI binary (clap). The `ijima token issue` subcommand.
-cli = ["dep:clap", "dep:reqwest"]
+cli = ["dep:clap", "dep:reqwest", "dep:ijima-client"]
 # Candle (Hugging Face Rust ML) embedding backend — the IA-standard
 # default, consistent with Quantizon. Builds candle on CPU; GPU/CUDA
 # acceleration is a future opt-in (requires a CUDA toolchain).
@@ -48,6 +48,7 @@ federation = ["ijima-core/federation", "http"]
 
 [dependencies]
 ijima-core = { workspace = true }
+ijima-client = { workspace = true, optional = true }
 ijima-miner = { workspace = true, optional = true }
 # Direct (optional) so the mining trigger can construct a Proserpina HTTP
 # agent. `mining` enables `backend-http` to compile the http module.
