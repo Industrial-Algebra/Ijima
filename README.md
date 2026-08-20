@@ -1,5 +1,8 @@
 # Ijima
 
+[![Docs](https://img.shields.io/badge/docs-ijima.industrialalgebra.com-blue)](https://ijima.industrialalgebra.com)
+[![Crates.io](https://img.shields.io/crates/v/ijima-server)](https://crates.io/crates/ijima-server)
+
 **The centralized memory service for the Anima ecosystem.**
 
 Ijima is the single source of truth for agentic memory — every harness

@@ -4,40 +4,60 @@
 single source of truth for agentic memory across every harness (pi, Tsume,
 Sakamoto, Wallace, Dominic, opencode, …). It replaces fragmented,
 per-harness memory stores with one service every agent reads from and
-writes to.
+writes to, with per-principal isolation, quantitative access control, and
+full provenance on every stored fact.
 
 ## What it does
 
-Ijima holds three things:
+Ijima serves three related capabilities:
 
-1. **The Memory Palace** — curated long-term semantic memory + a temporal
-   knowledge graph. Local candle embeddings, cosine search, content-hash +
-   semantic dedup.
-2. **The Session Context Repository** — raw session transcripts from every
-   harness, append-only and high-fidelity.
-3. **The Miner** — refines raw sessions into curated palace entries
-   (decisions, facts, references, patterns) with full provenance: *"this
-   memory came from that conversation."*
+1. **A memory palace** — curated memories organized as project → topic
+   rooms, with importance-weighted recall, semantic search, and a diary
+   per agent.
+2. **A knowledge graph** — subject/predicate/object triples with entity
+   resolution, timelines, and cross-project tunnels.
+3. **A session repository + mining pipeline** — raw agent session turns
+   flow in, an extraction engine (rules tier, optional LLM tier) proposes
+   candidate memories with confidence scores, and a human/agent review
+   queue promotes the good ones into the palace with provenance intact.
 
 ## Why it exists
 
-Memory was siloed per harness — pi had its mempalace, ZeroClaw had
-`brain.db`, OpenClaw had JSONL dumps. A decision archived in one context
-was invisible to the others, and valuable ore in raw session transcripts
-was never refined. Ijima centralizes the store *and* adds the missing link:
-automated extraction of curated memory from raw sessions. See
-[`docs/DESIGN.md`](https://github.com/Industrial-Algebra/Ijima/blob/develop/docs/DESIGN.md)
-for the full decision log (D1–D11).
+Before Ijima, each harness carried its own memory: pi-mempalace SQLite
+databases per workstation, ZeroClaw's Discord brain, ad-hoc files. Memory
+was fragmented (the same insight saved five times, never reconciled),
+unauditable (no notion of *where* a fact came from or *how much to trust*
+it), and unsecurable (one all-or-nothing bearer token). Ijima makes memory
+a *service*: one instance, many principals, capability-scoped access, and
+a trust tier on every entry.
 
-## Status
+## Ecosystem position
 
-Unreleased, in active development toward 0.1.0. The features above are
-merged to `develop` and tested; nothing is "shipped" until the crates are
-published to crates.io and tagged. See the [Roadmap](./design/roadmap.md).
+Ijima is the memory plane under Dominic's orchestration plane:
 
-## Key features
+- **[Schubert](https://github.com/Industrial-Algebra/Schubert)** provides
+  the capability algebra (Grassmannian Gr(4,8)) that Ijima uses for
+  authorization, proof-carrying GrantTokens, and rate limiting. Ijima is
+  Schubert's first and most complete consumer.
+- **Dominic** (meta-orchestrator) dispatches work and federates through
+  Ijima's control plane; Ijima enforces trust boundaries locally even when
+  Dominic is unreachable.
+- **pi** connects as a thin client (`IJIMA_URL` / `IJIMA_TOKEN`), replacing
+  the pi-mempalace extension.
+- **Proserpina** supplies the LLM agent surface for the mining tier
+  (`proserpina-agent`), cross-repo contract-tested.
 
-- Multi-tenant namespaces (personal / shared / global) with isolation.
-- Schubert capability auth on the Grassmannian Gr(4,8).
-- A rules + LLM mining pipeline with a per-namespace review queue.
-- Provenance on every memory (origin instance, authority scope, trust tier).
+## The workspace
+
+| Crate | Role |
+|---|---|
+| `ijima-core` | Domain types, `Store`/`KnowledgeGraph` traits, capability vocabulary |
+| `ijima-server` | HTTP daemon (axum), SurrealDB backend, auth, CLI |
+| `ijima-client` | Typed async HTTP client for harnesses |
+| `ijima-miner` | Extraction engine (rules + LLM tiers) |
+| `ijima-pi` / `integrations/pi` | pi extension (WASM/npm) |
+
+Ijima is v0.x: interfaces evolve, breaking changes are announced in the
+[CHANGELOG](https://github.com/Industrial-Algebra/Ijima/blob/develop/CHANGELOG.md),
+and the 0.2.0 "Central Brain" release targets a real single-instance
+deployment with all workstations as thin clients.
