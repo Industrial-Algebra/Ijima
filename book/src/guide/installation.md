@@ -38,6 +38,7 @@ Unknown keys are ignored (forward compatibility).
 |---|---|
 | `IJIMA_DIR` | Data directory (default `~/.ijima`) |
 | `IJIMA_CONFIG` | Explicit config file path |
+| `IJIMA_POLICY` | Issuance-policy file (policy-constrained `ijima token issue`; see [Token Management](./tokens.md)) |
 | `IJIMA_HOST` / `IJIMA_PORT` | Bind address overrides |
 | `IJIMA_KEY` | Issuer key path override |
 | `IJIMA_RATE_BASE` / `IJIMA_RATE_MULTIPLIER` / `IJIMA_RATE_DISABLE` | Rate-limit tuning |

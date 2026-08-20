@@ -4,29 +4,49 @@ Grants are credentials. This chapter is the operator's lifecycle guide.
 
 ## Issuing
 
+Issuance is **policy-constrained** (Schubert 0.5 #20.3): `ijima token
+issue` signs only what the issuance policy entitles, failing closed on
+unknown principals and over-entitled requests. The policy resolves as
+`--policy PATH` > `$IJIMA_POLICY` > `$IJIMA_DIR/policy.toml` > the
+embedded default — which seeds **no principals**, so a fresh install
+mints nothing until the operator provisions a policy file (bootstrap
+below).
+
+The operator file can be a minimal **principals-only overlay**:
+
+```toml
+# $IJIMA_DIR/policy.toml
+[principals.elliott]
+grants = ["memory:read", "memory:write", "knowledge:read", "knowledge:write"]
+
+[principals.minoru]
+grants = ["session:ingest", "mining:review"]
+```
+
+Partitions always derive from the embedded policy — an overlay can
+assign capabilities but never redefine the geometry. Adding a
+workstation = one file edit; no rebuild, no daemon restart (the daemon
+verifies proof-carrying grants, not principals).
+
 ```bash
 # a full personal grant
 ijima token issue --principal elliott \
     --capabilities memory:read,memory:write,knowledge:read,knowledge:write
 
-# a machine feed grant (session ingest + mining only)
+# a machine feed grant — always expiring
 ijima token issue --principal minoru \
-    --capabilities session:ingest,mining:review --json
+    --capabilities session:ingest,mining:review \
+    --expires-in 2592000 --json   # 30 days
 
 # an operator/admin grant (rare; the point class)
 ijima token issue --principal ops --capability admin --json
 ```
 
-`--json` emits `{token, principal, capabilities, public_key}` for
-scripting. `--capabilities` takes a CSV (multi-capability GrantToken);
-`--capability` takes a single value. The grant is signed by the issuer
-key in the data directory (`IJIMA_KEY` / `issuer_key` config to relocate)
-— **tokens minted against one key do not verify on a daemon with another
-key.**
-
-Issue *narrow* grants: a dispatcher that only ingests sessions gets
-`session:ingest` and nothing else. The geometry enforces what the grant
-says, not what the principal "should" have.
+`--json` emits `{token, principal, capabilities, expires_at_unix?,
+public_key}`. `--expires-in <SECONDS>` sets a signed expiry (Schubert
+0.5 ADR-0001; boundary inclusive — dead when `now >= expires_at`);
+omit for never-expiring. Renewal = re-issue (fresh nonce), never
+mutation.
 
 ## Deploying to clients
 
@@ -60,10 +80,9 @@ ijima token revoke --token "<bearer>" \
 
 ## Rotation practice
 
-- Prefer `revoke` + fresh `issue` over long-lived shared grants.
-- Issuer-key rotation (replace the key file, restart) invalidates *all*
-  grants at once — the emergency lever for key compromise, not routine
-  rotation.
-- GrantToken expiry is upstream-gated on Schubert 0.5 (`expires_at` +
-  `nonce` in the signed blob); until then, revocation is the routine
-  deprovisioning path.
+- Prefer short expiries + re-issue for machine feeds (`--expires-in`);
+  `revoke` for incidents; issuer-key rotation remains the emergency
+  lever for key compromise (invalidates every grant at once).
+- Schubert 0.5 expiry is adopted; the instance-side revocation list
+  stays as defense-in-depth (kills leaked bearers with no issuer
+  involvement). CRDT nonce-tombstones arrive with 0.3 satellites.

@@ -57,8 +57,9 @@ regardless of origin claims — an import is a claim, not a credential.
   deploy behind a real proxy on untrusted networks.
 - TLS is opt-in (`tls` feature); on a private Tailscale network, plain
   HTTP behind `tailscale serve` is the documented default.
-- GrantToken expiry is upstream-gated on Schubert 0.5; until adopted,
-  revocation is the routine deprovisioning path.
+- GrantToken expiry is adopted (Schubert 0.5); the instance-side
+  revocation list remains as defense-in-depth, and CRDT tombstones are
+  deferred to 0.3 satellites.
 - Context-poisoning protection is designed but not yet implemented.
 
 See `docs/DESIGN.md` and `docs/adr/` (grant-token-migration,

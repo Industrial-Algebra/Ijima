@@ -7,6 +7,7 @@ Index with one-line outcomes:
 |---|---|
 | `grant-token-migration.md` | Adopt Schubert 0.4 GrantTokens (multi-capability, partition-signed) as the sole bearer format; delete the duplicated wire codec; admin via geometry (point class), not string equality |
 | `token-revocation.md` | Store-backed SHA-256 bearer-hash revocation list (no raw bearers at rest); checked after signature verification; expires are upstream (Schubert 0.5) — revocation and expiry are complementary |
+| `schubert-0.5-adoption.md` | Full 0.5 adoption in the zero-re-mint window: signed expiry (`--expires-in`), policy-constrained issuance (principals-only overlay files, fails closed), instance-side revocation kept as defense-in-depth while CRDT tombstones wait for 0.3 satellites |
 | `provenance-tier-model.md` | MemorySource trust grades map to Schubert codimensions; trust transitions are capabilities; imports land AutoCapture |
 | `miner-architecture.md` | Two-tier extraction (deterministic rules + optional LLM via proserpina-agent); confidence-routed to auto-file or review queue |
 | `compaction-recovery.md` | Session compaction keeps recoverable turn history for re-mining |
