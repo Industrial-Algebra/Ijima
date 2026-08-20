@@ -177,6 +177,18 @@ struct IssueArgs {
     /// `--capability` / `--capabilities` is required.
     #[arg(long, value_name = "CSV")]
     capabilities: Option<String>,
+    /// Path to the issuance policy TOML (Schubert 0.5 #20.3). Default
+    /// resolution: `$IJIMA_POLICY` > `$IJIMA_DIR/policy.toml` > the
+    /// embedded policy. The policy must entitle the principal to every
+    /// requested capability — issuance fails closed otherwise.
+    #[arg(long, value_name = "PATH")]
+    policy: Option<PathBuf>,
+    /// Grant lifetime in seconds; the grant dies when `now >= now +
+    /// seconds` (inclusive, Schubert ADR-0001). Omit for a never-expiring
+    /// grant (pre-0.5 behavior). Service principals should always carry
+    /// an expiry.
+    #[arg(long, value_name = "SECONDS")]
+    expires_in: Option<u64>,
     /// Path to the issuer key file. Defaults to `$IJIMA_DIR/issuer.key`
     /// or `~/.ijima/issuer.key`. Created with a fresh seed on first use.
     #[arg(long, value_name = "PATH")]
@@ -402,15 +414,40 @@ fn run_issue(args: IssueArgs) -> ijima_core::Result<()> {
     };
     let seed = key_store::load_or_create(&key_path)?;
     let auth = IjimaAuth::from_embedded_policy_with_seed(seed)?;
-    let token = auth.issue_grant_bearer(args.principal.as_str(), &cap_refs)?;
+
+    // Policy-constrained issuance (Schubert 0.5 #20.3): the resolved
+    // policy must entitle the principal to every requested capability —
+    // fails closed, no geometry smuggling under an allowed id.
+    let policy_toml = IjimaAuth::resolve_issuance_policy(args.policy.as_deref())?;
+    let policy_cfg = IjimaAuth::issuance_policy_from_source(&policy_toml)?;
+    let grant_policy = schubert::crypto::GrantPolicy::from_policy(&policy_cfg)
+        .map_err(|e| ijima_core::IjimaError::invalid_input(format!("grant policy: {e}")))?;
+    let expires_at = args.expires_in.map(|secs| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() + secs)
+            .unwrap_or(secs)
+    });
+    let token = auth.issue_grant_bearer_under_policy(
+        args.principal.as_str(),
+        &cap_refs,
+        &grant_policy,
+        expires_at,
+    )?;
     let public_key = auth.issuer_public_key_hex();
 
     if args.json {
         let caps_json = caps.join(",");
-        println!(
-            "{{\"token\":\"{token}\",\"principal\":\"{}\",\"capabilities\":\"{caps_json}\",\"public_key\":\"{public_key}\"}}",
-            args.principal
-        );
+        match expires_at {
+            Some(at) => println!(
+                "{{\"token\":\"{token}\",\"principal\":\"{}\",\"capabilities\":\"{caps_json}\",\"expires_at_unix\":{at},\"public_key\":\"{public_key}\"}}",
+                args.principal
+            ),
+            None => println!(
+                "{{\"token\":\"{token}\",\"principal\":\"{}\",\"capabilities\":\"{caps_json}\",\"public_key\":\"{public_key}\"}}",
+                args.principal
+            ),
+        }
     } else {
         println!("{token}");
     }

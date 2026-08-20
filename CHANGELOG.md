@@ -6,7 +6,58 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet — Ijima v0.1.0 is shipped._
+Everything since v0.1.0 — the v0.2.0 "Central Brain" arc: consolidation,
+hardening, and the deployment surface.
+
+### Auth (Schubert)
+- **GrantToken migration** (#63): multi-capability, partition-signed
+  Schubert grants replace single-capability CapabilityTokens; write
+  implies read; admin via geometry (point class); ~60-line duplicated
+  wire codec deleted. Breaking bearer-wire change.
+- **Token revocation** (#66): store-backed SHA-256 bearer-hash list,
+  checked after signature verification; survives restarts; admin routes
+  + CLI. Raw bearers never persisted.
+- **Schubert 0.5 adoption**: signed grant expiry (`--expires-in`,
+  inclusive boundary, distinct `GrantExpired` 401 detail) and
+  **policy-constrained issuance** — `ijima token issue` signs only what
+  the issuance policy entitles (fails closed; principals-only overlay
+  files on the embedded partitions). ADR `schubert-0.5-adoption`.
+
+### Import (WS2, #70)
+- `ijima import mempalace|zeroclaw --db --source`: streams legacy SQLite
+  corpora into a running daemon over HTTP; per-source `ns_import_<source>`
+  namespaces; provenance retagging (origin = source, trust dropped to
+  AutoCapture); cross-source dedup via `/memories/check`; idempotent;
+  per-source `{attempted, added, deduped, skipped}` report.
+- Client: `store_memory_in`, `check_duplicate`, `import_memories`,
+  `ImportCounts`.
+- Store fixes the import surfaced: namespaced Surreal record keys
+  (`<ns>:<id>` — cross-namespace id collision) and origin/authority now
+  projected in browse/list selects.
+
+### Deployment (WS1, #65/#66 ancestry)
+- Config file layer (`ijima.toml`): defaults < file < env < CLI;
+  discovery `$IJIMA_CONFIG` > `$IJIMA_DIR/ijima.toml` >
+  `/etc/ijima/ijima.toml`; explicit-but-missing config = hard error.
+- `/status` version/uptime; systemd unit + example config + laniakea
+  runbook (`docs/deploy/`).
+
+### Dependencies
+- proserpina 0.3 → **proserpina-agent 0.1.0** (WS0, #68).
+- **surrealdb 2.6.5 → 3.2.4** (#71): SerdeWrapper store bridge; tables
+  defined up-front (v3 hard-errors SELECT on missing tables);
+  surrealkv directory-lock semantics documented. On-disk layout note:
+  pre-0.2 dev databases should be re-imported.
+- Dependency sweep (#69): sha2 0.11, base64 0.23, axum-server 0.8,
+  serde/serde_json/thiserror/async-trait/clap refreshes; dead `rand`
+  removed.
+
+### Docs
+- The mdBook: 11 stub chapters → 25 real chapters (Schubert standard);
+  deploys on tag via Netlify (workflow green, site ijima.industrialalgebra.com).
+
+### Mining tier
+- LLM agent surface via `proserpina-agent` (HttpAgent, backend-http).
 
 ## [0.1.0] — 2026-08-10
 
