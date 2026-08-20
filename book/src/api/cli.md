@@ -45,6 +45,19 @@ ijima migrate [--palace PATH] [--brain PATH] [--embed] [--namespace NS]
 The older one-shot local import (writes into the daemon's own data
 directory, no HTTP). Prefer `import`.
 
+## `ijima namespace`
+
+```bash
+ijima namespace grant <NS> <PRINCIPAL> --url URL --auth "<admin>"
+ijima namespace revoke <NS> <PRINCIPAL> --url URL --auth "<admin>"
+ijima namespace members <NS> --url URL --auth "<admin>"
+```
+
+Shared-namespace membership management (WS3 org walls) on a running
+daemon — admin capability required. Grants are upserts (idempotent),
+revokes are idempotent, members list oldest-grant-first with the
+audit trail (`granted_by`, `granted_at_unix`).
+
 ## `ijima export`
 
 ```bash

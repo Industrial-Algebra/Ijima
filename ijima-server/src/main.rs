@@ -36,6 +36,12 @@ enum Command {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Manage shared-namespace membership (WS3 org walls) on a running
+    /// daemon. Requires an admin bearer.
+    Namespace {
+        #[command(subcommand)]
+        action: NamespaceAction,
+    },
     /// Ingest doctrine from a seed-pack directory into a running daemon.
     Doctrine {
         #[command(subcommand)]
@@ -162,6 +168,43 @@ enum TokenAction {
     Revocations(RevocationsArgs),
 }
 
+/// `ijima namespace <action>` — org-wall membership management (WS3).
+#[derive(Subcommand, Debug)]
+enum NamespaceAction {
+    /// Grant a principal membership in a shared namespace.
+    Grant(NsMembershipArgs),
+    /// Revoke a principal's membership (idempotent).
+    Revoke(NsMembershipArgs),
+    /// List a namespace's members, oldest grant first.
+    Members(NsMembersArgs),
+}
+
+#[derive(Args, Debug)]
+struct NsMembershipArgs {
+    /// The shared namespace (e.g. `ns_ia_shared`).
+    namespace: String,
+    /// The principal to grant or revoke.
+    principal: String,
+    /// Daemon base URL.
+    #[arg(long, default_value = "http://127.0.0.1:7373")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long)]
+    auth: String,
+}
+
+#[derive(Args, Debug)]
+struct NsMembersArgs {
+    /// The shared namespace to list.
+    namespace: String,
+    /// Daemon base URL.
+    #[arg(long, default_value = "http://127.0.0.1:7373")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long)]
+    auth: String,
+}
+
 #[derive(Args)]
 struct IssueArgs {
     /// The principal to issue the token to (e.g. `elliott`, `tsume-discord`).
@@ -229,6 +272,47 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     ijima_server::server::init_tracing();
     match cli.command {
+        Command::Namespace { action } => match action {
+            NamespaceAction::Grant(args) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                match rt.block_on(run_ns_grant(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "namespace grant failed");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            NamespaceAction::Revoke(args) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                match rt.block_on(run_ns_revoke(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "namespace revoke failed");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            NamespaceAction::Members(args) => {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                match rt.block_on(run_ns_members(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "namespace members failed");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+        },
         Command::Token { action } => match action {
             TokenAction::Issue(args) => match run_issue(args) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -466,6 +550,111 @@ fn validate_capability(cap: &str) -> ijima_core::Result<()> {
 }
 
 /// `ijima token revoke` — kills a bearer on a running daemon (admin).
+/// `ijima namespace grant <ns> <principal>` — WS3 org-wall grant (admin).
+async fn run_ns_grant(args: NsMembershipArgs) -> ijima_core::Result<()> {
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/namespaces/grant", args.url.trim_end_matches('/'));
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(args.auth.trim())
+        .json(&serde_json::json!({
+            "namespace": args.namespace,
+            "principal": args.principal,
+        }))
+        .send()
+        .await
+        .map_err(|e| ijima_core::IjimaError::Transport {
+            detail: format!("namespace grant: {e}"),
+        })?;
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            eprintln!(
+                "ijima: `{}` is now a member of `{}`.",
+                args.principal, args.namespace
+            );
+            Ok(())
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(ijima_core::IjimaError::invalid_input(
+            "daemon rejected: the --auth token does not carry admin",
+        )),
+        status => Err(ijima_core::IjimaError::Transport {
+            detail: format!("daemon returned {status}"),
+        }),
+    }
+}
+
+/// `ijima namespace revoke <ns> <principal>` — WS3 org-wall revoke (admin).
+async fn run_ns_revoke(args: NsMembershipArgs) -> ijima_core::Result<()> {
+    let client = reqwest::Client::new();
+    let endpoint = format!("{}/namespaces/revoke", args.url.trim_end_matches('/'));
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(args.auth.trim())
+        .json(&serde_json::json!({
+            "namespace": args.namespace,
+            "principal": args.principal,
+        }))
+        .send()
+        .await
+        .map_err(|e| ijima_core::IjimaError::Transport {
+            detail: format!("namespace revoke: {e}"),
+        })?;
+    match resp.status() {
+        reqwest::StatusCode::NO_CONTENT => {
+            eprintln!(
+                "ijima: `{}` membership in `{}` revoked.",
+                args.principal, args.namespace
+            );
+            Ok(())
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(ijima_core::IjimaError::invalid_input(
+            "daemon rejected: the --auth token does not carry admin",
+        )),
+        status => Err(ijima_core::IjimaError::Transport {
+            detail: format!("daemon returned {status}"),
+        }),
+    }
+}
+
+/// `ijima namespace members <ns>` — WS3 membership listing (admin).
+async fn run_ns_members(args: NsMembersArgs) -> ijima_core::Result<()> {
+    let client = reqwest::Client::new();
+    let endpoint = format!(
+        "{}/namespaces/members?namespace={}",
+        args.url.trim_end_matches('/'),
+        args.namespace
+    );
+    let resp = client
+        .get(&endpoint)
+        .bearer_auth(args.auth.trim())
+        .send()
+        .await
+        .map_err(|e| ijima_core::IjimaError::Transport {
+            detail: format!("namespace members: {e}"),
+        })?;
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            let members: serde_json::Value =
+                resp.json()
+                    .await
+                    .map_err(|e| ijima_core::IjimaError::Transport {
+                        detail: format!("members decode: {e}"),
+                    })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&members).unwrap_or_default()
+            );
+            Ok(())
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(ijima_core::IjimaError::invalid_input(
+            "daemon rejected: the --auth token does not carry admin",
+        )),
+        status => Err(ijima_core::IjimaError::Transport {
+            detail: format!("daemon returned {status}"),
+        }),
+    }
+}
+
 async fn run_revoke(args: RevokeArgs) -> ijima_core::Result<()> {
     let client = reqwest::Client::new();
     let endpoint = format!("{}/tokens/revoke", args.url.trim_end_matches('/'));

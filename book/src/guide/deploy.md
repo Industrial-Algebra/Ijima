@@ -30,10 +30,14 @@ workstations (pi, agents)          laniakea (or any always-on host)
    `deploy/ijima.toml.example`).
 3. `deploy/ijima.service` → systemd; `systemctl enable --now ijima`.
 4. Mint grants per principal (operators, harnesses, machine feeds) —
-   [Token Management](./tokens.md).
-5. `curl .../health` liveness; `GET /status` (admin) for counts.
-6. Import workstation corpora — [Importing Legacy Corpora](./import.md).
-7. Point each workstation's `IJIMA_URL`/`IJIMA_TOKEN` at the instance.
+   [Token Management](./tokens.md) — via the principals overlay policy.
+5. Grant shared-namespace memberships for the org walls:
+   `ijima namespace grant ns_ia_shared <principal> --auth <admin>`
+   (repeat for `ns_kellas_shared`, `ns_shiroyama_shared`,
+   `ns_writing_shared` as needed).
+6. `curl .../health` liveness; `GET /status` (admin) for counts.
+7. Import workstation corpora — [Importing Legacy Corpora](./import.md).
+8. Point each workstation's `IJIMA_URL`/`IJIMA_TOKEN` at the instance.
 
 ## Backup & restore
 

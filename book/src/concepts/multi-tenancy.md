@@ -16,13 +16,28 @@ No request spans namespaces; there is no implicit cross-namespace read.
 
 - Omit the namespace → your personal namespace.
 - Pass `?namespace=<ns>` → that namespace, subject to checks:
-  another principal's `*_private` namespace is always forbidden.
+  another principal's `*_private` namespace is always forbidden, and
+  **shared namespaces require membership** (granted by an admin;
+  admins bypass).
+- Open namespaces — `global`, `ns_doctrine`, `ns_import_*` staging —
+  are readable/writable by any authenticated principal.
 - Writes require `memory:write` (or `knowledge:write`) *and* namespace
   eligibility; reads are personal-by-default and explicit otherwise.
+- Promotion targets go through the same rule (`trust:promote` cannot
+  tunnel through an org wall; import staging is not a promotion target).
 
 Shared-namespace **membership** (org walls like `ns_ia_shared`,
-`ns_kellas_shared`) is runtime-managed data, not static policy — see the
-design decision log.
+`ns_kellas_shared`) is runtime-managed store data, not static policy —
+grants take effect immediately for principals holding valid grants:
+
+```bash
+ijima namespace grant ns_ia_shared elliott --auth <admin-bearer>
+ijima namespace members ns_ia_shared --auth <admin-bearer>
+ijima namespace revoke ns_ia_shared elliott --auth <admin-bearer>
+```
+
+Admins bypass membership checks (operator access). See the
+namespace-membership ADR.
 
 ## Isolation mechanics
 
