@@ -2,48 +2,85 @@
 
 ## Prerequisites
 
-- A recent Rust toolchain (see [`rust-toolchain.toml`](https://github.com/Industrial-Algebra/Ijima/blob/develop/rust-toolchain.toml)).
+- A recent Rust toolchain (see
+  [`rust-toolchain.toml`](https://github.com/Industrial-Algebra/Ijima/blob/develop/rust-toolchain.toml)).
 - (Optional) a model endpoint for the mining LLM tier — DeepSeek by default.
+- (Optional) a Tailscale network for remote thin clients.
 
-## Build the daemon + CLI
+## Install
 
-```bash
-git clone https://github.com/Industrial-Algebra/Ijima.git
-cd Ijima
-cargo build --features "http,server-auth,backend-surreal,embeddings-candle,cli,mining" --bin ijima
-```
-
-## First run
+Ijima is published on crates.io:
 
 ```bash
-# Where the issuer key + database live.
-export IJIMA_DIR=~/.ijima
-
-# Issue an admin token (creates the issuer key on first run).
-./target/debug/ijima token issue --principal elliott --capability admin
-
-# Start the daemon (HTTP on port 7373).
-./target/debug/ijima serve --port 7373
+cargo install ijima-server --features "cli,backend-sqlite,embeddings-candle"
 ```
 
-## Store and search a memory
+The default features give you the daemon, HTTP, Schubert auth, and the
+SurrealDB backend. Add `backend-sqlite` if you will import from a legacy
+pi-mempalace or ZeroClaw database, and `embeddings-candle` for semantic
+search (downloads all-MiniLM-L6-v2 on first use).
+
+## Start a daemon
 
 ```bash
-# Store (needs a memory:write token).
-curl -X POST http://127.0.0.1:7373/memories \
-  -H "authorization: Bearer <token>" \
-  -H "content-type: application/json" \
-  -d '{"id":"m1","content":"Decided to use SurrealDB","project":"ijima","topic":"storage","source":"Explicit","harness":"Pi"}'
-
-# Semantic search (the daemon embeds centrally with candle).
-curl -X POST http://127.0.0.1:7373/memories/search \
-  -H "authorization: Bearer <read-token>" \
-  -H "content-type: application/json" \
-  -d '{"text":"database choice","limit":5}'
+ijima serve
 ```
 
-## Next
+The daemon listens on `127.0.0.1:7373`, creates a data directory at
+`~/.ijima` (an embedded SurrealDB store + issuer key), and is ready.
+`IJIMA_DIR` relocates the data directory; see
+[Installing and Configuring](./guide/installation.md).
 
-- [Feature Flags](./guide/feature-flags.md) — the full build matrix.
-- [The Mining Pipeline](./guide/mining.md) — turn sessions into memories.
-- [Security](./design/security.md) — the capability model.
+## Mint a grant
+
+Every request needs a Schubert GrantToken. Mint one for yourself:
+
+```bash
+ijima token issue --principal elliott \
+    --capabilities memory:read,memory:write,knowledge:read,knowledge:write
+```
+
+The token is a base64 GrantToken blob — proof-carrying, signed by the
+issuer key in the data directory. Store it somewhere safe (a password
+manager); it is a *credential*.
+
+## First requests
+
+```bash
+TOKEN="..."  # from the step above
+
+# store a memory
+curl -s -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
+     -d '{"id":"mem_first","content":"Ijima is running","project":"ijima",
+          "topic":"notes","source":"Explicit","harness":"Pi",
+          "importance":0.5,"created_at":"0"}' \
+     localhost:7373/memories
+
+# recall it
+curl -s -H "Authorization: Bearer $TOKEN" \
+     localhost:7373/memories/mem_first
+```
+
+The response provenance block reports what the daemon saw: source tier,
+harness, origin instance, authority scope.
+
+## From a harness
+
+Rust harnesses use `ijima-client`:
+
+```rust
+let client = ijima_client::Client::new(
+    ijima_client::ClientConfig::new("http://127.0.0.1:7373", Harness::Pi)
+        .with_token(token),
+);
+let id = client.store_memory(memory).await?;
+```
+
+pi users: the [pi integration](./guide/pi.md) is a single env pair
+(`IJIMA_URL`, `IJIMA_TOKEN`).
+
+## Next steps
+
+- [Concepts](./concepts/two-store-model.md) — the two-store model, provenance, capabilities.
+- [Importing Legacy Corpora](./guide/import.md) — bring your pi-mempalace history in.
+- [The Mining Pipeline](./guide/mining.md) — turn session transcripts into memories.
