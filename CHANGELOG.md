@@ -23,6 +23,18 @@ hardening, and the deployment surface.
   the issuance policy entitles (fails closed; principals-only overlay
   files on the embedded partitions). ADR `schubert-0.5-adoption`.
 
+### Namespace membership (WS3)
+- **Org walls**: shared namespaces (anything not `_private`, `global`,
+  `ns_doctrine`, or `ns_import_*` staging) now require store-backed
+  membership — admins bypass. `resolve_ns` enforces on every
+  namespace-resolving route (23 call sites).
+- **Promotion target gating**: `POST /memories/:id/promote` no longer
+  bypasses the wall (targets run the same rule; import staging rejected
+  as a target) — closes a pre-WS3 tunnel.
+- Admin surface: `POST /namespaces/grant|revoke`,
+  `GET /namespaces/members`; `ijima namespace grant|revoke|members`
+  CLI. ADR `namespace-membership.md`.
+
 ### Import (WS2, #70)
 - `ijima import mempalace|zeroclaw --db --source`: streams legacy SQLite
   corpora into a running daemon over HTTP; per-source `ns_import_<source>`

@@ -30,6 +30,8 @@ namespaces are always rejected).
 | `GET` | `/repos/resolve?path=` | `memory:read` (RepoDirectory) |
 | `POST` | `/tokens/revoke` | `admin` |
 | `GET` | `/tokens/revocations` | `admin` |
+| `POST` | `/namespaces/grant`, `/namespaces/revoke` | `admin` |
+| `GET` | `/namespaces/members?namespace=` | `admin` |
 | `GET` | `/federation/state`, routed-write, conflict-signal | `federation` feature |
 
 The full table (with the store method each route maps to) lives in the

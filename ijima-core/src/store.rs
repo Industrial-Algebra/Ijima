@@ -13,6 +13,7 @@ use crate::{
     AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
     RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
     harness::Harness,
+    namespace::NamespaceMembership,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
 
@@ -231,6 +232,25 @@ pub trait Store: Send + Sync {
     /// `GET /tokens/revocations` (admin) and daemon-boot hydration of the
     /// in-memory rejection set.
     async fn list_revocations(&self) -> Result<Vec<TokenRevocation>>;
+
+    // ===== Shared-namespace membership (WS3 org walls) =====
+
+    /// Grants (upserts) a principal's membership in a shared namespace.
+    /// Admin operation; idempotent — re-granting refreshes `granted_at`/
+    /// `granted_by` but never duplicates.
+    async fn grant_namespace_membership(&self, membership: NamespaceMembership) -> Result<()>;
+
+    /// Revokes a membership. Idempotent: revoking an absent membership is
+    /// not an error.
+    async fn revoke_namespace_membership(&self, ns: &NamespaceId, principal: &str) -> Result<()>;
+
+    /// Lists the members of a namespace, oldest grant first. Powers
+    /// `GET /namespaces/members` (admin).
+    async fn list_namespace_members(&self, ns: &NamespaceId) -> Result<Vec<NamespaceMembership>>;
+
+    /// Hot-path membership check behind `resolve_ns` (shared-namespace
+    /// reads/writes).
+    async fn is_namespace_member(&self, ns: &NamespaceId, principal: &str) -> Result<bool>;
 
     // ===== Mining review queue (ADR M2, M3) =====
 

@@ -60,6 +60,22 @@ pub struct Namespace {
 /// Readable by every principal via `?namespace=ns_doctrine`.
 pub const DOCTRINE_NAMESPACE: &str = "ns_doctrine";
 
+/// A principal's membership in a shared namespace — the WS3 org-wall
+/// grant. Membership is store-backed (mutable at runtime, no redeploy);
+/// see the namespace-membership ADR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NamespaceMembership {
+    /// The shared namespace (`ns_<org>_shared`).
+    pub namespace: String,
+    /// The principal granted access.
+    pub principal: String,
+    /// Unix seconds when the grant was recorded.
+    pub granted_at_unix: u64,
+    /// The admin principal who issued the grant (audit trail).
+    pub granted_by: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -67,7 +67,7 @@ pub use error::IjimaError;
 pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Triple};
 pub use memory::{Memory, MemoryId, MemorySource};
 pub use mining::{AcceptedExtraction, QueuedExtraction};
-pub use namespace::{Namespace, NamespaceId, NamespaceKind};
+pub use namespace::{Namespace, NamespaceId, NamespaceKind, NamespaceMembership};
 pub use palace::{PalaceGraph, ProjectTaxon, Room, Tunnel, TunnelTraversal};
 pub use provenance::{AuthorityScope, InstanceId};
 pub use repo::RepoDirectory;

@@ -30,9 +30,9 @@ use async_trait::async_trait;
 use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
     IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
-    PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room, SearchHit, Session,
-    SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel, TunnelTraversal,
-    embeddings::Embedder, harness::Harness, memory::MemorySource,
+    NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room,
+    SearchHit, Session, SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel,
+    TunnelTraversal, embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -48,6 +48,7 @@ const SESSIONS_TABLE: &str = "sessions";
 const DIARY_TABLE: &str = "diaries";
 const QUEUE_TABLE: &str = "mining_queue";
 const REVOCATIONS_TABLE: &str = "token_revocations";
+const NAMESPACE_MEMBERS_TABLE: &str = "namespace_members";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -157,6 +158,9 @@ impl SurrealStore {
         DEFINE TABLE IF NOT EXISTS entities          SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS triples           SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS token_revocations SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS namespace_members SCHEMALESS;
+        DEFINE INDEX IF NOT EXISTS nmem_ns      ON TABLE namespace_members FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS nmem_ns_princ ON TABLE namespace_members FIELDS namespace, principal;
         DEFINE INDEX IF NOT EXISTS mem_ns        ON TABLE memories       FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS mem_ns_hash   ON TABLE memories       FIELDS namespace, content_hash;
         DEFINE INDEX IF NOT EXISTS turns_ns_sess ON TABLE session_turns   FIELDS namespace, session_id;
@@ -1143,6 +1147,54 @@ impl Store for SurrealStore {
             .map_err(store_err)?;
         let revs = take_vec::<TokenRevocation>(&mut result)?;
         Ok(revs)
+    }
+
+    async fn grant_namespace_membership(&self, membership: NamespaceMembership) -> Result<()> {
+        // Upsert by the natural key (ns, principal): re-granting refreshes
+        // granted_at/granted_by without duplicating.
+        let key = format!("{}:{}", membership.namespace, membership.principal);
+        let _: Option<surrealdb::types::SerdeWrapper<NamespaceMembership>> = self
+            .db
+            .upsert((NAMESPACE_MEMBERS_TABLE, key))
+            .content(surrealdb::types::SerdeWrapper(membership))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn revoke_namespace_membership(&self, ns: &NamespaceId, principal: &str) -> Result<()> {
+        let key = format!("{}:{}", ns.as_str(), principal);
+        let _: Option<surrealdb::types::SerdeWrapper<NamespaceMembership>> = self
+            .db
+            .delete((NAMESPACE_MEMBERS_TABLE, key))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_namespace_members(&self, ns: &NamespaceId) -> Result<Vec<NamespaceMembership>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {NAMESPACE_MEMBERS_TABLE} WHERE namespace = $ns \
+                 ORDER BY granted_at_unix"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        take_vec::<NamespaceMembership>(&mut result)
+    }
+
+    async fn is_namespace_member(&self, ns: &NamespaceId, principal: &str) -> Result<bool> {
+        // Direct natural-key lookup (`<ns>:<principal>`) — no query,
+        // no aggregation semantics, the same key grant/revoke address.
+        let key = format!("{}:{}", ns.as_str(), principal);
+        let record: Option<surrealdb::types::SerdeWrapper<NamespaceMembership>> = self
+            .db
+            .select((NAMESPACE_MEMBERS_TABLE, key))
+            .await
+            .map_err(store_err)?;
+        Ok(record.is_some())
     }
 }
 
@@ -2337,6 +2389,79 @@ async fn fresh_store_reads_succeed_before_any_write() {
     let stats = store.store_stats().await.expect("fresh stats");
     assert_eq!(stats.total_memories, 0);
     assert!(stats.namespaces.is_empty());
+}
+
+// WS3 org walls: membership CRUD contract — idempotent grant, oldest-
+// first listing, revoke-absent-is-ok, and the hot-path boolean.
+#[tokio::test]
+async fn namespace_membership_crud_round_trips() {
+    let store = SurrealStore::open_embedded().await.expect("open");
+    let ns = NamespaceId::new("ns_ia_shared");
+    let mk = |principal: &str, at: u64| NamespaceMembership {
+        namespace: "ns_ia_shared".into(),
+        principal: principal.into(),
+        granted_at_unix: at,
+        granted_by: "root".into(),
+    };
+
+    // Nobody is a member yet.
+    assert!(
+        !store
+            .is_namespace_member(&ns, "elliott")
+            .await
+            .expect("check")
+    );
+
+    store
+        .grant_namespace_membership(mk("elliott", 100))
+        .await
+        .expect("grant");
+    store
+        .grant_namespace_membership(mk("sara", 200))
+        .await
+        .expect("grant");
+    // Idempotent re-grant refreshes, never duplicates.
+    store
+        .grant_namespace_membership(mk("elliott", 300))
+        .await
+        .expect("re-grant");
+
+    assert!(
+        store
+            .is_namespace_member(&ns, "elliott")
+            .await
+            .expect("check")
+    );
+    let members = store.list_namespace_members(&ns).await.expect("list");
+    assert_eq!(members.len(), 2, "re-grant must not duplicate: {members:?}");
+    // Oldest grant first (elliott's original 100 predates sara's 200;
+    // the refreshed row keeps key order by granted_at).
+    assert_eq!(members[0].principal, "sara");
+    assert_eq!(members[1].principal, "elliott");
+    assert_eq!(members[1].granted_at_unix, 300, "re-grant refreshes");
+
+    store
+        .revoke_namespace_membership(&ns, "elliott")
+        .await
+        .expect("revoke");
+    assert!(
+        !store
+            .is_namespace_member(&ns, "elliott")
+            .await
+            .expect("check")
+    );
+    // Revoking an absent membership is not an error.
+    store
+        .revoke_namespace_membership(&ns, "ghost")
+        .await
+        .expect("revoke absent");
+    // Membership is per-namespace.
+    assert!(
+        !store
+            .is_namespace_member(&NamespaceId::new("ns_kellas_shared"), "sara")
+            .await
+            .expect("check")
+    );
 }
 
 // The revocation round-trip is covered full-stack in api::tests
