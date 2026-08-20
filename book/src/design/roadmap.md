@@ -5,11 +5,12 @@
 - **v0.1.0** (2026-08-10) — the library: two-store model, Schubert
   capability auth, SurrealDB backend, mining pipeline, pi extension,
   crates.io publication of core/server/miner/client.
-- **v0.2.0 "Central Brain"** (in progress) — the deployment release:
-  config-file layer + deploy kit (WS1), GrantToken migration, token
-  revocation, multi-source import over HTTP (WS2), namespace membership
-  (WS3), Proserpina agent surface (WS0), dependency sweep incl.
-  surrealdb 3.
+- **v0.2.0 "Central Brain"** (2026-08-21) — the deployment release:
+  GrantToken migration + signed expiry + policy-constrained issuance
+  (Schubert 0.4 → 0.5), token revocation, config-file layer + deploy
+  kit, multi-source import over HTTP (WS2), membership-gated org walls
+  (WS3), Proserpina agent surface (WS0), surrealdb 3, the book you are
+  reading.
 
 **Next (0.3 horizon):**
 
