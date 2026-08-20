@@ -31,7 +31,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use ijima_core::{IjimaError, Result, TokenRevocation};
 use schubert::{
     AccessController, CapabilityId, PrincipalId,
-    crypto::{CapabilityIssuer, GrantToken, GrantVerifier, KeyStore},
+    crypto::{CapabilityIssuer, GrantPolicy, GrantToken, GrantVerifier, KeyStore},
 };
 use sha2::{Digest, Sha256};
 
@@ -209,6 +209,92 @@ impl IjimaAuth {
                 "grant must carry at least one capability",
             ));
         }
+        let entries = self.capability_entries(capabilities)?;
+        let grant = self
+            .issuer
+            .issue_grant(principal, &entries)
+            .map_err(|e| IjimaError::invalid_input(format!("grant issue: {e}")))?;
+        Ok(B64.encode(GrantToken::to_bytes(&grant)))
+    }
+
+    /// Issues a grant that dies at `expires_at_unix` (Unix seconds,
+    /// Schubert 0.5 ADR-0001: the boundary is inclusive — the grant is
+    /// dead the instant `now >= expires_at`). Expiry is covered by the
+    /// signature and enforced by [`GrantVerifier::verify`] standalone;
+    /// expired bearers fail `verify_bearer` with an `expired` detail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::InvalidInput`] on unknown capabilities or
+    /// issuer rejection — same contract as
+    /// [`issue_grant_bearer`](Self::issue_grant_bearer).
+    pub fn issue_grant_bearer_with_expiry(
+        &self,
+        principal: impl Into<PrincipalId>,
+        capabilities: &[&str],
+        expires_at_unix: u64,
+    ) -> Result<String> {
+        if capabilities.is_empty() {
+            return Err(IjimaError::invalid_input(
+                "grant must carry at least one capability",
+            ));
+        }
+        let entries = self.capability_entries(capabilities)?;
+        let grant = self
+            .issuer
+            .issue_grant_with_expiry(principal, &entries, expires_at_unix)
+            .map_err(|e| IjimaError::invalid_input(format!("grant issue: {e}")))?;
+        Ok(B64.encode(GrantToken::to_bytes(&grant)))
+    }
+
+    /// Policy-constrained issuance (Schubert 0.5 #20.3): signs only what
+    /// `policy` entitles this principal to carry. Fails closed — an
+    /// unknown principal or a capability outside the entitlement denies
+    /// with [`schubert::SchubertError::GrantDeniedByPolicy`] detail (no
+    /// smuggling a stronger geometry under an allowed id). `expires_at`
+    /// passes through to the issuer (`None` = never, pre-0.5 behavior).
+    ///
+    /// This is the seam `ijima token issue` builds on; the unconstrained
+    /// [`issue_grant_bearer`](Self::issue_grant_bearer) remains for test
+    /// tooling and trusted offline flows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::InvalidInput`] when the policy denies the
+    /// request, or for unknown capabilities.
+    pub fn issue_grant_bearer_under_policy(
+        &self,
+        principal: impl Into<PrincipalId>,
+        capabilities: &[&str],
+        policy: &GrantPolicy,
+        expires_at: Option<u64>,
+    ) -> Result<String> {
+        if capabilities.is_empty() {
+            return Err(IjimaError::invalid_input(
+                "grant must carry at least one capability",
+            ));
+        }
+        let entries = self.capability_entries(capabilities)?;
+        let principal = principal.into();
+        policy
+            .may_issue(&principal, &entries)
+            .map_err(|e| IjimaError::invalid_input(format!("grant denied by policy: {e}")))?;
+        let grant = match expires_at {
+            Some(at) => self.issuer.issue_grant_with_expiry(principal, &entries, at),
+            None => self.issuer.issue_grant(principal, &entries),
+        }
+        .map_err(|e| IjimaError::invalid_input(format!("grant issue: {e}")))?;
+        Ok(B64.encode(GrantToken::to_bytes(&grant)))
+    }
+
+    /// Resolves capability names to signed `(CapabilityId, partition)`
+    /// pairs via the loaded policy's partition map.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::InvalidInput`] for any name not in the
+    /// policy vocabulary.
+    fn capability_entries(&self, capabilities: &[&str]) -> Result<Vec<(CapabilityId, Vec<usize>)>> {
         let mut entries = Vec::with_capacity(capabilities.len());
         for cap in capabilities {
             let partition = self
@@ -218,11 +304,101 @@ impl IjimaAuth {
                 .ok_or_else(|| IjimaError::invalid_input(format!("unknown capability: {cap}")))?;
             entries.push((CapabilityId::new(*cap), partition));
         }
-        let grant = self
-            .issuer
-            .issue_grant(principal, &entries)
-            .map_err(|e| IjimaError::invalid_input(format!("grant issue: {e}")))?;
-        Ok(B64.encode(GrantToken::to_bytes(&grant)))
+        Ok(entries)
+    }
+
+    /// The grant verifier (exposes `verify_at` for clock-injected checks).
+    pub fn grant_verifier(&self) -> &GrantVerifier {
+        &self.grant_verifier
+    }
+
+    /// Resolves the issuance policy for `ijima token issue` (Schubert 0.5
+    /// #20.3): an explicit `--policy` path wins (unreadable = hard error
+    /// — an explicit pointer must be honored); then `$IJIMA_POLICY`
+    /// (same hard-error rule); then `$IJIMA_DIR/policy.toml` if present;
+    /// otherwise the embedded default (which seeds no principals — a
+    /// fresh install mints nothing until the operator provisions a
+    /// policy file).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::InvalidInput`] when an explicit/env policy
+    /// path cannot be read or the fallback resolution fails.
+    pub fn resolve_issuance_policy(explicit: Option<&std::path::Path>) -> Result<String> {
+        let env_path = std::env::var_os("IJIMA_POLICY").map(std::path::PathBuf::from);
+        let dir = std::env::var_os("IJIMA_DIR").map(std::path::PathBuf::from);
+        Ok(
+            resolve_policy_source(explicit, env_path.as_deref(), dir.as_deref())?
+                .unwrap_or_else(|| POLICY_TOML.to_string()),
+        )
+    }
+
+    /// Builds the [`schubert::policy::PolicyConfig`] that constrains issuance
+    /// from a resolved policy source. Two shapes are accepted:
+    ///
+    /// - **Full policy** (contains `[capabilities]`): parsed and validated
+    ///   as a complete policy. Must match the embedded partition map the
+    ///   daemon verifies with — a diverging geometry is an operator error,
+    ///   surfaced as a hard parse error.
+    /// - **Principals-only overlay** (the operator-friendly default):
+    ///   `[principals.<name>] grants = [...]` sections merged onto the
+    ///   embedded policy. Partitions always derive from the embedded
+    ///   policy, so an overlay can only *assign* existing capabilities —
+    ///   never redefine the geometry (the #20.3 anti-smuggling invariant).
+    ///   The overlay's principal map is authoritative: removing a principal
+    ///   removes their issuance entitlement (already-issued grants keep
+    ///   verifying — they are proof-carrying — until expiry or revocation).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::InvalidInput`] when neither shape parses, an
+    /// overlay carries non-principal sections, or the merged config fails
+    /// validation.
+    pub fn issuance_policy_from_source(toml_str: &str) -> Result<schubert::policy::PolicyConfig> {
+        #[derive(serde::Deserialize)]
+        struct PrincipalsOverlay {
+            #[serde(default)]
+            principals: std::collections::BTreeMap<String, schubert::policy::PrincipalConfig>,
+        }
+
+        if toml_str.contains("[capabilities") {
+            let cfg = schubert::policy::PolicyConfig::from_toml(toml_str)
+                .map_err(|e| IjimaError::invalid_input(format!("policy parse: {e}")))?;
+            cfg.validate()
+                .map_err(|e| IjimaError::invalid_input(format!("policy validate: {e}")))?;
+            return Ok(cfg);
+        }
+
+        // Overlay: principals only, on top of the embedded partitions.
+        let raw: toml::Value = toml::from_str(toml_str)
+            .map_err(|e| IjimaError::invalid_input(format!("policy overlay parse: {e}")))?;
+        // Reject documents that try to do more than assign principals: any
+        // top-level section other than `principals` is out of contract.
+        if let Some(table) = raw.as_table() {
+            for key in table.keys() {
+                if key != "principals" {
+                    return Err(IjimaError::invalid_input(format!(
+                        "policy overlay may only contain [principals.*] (found `{key}`); \
+                         a full policy must carry [capabilities] and validate as a whole"
+                    )));
+                }
+            }
+        }
+        let overlay: PrincipalsOverlay = raw
+            .try_into()
+            .map_err(|e| IjimaError::invalid_input(format!("policy overlay parse: {e}")))?;
+        if overlay.principals.is_empty() {
+            return Err(IjimaError::invalid_input(
+                "policy overlay declares no principals",
+            ));
+        }
+        let mut merged = schubert::policy::PolicyConfig::from_toml(POLICY_TOML)
+            .map_err(|e| IjimaError::invalid_input(format!("embedded policy: {e}")))?;
+        merged.principals = overlay.principals;
+        merged
+            .validate()
+            .map_err(|e| IjimaError::invalid_input(format!("policy validate: {e}")))?;
+        Ok(merged)
     }
 
     /// Convenience: issues a single-capability grant. Equivalent to
@@ -311,6 +487,41 @@ impl IjimaAuth {
     }
 }
 
+/// Pure policy-source resolution core for
+/// [`IjimaAuth::resolve_issuance_policy`]: explicit path (unreadable =
+/// hard error) → env path (same rule) → `<dir>/policy.toml` if present →
+/// `None` (caller falls back to the embedded default). Env-free so the
+/// precedence chain is testable without env mutation.
+///
+/// # Errors
+///
+/// Returns [`IjimaError::InvalidInput`] when an explicit or env policy
+/// path exists but cannot be read.
+fn resolve_policy_source(
+    explicit: Option<&std::path::Path>,
+    env_path: Option<&std::path::Path>,
+    dir: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    let read_or_err = |p: &std::path::Path, origin: &str| {
+        std::fs::read_to_string(p).map(Some).map_err(|e| {
+            IjimaError::invalid_input(format!("policy file {origin} {}: {e}", p.display()))
+        })
+    };
+    if let Some(p) = explicit {
+        return read_or_err(p, "(--policy)");
+    }
+    if let Some(p) = env_path {
+        return read_or_err(p, "($IJIMA_POLICY)");
+    }
+    if let Some(dir) = dir {
+        let candidate = dir.join("policy.toml");
+        if candidate.exists() {
+            return read_or_err(&candidate, "($IJIMA_DIR/policy.toml)");
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,6 +549,169 @@ mod tests {
             principal.granted_capabilities(),
             vec![MEMORY_READ.to_string()]
         );
+    }
+
+    // ---- Schubert 0.5: expiry ----
+
+    #[test]
+    fn expired_grant_is_rejected_with_expired_detail() {
+        let auth = fresh();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Issued with an expiry in the past — dead on arrival.
+        let bearer = auth
+            .issue_grant_bearer_with_expiry("elliott", &[MEMORY_READ], now - 1)
+            .expect("issue");
+        let err = auth.verify_bearer(&bearer).expect_err("must be dead");
+        let msg = err.to_string();
+        assert!(msg.contains("expired"), "detail should name expiry: {msg}");
+    }
+
+    #[test]
+    fn expiry_boundary_is_inclusive_at_verify_at() {
+        let auth = fresh();
+        let bearer = auth
+            .issue_grant_bearer_with_expiry("elliott", &[MEMORY_READ], 1_000_000)
+            .expect("issue");
+        let buf = B64.decode(bearer.trim()).expect("b64");
+        let grant = GrantToken::from_bytes(&buf).expect("grant");
+        // ADR-0001: dead the instant now >= expires_at.
+        assert!(auth.grant_verifier().verify_at(&grant, 999_999).is_ok());
+        let err = auth
+            .grant_verifier()
+            .verify_at(&grant, 1_000_000)
+            .expect_err("boundary is inclusive");
+        assert!(matches!(err, schubert::SchubertError::GrantExpired { .. }));
+    }
+
+    #[test]
+    fn unexpired_grant_with_expiry_still_verifies() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let auth = fresh();
+        let bearer = auth
+            .issue_grant_bearer_with_expiry("elliott", &[MEMORY_READ, MEMORY_WRITE], now + 3600)
+            .expect("issue");
+        let principal = auth.verify_bearer(&bearer).expect("valid for an hour");
+        assert!(principal.may(MEMORY_WRITE));
+    }
+
+    // ---- Schubert 0.5: policy-constrained issuance ----
+
+    fn policy_with_alice() -> schubert::policy::PolicyConfig {
+        let toml = format!(
+            "{POLICY_TOML}\n[principals.alice]\ngrants = [\"memory:read\", \"memory:write\"]\n"
+        );
+        schubert::policy::PolicyConfig::from_toml(&toml).expect("policy parses")
+    }
+
+    #[test]
+    fn under_policy_allows_entitled_request() {
+        let auth = fresh();
+        let policy =
+            schubert::crypto::GrantPolicy::from_policy(&policy_with_alice()).expect("grant policy");
+        let bearer = auth
+            .issue_grant_bearer_under_policy("alice", &[MEMORY_READ], &policy, None)
+            .expect("alice is entitled to memory:read");
+        let principal = auth.verify_bearer(&bearer).expect("verify");
+        assert_eq!(principal.principal.as_str(), "alice");
+    }
+
+    #[test]
+    fn under_policy_denies_unknown_principal() {
+        let auth = fresh();
+        let policy =
+            schubert::crypto::GrantPolicy::from_policy(&policy_with_alice()).expect("grant policy");
+        let err = auth
+            .issue_grant_bearer_under_policy("mallory", &[MEMORY_READ], &policy, None)
+            .expect_err("fails closed on unknown principals");
+        assert!(err.to_string().contains("mallory"));
+    }
+
+    #[test]
+    fn under_policy_denies_over_entitled_request() {
+        let auth = fresh();
+        let policy =
+            schubert::crypto::GrantPolicy::from_policy(&policy_with_alice()).expect("grant policy");
+        let err = auth
+            .issue_grant_bearer_under_policy("alice", &[ADMIN], &policy, None)
+            .expect_err("alice cannot smuggle admin");
+        assert!(err.to_string().contains("admin"));
+    }
+
+    #[test]
+    fn principals_only_overlay_merges_onto_embedded_partitions() {
+        let overlay = "[principals.elliott]\ngrants = [\"memory:read\", \"memory:write\"]\n";
+        let cfg = IjimaAuth::issuance_policy_from_source(overlay).expect("overlay");
+        // Partitions come from the embedded policy (anti-smuggling).
+        let read = cfg.capabilities.get(MEMORY_READ).expect("embedded cap");
+        assert!(!read.partition.is_empty());
+        // The overlay principal is entitled.
+        let grants = cfg.grants_for("elliott");
+        assert_eq!(grants.len(), 2);
+        assert!(cfg.grants_for("mallory").is_empty());
+    }
+
+    #[test]
+    fn overlay_rejects_non_principal_sections() {
+        let bad = "[principals.elliott]\ngrants = [\"memory:read\"]\n\n[grassmannian]\nk = 9\n";
+        let err = IjimaAuth::issuance_policy_from_source(bad)
+            .expect_err("overlay may not touch geometry");
+        assert!(err.to_string().contains("grassmannian"));
+    }
+
+    #[test]
+    fn overlay_with_no_principals_is_rejected() {
+        let err = IjimaAuth::issuance_policy_from_source("# nothing\n").expect_err("empty overlay");
+        assert!(err.to_string().contains("no principals"));
+    }
+
+    #[test]
+    fn policy_source_precedence_explicit_env_dir_fallback() {
+        let tmp = std::env::temp_dir().join(format!("ijima-pol-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("mkdir");
+        let explicit = tmp.join("explicit.toml");
+        let env = tmp.join("env.toml");
+        let dir_policy = tmp.join("policy.toml");
+        std::fs::write(&explicit, "# explicit").expect("w");
+        std::fs::write(&env, "# env").expect("w");
+        std::fs::write(&dir_policy, "# dir").expect("w");
+
+        // explicit wins over env and dir
+        assert_eq!(
+            resolve_policy_source(Some(&explicit), Some(&env), Some(&tmp))
+                .expect("res")
+                .as_deref(),
+            Some("# explicit")
+        );
+        // env wins over dir
+        assert_eq!(
+            resolve_policy_source(None, Some(&env), Some(&tmp))
+                .expect("res")
+                .as_deref(),
+            Some("# env")
+        );
+        // dir/policy.toml picked up when present
+        assert_eq!(
+            resolve_policy_source(None, None, Some(&tmp))
+                .expect("res")
+                .as_deref(),
+            Some("# dir")
+        );
+        // no dir policy → None (caller falls back to embedded)
+        let empty = tmp.join("empty");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        assert_eq!(
+            resolve_policy_source(None, None, Some(&empty)).expect("res"),
+            None
+        );
+        // explicit pointer at a missing file = hard error
+        let missing = tmp.join("missing.toml");
+        assert!(resolve_policy_source(Some(&missing), None, None).is_err());
     }
 
     #[test]

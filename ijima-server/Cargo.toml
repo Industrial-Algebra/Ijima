@@ -67,7 +67,7 @@ candle-nn = { version = "0.11", default-features = false, optional = true }
 candle-transformers = { version = "0.11", default-features = false, optional = true }
 tokenizers = { version = "0.21", optional = true }
 hf-hub = { version = "1.0", features = ["blocking"], optional = true }
-schubert = { version = "0.4", features = ["std", "crypto", "policy"], optional = true }
+schubert = { version = "0.5", features = ["std", "crypto", "policy"], optional = true }
 base64 = { version = "0.23", optional = true }
 surrealdb = { version = "3", default-features = false, features = ["kv-mem", "kv-surrealkv"], optional = true }
 rusqlite = { workspace = true, optional = true }
