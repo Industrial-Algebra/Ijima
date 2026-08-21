@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **NixOS support**: root `flake.nix` — `packages.x86_64-linux.ijima`
+  (built from the repo's own source on the pinned nightly toolchain the
+  release was verified on; nixpkgs' stable rustc mis-selects diskann's
+  AVX-512 VNNI intrinsic), `nixosModules.ijima` (hardened systemd service
+  module: `services.ijima.{enable,package,dataDir,bindAddress,port,user,
+  memoryMax}`), and a `module-eval` flake check that integrates the module
+  into a real NixOS evaluation. Book: new "NixOS" guide chapter.
+
 - **Knowledge-graph import** (`ijima import mempalace`): pi-mempalace
   `entities` + `triples` tables now import alongside memories — entities
   re-addressed from opaque `ent_*` hashes to Ijima's id-is-name

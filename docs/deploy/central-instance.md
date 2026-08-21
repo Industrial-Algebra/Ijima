@@ -1,9 +1,10 @@
-# Laniakea runbook — Ijima central instance
+# Central-instance runbook — Ijima
 
-Target host: **laniakea** (Ryzen 7 NAS, 64 GB RAM, 1 TB NVMe, 20 TB ZFS
-pool, tailnet-visible). This instance is the central memory brain for
-Industrial Algebra, Kellas Cat Games, Shiroyama Electric Music Company,
-and personal projects/writings.
+Target: one always-on host acting as the fleet's central memory brain
+(this example assumes a NAS-class machine with an SSD for the live store
+and bulk storage for backups). The instance serves multiple
+organizations — e.g. Industrial Algebra, Kellas Cat Games, Shiroyama
+Electric Music Company, and personal projects/writings.
 
 ## 1. Layout
 
@@ -25,7 +26,7 @@ sudo useradd --system --home /var/lib/ijima --shell /usr/sbin/nologin ijima
 sudo mkdir -p /var/lib/ijima /etc/ijima
 sudo chown -R ijima:ijima /var/lib/ijima
 
-# binary (build on laniakea — Rust toolchain via rustup)
+# binary (build on the host — Rust toolchain via rustup)
 git clone https://github.com/Industrial-Algebra/Ijima
 cd Ijima && cargo build --release --bin ijima \
   --features "http,server-auth,backend-surreal,embeddings-candle,cli,mining"
