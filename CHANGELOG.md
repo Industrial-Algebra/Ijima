@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet — v0.3.0 development begins._
+
+## [0.2.1] — 2026-08-21
+
 ### Added
 
 - **Knowledge-graph import** (`ijima import mempalace`): pi-mempalace
@@ -15,8 +19,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   temporal range (`valid_to` applied as invalidation), orphan references
   counted as `unmapped`. Client surface: `add_triple_in`,
   `invalidate_triple_in`, `import_kg`; `POST /kg/triples` honors
-  `?namespace=` (found on the first laniakea deployment: rindler's 170
-  entities / 124 triples stayed behind).
+  `?namespace=` (found on the first production deployment: a source
+  corpus's 170 entities / 124 triples stayed behind).
 - CLI import report now nests per-layer counts:
   `{ "memories": …, "knowledge": …, "unmapped": n }`.
 
@@ -25,7 +29,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Client 429 backoff**: all HTTP calls retry on `Too Many Requests`
   with exponential backoff (250 ms doubling, six attempts, ~16 s) before
   surfacing the error. Previously an import against a rate-limited daemon
-  silently counted 429'd rows as `skipped` — the first laniakea import
+  silently counted 429'd rows as `skipped` — the first production import
   lost 13,617 of 14,444 memories this way. Regression-tested E2E against
   a live rate limiter.
 - **pi extension build** (`integrations/pi`): `package.json` now points
@@ -81,8 +85,8 @@ central memory instance for the Anima ecosystem.
 - Config file layer (`ijima.toml`): defaults < file < env < CLI;
   discovery `$IJIMA_CONFIG` > `$IJIMA_DIR/ijima.toml` >
   `/etc/ijima/ijima.toml`; explicit-but-missing config = hard error.
-- `/status` version/uptime; systemd unit + example config + laniakea
-  runbook (`docs/deploy/`).
+- `/status` version/uptime; systemd unit + example config +
+  central-instance runbook (`docs/deploy/`).
 
 ### Dependencies
 - proserpina 0.3 → **proserpina-agent 0.1.0** (WS0, #68).
