@@ -39,6 +39,9 @@ client.import_memories(ns, memories).await?;          // dedup-checked bulk
 // knowledge graph
 client.add_triple(triple).await?;
 client.query_entity("amari", Some(ns)).await?;
+client.add_triple_in(ns, &import_triple).await?;  // explicit ns
+client.invalidate_triple_in(ns, triple_id).await?;
+client.import_kg(ns, triples).await?;             // bulk import
 
 // sessions & mining
 client.ingest_turn(session_id, turn).await?;
@@ -51,7 +54,13 @@ client.palace_graph(Some(ns)).await?;
 ```
 
 `import_memories` returns `ImportCounts { attempted, added, deduped,
-skipped }` — the WS2 import loop in a single call.
+skipped }` — the WS2 import loop in a single call. `import_kg` returns
+`KgImportCounts { attempted, added, skipped }` and applies each triple's
+`valid_to` as a post-add invalidation.
+
+All HTTP calls are retried on `429 Too Many Requests` with exponential
+backoff (250 ms doubling, six attempts, ~16 s total) before the error
+surfaces — a rate-limited daemon slows imports down, never drops rows.
 
 ## Errors
 

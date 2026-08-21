@@ -24,8 +24,8 @@ ijima import zeroclaw --db ~/zeroclaw/brain.db --source "zeroclaw-archive"
 
 ## What the importer does
 
-1. **Reads** the source rows (memories; pi-mempalace knowledge-graph rows
-   arrive as triples).
+1. **Reads** the source rows (memories; pi-mempalace corpora also carry
+   `entities` + `triples` knowledge-graph tables — see step 5).
 2. **Retags provenance**: `origin = <source>`, trust tier **dropped to
    `AutoCapture`** regardless of original classification. Harness
    provenance is preserved (`Pi` for mempalace, `Other` for ZeroClaw).
@@ -35,11 +35,24 @@ ijima import zeroclaw --db ~/zeroclaw/brain.db --source "zeroclaw-archive"
 4. **Dedups**: every memory is pre-checked via `POST /memories/check`
    (content-hash) before storing. The same memory saved on two
    workstations stores once per source namespace; re-running an import
-   is idempotent.
-5. **Reports** per source:
+   is idempotent. If the daemon rate-limits the import (HTTP 429) the
+   client backs off exponentially (250 ms doubling, ~16 s budget) and
+   retries — rate limiting never drops rows.
+5. **Imports the knowledge graph** (pi-mempalace sources only):
+   entities are re-addressed from opaque `ent_*` hashes to Ijima's
+   id-is-name convention (same-name source entities merge), and each
+   triple is added with its confidence + temporal range — a source
+   `valid_to` is applied as an invalidation so historical facts stay
+   historical. Triples referencing unknown entities are counted as
+   `unmapped`, never imported.
+6. **Reports** per source:
 
 ```json
-{ "attempted": 1284, "added": 1190, "deduped": 91, "skipped": 3 }
+{
+  "memories":  { "attempted": 14459, "added": 14459, "deduped": 0, "skipped": 0 },
+  "knowledge": { "attempted": 124, "added": 124, "skipped": 0 },
+  "unmapped": 0
+}
 ```
 
 `skipped` counts per-row failures — one bad row never aborts the run.
