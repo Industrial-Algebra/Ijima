@@ -6,8 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Everything since v0.1.0 — the v0.2.0 "Central Brain" arc: consolidation,
-hardening, and the deployment surface.
+_Nothing yet — v0.3.0 development begins._
+
+## [0.2.0] — 2026-08-21
+
+The "Central Brain" release: consolidation, hardening, and the
+deployment surface — everything needed to run Ijima as the single
+central memory instance for the Anima ecosystem.
 
 ### Auth (Schubert)
 - **GrantToken migration** (#63): multi-capability, partition-signed
