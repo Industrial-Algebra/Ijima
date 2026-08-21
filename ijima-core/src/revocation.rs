@@ -25,11 +25,13 @@
 //! deprovisioning; revocation handles incidents. See
 //! `docs/adr/token-revocation.md`.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// A revoked grant token, identified by the SHA-256 hex of its bearer
 /// string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TokenRevocation {
     /// SHA-256 hex digest of the revoked bearer token (primary key).
     pub token_hash: String,
