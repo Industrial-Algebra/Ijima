@@ -13,6 +13,44 @@ use async_trait::async_trait;
 
 use crate::{NamespaceId, Result};
 
+/// A knowledge-graph triple prepared for bulk import — the wire shape
+/// shared by `ijima import` (source dbs) and the HTTP client
+/// (`import_kg`). Subject/object are entity **names** (Ijima's
+/// id-is-name convention); `valid_to` is applied as a post-add
+/// invalidation when present.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ImportTriple {
+    /// Subject entity **name** (becomes the `EntityId`).
+    pub subject: String,
+    /// The relationship verb (e.g. `depends_on`).
+    pub predicate: String,
+    /// Object entity **name** (becomes the `EntityId`).
+    pub object: String,
+    /// When the fact became true (ISO date), if known.
+    pub valid_from: Option<String>,
+    /// When the fact stopped being true; applied as a post-add
+    /// invalidation on import.
+    pub valid_to: Option<String>,
+    /// Source confidence `[0, 1]`.
+    pub confidence: f32,
+    /// The memory that evidenced the fact, if any.
+    pub source_memory_id: Option<String>,
+}
+
+/// Aggregate counts reported by a knowledge-graph import run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct KgImportCounts {
+    /// Triples read from the source.
+    pub attempted: usize,
+    /// Successfully added (including invalidations for historical
+    /// ranges).
+    pub added: usize,
+    /// Not added — transport or store failure per-triple.
+    pub skipped: usize,
+}
+
 /// Stable opaque identifier for an entity (node).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
