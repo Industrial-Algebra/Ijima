@@ -55,8 +55,8 @@
 
 use ijima_core::harness::Harness;
 use ijima_core::{
-    DiaryEntry, IjimaError, Memory, PalaceGraph, ProjectTaxon, Result, Room, Session, SessionTurn,
-    TunnelTraversal,
+    DiaryEntry, IjimaError, ImportTriple, KgImportCounts, Memory, PalaceGraph, ProjectTaxon,
+    Result, Room, Session, SessionTurn, Triple, TunnelTraversal,
 };
 use serde::Deserialize;
 
@@ -287,6 +287,101 @@ impl Client {
                 Err(e) => {
                     if std::env::var("IJIMA_DEBUG").is_ok() {
                         eprintln!("ijima: import check failed: {e}");
+                    }
+                    counts.skipped += 1;
+                }
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Adds a knowledge-graph triple into a specific namespace
+    /// (`POST /kg/triples?namespace=<ns>`). Subject/object are entity names
+    /// (Ijima's id-is-name convention); entities are created idempotently.
+    /// Requires a `knowledge:write` grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn add_triple_in(&self, namespace: &str, triple: &ImportTriple) -> Result<Triple> {
+        #[derive(serde::Serialize)]
+        struct AddRequest<'a> {
+            subject: &'a str,
+            predicate: &'a str,
+            object: &'a str,
+            valid_from: Option<&'a str>,
+            confidence: f32,
+            source_memory_id: Option<&'a str>,
+        }
+        let req = AddRequest {
+            subject: &triple.subject,
+            predicate: &triple.predicate,
+            object: &triple.object,
+            valid_from: triple.valid_from.as_deref(),
+            confidence: triple.confidence,
+            source_memory_id: triple.source_memory_id.as_deref(),
+        };
+        let resp = self
+            .post(&build_path("/kg/triples", Some(namespace), None), &req)
+            .await?;
+        decode(ok_status(resp).await?).await
+    }
+
+    /// Invalidates a triple in a specific namespace
+    /// (`POST /kg/triples/{id}/invalidate?namespace=<ns>`) — sets `valid_to`,
+    /// marking the fact no longer current. Idempotent. Requires a
+    /// `knowledge:write` grant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure.
+    #[cfg(feature = "remote")]
+    pub async fn invalidate_triple_in(&self, namespace: &str, triple_id: &str) -> Result<()> {
+        let path = build_path(
+            &format!("/kg/triples/{triple_id}/invalidate"),
+            Some(namespace),
+            None,
+        );
+        let resp = self.post(&path, &serde_json::json!({})).await?;
+        ok_status(resp).await?;
+        Ok(())
+    }
+
+    /// Bulk knowledge-graph import into `namespace`: each triple is added
+    /// via [`Self::add_triple_in`] and, when the source carried a
+    /// `valid_to`, invalidated so the historical range is preserved.
+    /// Per-triple failures are counted as `skipped` — one bad edge never
+    /// aborts the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when a request could not be sent; all
+    /// per-triple outcomes land in the counts.
+    #[cfg(feature = "remote")]
+    pub async fn import_kg(
+        &self,
+        namespace: &str,
+        triples: Vec<ImportTriple>,
+    ) -> Result<KgImportCounts> {
+        let mut counts = KgImportCounts {
+            attempted: triples.len(),
+            ..Default::default()
+        };
+        for triple in triples {
+            let result = async {
+                let created = self.add_triple_in(namespace, &triple).await?;
+                if triple.valid_to.is_some() {
+                    self.invalidate_triple_in(namespace, &created.id).await?;
+                }
+                Ok::<(), IjimaError>(())
+            }
+            .await;
+            match result {
+                Ok(()) => counts.added += 1,
+                Err(e) => {
+                    if std::env::var("IJIMA_DEBUG").is_ok() {
+                        eprintln!("ijima: kg import failed: {e}");
                     }
                     counts.skipped += 1;
                 }
@@ -623,26 +718,50 @@ impl Client {
 
     #[cfg(feature = "remote")]
     async fn get(&self, path: &str) -> Result<reqwest::Response> {
-        self.add_auth(self.http.get(self.url(path)))
-            .send()
+        self.send_with_retry(self.add_auth(self.http.get(self.url(path))))
             .await
-            .map_err(transport)
     }
 
     #[cfg(feature = "remote")]
     async fn delete(&self, path: &str) -> Result<reqwest::Response> {
-        self.add_auth(self.http.delete(self.url(path)))
-            .send()
+        self.send_with_retry(self.add_auth(self.http.delete(self.url(path))))
             .await
-            .map_err(transport)
     }
 
     #[cfg(feature = "remote")]
     async fn post<T: serde::Serialize>(&self, path: &str, body: &T) -> Result<reqwest::Response> {
-        self.add_auth(self.http.post(self.url(path)).json(body))
-            .send()
+        self.send_with_retry(self.add_auth(self.http.post(self.url(path)).json(body)))
             .await
-            .map_err(transport)
+    }
+
+    /// Sends a request, retrying with exponential backoff when the server
+    /// answers `429 Too Many Requests` (the daemon's rate limiter — see a
+    /// production import incident where 13k rows were silently skipped).
+    /// Backoff: 250ms · 500ms · 1s · 2s · 4s · 8s (≈16s total) before the
+    /// final response is surfaced to the caller.
+    #[cfg(feature = "remote")]
+    async fn send_with_retry(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            // `try_clone` buffers the request so it can be re-sent;
+            // `None` means a streaming body (never built by this
+            // client) — send it once without retry.
+            let resp = match req.try_clone() {
+                Some(sendable) => sendable.send().await.map_err(transport)?,
+                None => return req.send().await.map_err(transport),
+            };
+            if resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Ok(resp);
+            }
+            match retry_delay_ms(attempt) {
+                Some(ms) => {
+                    tracing::debug!(attempt, ms, "rate limited; backing off");
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    attempt += 1;
+                }
+                None => return Ok(resp),
+            }
+        }
     }
 }
 
@@ -658,6 +777,19 @@ async fn ok_status(resp: reqwest::Response) -> Result<reqwest::Response> {
         })
     }
 }
+
+/// Backoff schedule for a rate-limited (`429`) attempt: 250ms doubling
+/// per attempt, capped after [`MAX_RETRY_ATTEMPTS`] retries. `None` means
+/// stop retrying.
+pub fn retry_delay_ms(attempt: u32) -> Option<u64> {
+    if attempt >= MAX_RETRY_ATTEMPTS {
+        return None;
+    }
+    Some(250 * (1u64 << attempt))
+}
+
+/// Maximum number of backoff retries per request.
+pub const MAX_RETRY_ATTEMPTS: u32 = 6;
 
 #[cfg(feature = "remote")]
 async fn decode<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T> {
@@ -718,6 +850,32 @@ fn build_path3(
 mod tests {
     use super::*;
     use ijima_core::MemoryId;
+
+    #[test]
+    fn retry_backoff_doubles_then_stops() {
+        // 250ms doubling: 250, 500, 1000, 2000, 4000, 8000 — then None.
+        assert_eq!(retry_delay_ms(0), Some(250));
+        assert_eq!(retry_delay_ms(1), Some(500));
+        assert_eq!(retry_delay_ms(2), Some(1000));
+        assert_eq!(retry_delay_ms(3), Some(2000));
+        assert_eq!(retry_delay_ms(4), Some(4000));
+        assert_eq!(retry_delay_ms(5), Some(8000));
+        assert_eq!(retry_delay_ms(6), None);
+        assert_eq!(retry_delay_ms(99), None);
+    }
+
+    #[test]
+    fn kg_import_counts_default_and_serialize() {
+        let c = KgImportCounts::default();
+        assert_eq!((c.attempted, c.added, c.skipped), (0, 0, 0));
+        let c = KgImportCounts {
+            attempted: 4,
+            added: 3,
+            skipped: 1,
+        };
+        let json = serde_json::to_string(&c).expect("serde");
+        assert_eq!(json, r#"{"attempted":4,"added":3,"skipped":1}"#);
+    }
 
     #[test]
     fn import_counts_default_to_zero_and_serialize() {

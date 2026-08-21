@@ -7,7 +7,8 @@ Status: Accepted (WS1b of `docs/plans/2026-08-10-v0.2.0-central-brain.md`)
 
 Schubert `GrantToken`s are stateless Ed25519 signatures: a bearer is
 cryptographically valid for as long as the issuer key exists. On a
-single-workstation test daemon that is acceptable. On **laniakea** — a
+single-workstation test daemon that is acceptable. On the **central
+instance** — a
 long-lived, multi-principal, tailnet-exposed central instance — it is
 not: a bearer leaked into a CI log, a dotfile, or a backup must be
 killable *now*, not at the next issuer-key rotation (which invalidates
@@ -52,7 +53,7 @@ A store-backed **revocation list** checked at verify time:
   before its TTL.
 - **Issuer-key rotation as the kill-switch**: the nuclear option — kills
   *every* grant at once. Retained as the documented emergency lever for
-  compromise-of-the-key (as opposed to leak-of-a-token), per the laniakea
+  compromise-of-the-key (as opposed to leak-of-a-token), per the central-instance
   runbook.
 - ** denying at the extractor only (not `verify_bearer`)**: would leave
   non-HTTP verifiers (future satellite sync paths) unguarded.

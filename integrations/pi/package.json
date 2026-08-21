@@ -1,8 +1,19 @@
 {
   "name": "ijima-pi",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
-  "description": "Ijima memory service pi integration — wasm core + thin TS shim",
-  "license": "Apache-2.0"
+  "description": "Ijima memory service pi integration \u2014 wasm core + thin TS shim",
+  "license": "Apache-2.0",
+  "main": "./index.js",
+  "files": [
+    "index.js",
+    "index.ts",
+    "pkg/",
+    "package.json"
+  ],
+  "scripts": {
+    "build:wasm": "wasm-pack build ../../ijima-pi --target nodejs --out-dir ../integrations/pi/pkg --out-name ijima_pi",
+    "build": "npm run build:wasm && tsc index.ts --module nodenext --moduleResolution nodenext --target es2022 --skipLibCheck --esModuleInterop"
+  }
 }

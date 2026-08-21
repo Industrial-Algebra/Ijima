@@ -805,12 +805,13 @@ async fn add_triple(
     principal: AuthPrincipal,
     Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
     Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
     Json(req): Json<AddTripleRequest>,
 ) -> Result<Json<ijima_core::Triple>, ApiError> {
     if !principal.0.may(ijima_core::capabilities::KNOWLEDGE_WRITE) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, store.as_ref(), None).await?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let triple = kg
         .add_triple(
             &ns,
@@ -2542,6 +2543,133 @@ mod tests {
         assert_eq!(body["doctrine"].as_array().unwrap().len(), 1);
         assert_eq!(body["doctrine"][0]["content"], "doctrine baseline");
         assert_eq!(body["doctrine"][0]["source"], "Doctrine");
+    }
+
+    #[cfg(feature = "rate-limit")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn import_memories_backs_off_through_rate_limit() {
+        // Regression (production, 2026-08-21): the first 14k-row import lost
+        // 13.6k memories because 429s were counted as skips. The client now
+        // retries with backoff, so the same import completes — slowly —
+        // through a tiny rate bucket. Real socket, real client.
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app(
+            auth.clone(),
+            store,
+            kg,
+            None,
+            Arc::new(crate::redaction::Redactor::new()),
+            Some(crate::rate_limit::make_rate_limiter(1.0, 1.0)),
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // One multi-capability grant: check (read) + store (write).
+        let token = auth
+            .issue_grant_bearer("elliott", &[MEMORY_READ, MEMORY_WRITE])
+            .expect("issue");
+        let client = ijima_client::Client::new(
+            ijima_client::ClientConfig::new(format!("http://{addr}"), Harness::Pi)
+                .with_token(token),
+        );
+        let ns = format!("ns_import_ratelimit_{}", std::process::id());
+        let memories: Vec<Memory> = (0..5)
+            .map(|i| Memory {
+                id: MemoryId(format!("mem_backoff_{i}")),
+                content: format!("backoff corpus row {i} for rate-limit regression"),
+                project: "ijima".into(),
+                topic: "test".into(),
+                source: ijima_core::memory::MemorySource::AutoCapture,
+                harness: Harness::Pi,
+                session_id: None,
+                origin: ijima_core::InstanceId::local(),
+                authority: ijima_core::AuthorityScope::local(),
+                importance: 0.5,
+                created_at: "0".into(),
+            })
+            .collect();
+        let counts = client.import_memories(&ns, memories).await.expect("import");
+        assert_eq!(counts.attempted, 5);
+        assert_eq!(counts.added, 5, "no memory may be lost to 429s");
+        assert_eq!(counts.skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn knowledge_graph_add_honors_namespace_param() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", "knowledge:write");
+        let read = bearer(&auth, "elliott", "knowledge:read");
+
+        // Add a triple into the open staging namespace via ?namespace=.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/kg/triples?namespace=ns_import_stage")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "subject": "Ijima",
+                            "predicate": "depends_on",
+                            "object": "Schubert",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Default (personal) namespace stays empty …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/kg/stats")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let personal: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(personal["triples"], 0);
+
+        // … and the staging namespace reports the edge.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/kg/stats?namespace=ns_import_stage")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let staged: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(staged["triples"], 1);
     }
 
     #[tokio::test]

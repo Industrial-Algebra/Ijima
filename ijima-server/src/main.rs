@@ -754,8 +754,8 @@ async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
 /// `ns_import_<source>` (or `--namespace`).
 async fn run_import(args: ImportArgs) -> ijima_core::Result<()> {
     use ijima_server::migration::{
-        default_import_ns, map_pipalace_memory, map_zeroclaw_memory, read_pipalace_memories,
-        read_zeroclaw_memories, retag_imported,
+        default_import_ns, map_pipalace_kg, map_pipalace_memory, map_zeroclaw_memory,
+        read_pipalace_kg, read_pipalace_memories, read_zeroclaw_memories, retag_imported,
     };
 
     let url = args
@@ -804,9 +804,38 @@ async fn run_import(args: ImportArgs) -> ijima_core::Result<()> {
         "ijima: import `{}` complete — {} added, {} deduped, {} skipped (of {} attempted)",
         args.source, counts.added, counts.deduped, counts.skipped, counts.attempted
     );
+
+    // Knowledge graph (pi-mempalace corpora only — ZeroClaw predated the
+    // KG). Entities are re-addressed from opaque `ent_*` ids to Ijima's
+    // id-is-name convention; triples with unmappable references are
+    // counted as unmapped, not imported.
+    let mut kg_counts = ijima_core::KgImportCounts::default();
+    let mut kg_unmapped = 0usize;
+    if matches!(args.kind, ImportKind::Mempalace) {
+        let (entities, triples) = read_pipalace_kg(&args.db.to_string_lossy())?;
+        let kg = map_pipalace_kg(&entities, &triples);
+        kg_unmapped = kg.unmapped;
+        eprintln!(
+            "ijima: importing knowledge graph — {} triples ({} unmapped) from {} entities…",
+            kg.triples.len(),
+            kg.unmapped,
+            entities.len()
+        );
+        kg_counts = client.import_kg(&ns, kg.triples).await?;
+        eprintln!(
+            "ijima: kg import complete — {} added, {} skipped (of {} attempted)",
+            kg_counts.added, kg_counts.skipped, kg_counts.attempted
+        );
+    }
+
     println!(
         "{}",
-        serde_json::to_string_pretty(&counts).unwrap_or_default()
+        serde_json::to_string_pretty(&serde_json::json!({
+            "memories": counts,
+            "knowledge": kg_counts,
+            "unmapped": kg_unmapped,
+        }))
+        .unwrap_or_default()
     );
     Ok(())
 }

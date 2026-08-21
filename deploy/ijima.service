@@ -1,4 +1,4 @@
-# Ijima daemon — systemd unit for the laniakea central instance.
+# Ijima daemon — systemd unit for a central instance.
 #
 # Install:
 #   sudo cp deploy/ijima.service /etc/systemd/system/

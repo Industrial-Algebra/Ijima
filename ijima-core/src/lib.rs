@@ -64,7 +64,9 @@ pub use capabilities::intersection_number;
 pub use diary::DiaryEntry;
 pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
 pub use error::IjimaError;
-pub use knowledge::{Entity, EntityId, EntityRecord, KgStats, KnowledgeGraph, Triple};
+pub use knowledge::{
+    Entity, EntityId, EntityRecord, ImportTriple, KgImportCounts, KgStats, KnowledgeGraph, Triple,
+};
 pub use memory::{Memory, MemoryId, MemorySource};
 pub use mining::{AcceptedExtraction, QueuedExtraction};
 pub use namespace::{Namespace, NamespaceId, NamespaceKind, NamespaceMembership};
