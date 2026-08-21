@@ -37,8 +37,10 @@ pub struct AuthPrincipal(pub AuthenticatedPrincipal);
 /// exhausted, [`AuthRejection::RateLimited`] maps to HTTP 429.
 #[derive(Debug)]
 pub enum AuthRejection {
-    /// Authentication failed (missing/invalid token).
-    Unauthorized(&'static str),
+    /// Authentication failed (missing/invalid token). Owned string so the
+    /// verify path can carry its detail (expired vs revoked vs forged —
+    /// the ADR-0001 composition rule: which check fired is telemetry).
+    Unauthorized(String),
     /// Rate limit exceeded (Schubert `RateLimitExceeded`).
     #[cfg(feature = "rate-limit")]
     RateLimited,
@@ -69,21 +71,28 @@ where
         let Extension(auth): Extension<Arc<IjimaAuth>> =
             Extension::from_request_parts(parts, _state)
                 .await
-                .map_err(|_| AuthRejection::Unauthorized("auth state not installed"))?;
+                .map_err(|_| AuthRejection::Unauthorized("auth state not installed".into()))?;
 
         let header = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
-            .ok_or(AuthRejection::Unauthorized("missing Authorization header"))?;
+            .ok_or(AuthRejection::Unauthorized(
+                "missing Authorization header".into(),
+            ))?;
 
         let token = header
             .strip_prefix("Bearer ")
-            .ok_or(AuthRejection::Unauthorized("expected 'Bearer <token>'"))?;
+            .ok_or(AuthRejection::Unauthorized(
+                "expected 'Bearer <token>'".into(),
+            ))?;
 
-        let principal = auth
-            .verify_bearer(token)
-            .map_err(|_| AuthRejection::Unauthorized("invalid capability token"))?;
+        let principal = auth.verify_bearer(token).map_err(|e| {
+            // Surface the reason ("token revoked", "grant verify: grant
+            // expired …", decode failures) instead of a blanket message —
+            // operators must distinguish deprovisioning from forgery.
+            AuthRejection::Unauthorized(e.to_string())
+        })?;
 
         // Schubert rate limiting: if a RateLimitState extension is
         // installed, consume one token. The capability token drives
@@ -127,7 +136,7 @@ mod tests {
             .await
             .expect("must extract");
         assert_eq!(got.0.principal.as_str(), "elliott");
-        assert_eq!(got.0.capability, MEMORY_READ);
+        assert!(got.0.may(MEMORY_READ));
     }
 
     #[tokio::test]

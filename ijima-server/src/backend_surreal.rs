@@ -30,9 +30,9 @@ use async_trait::async_trait;
 use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
     IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
-    PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room, SearchHit, Session,
-    SessionId, SessionTurn, Store, StoreStats, Triple, Tunnel, TunnelTraversal,
-    embeddings::Embedder, harness::Harness, memory::MemorySource,
+    NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room,
+    SearchHit, Session, SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel,
+    TunnelTraversal, embeddings::Embedder, harness::Harness, memory::MemorySource,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -47,6 +47,8 @@ const TURNS_TABLE: &str = "session_turns";
 const SESSIONS_TABLE: &str = "sessions";
 const DIARY_TABLE: &str = "diaries";
 const QUEUE_TABLE: &str = "mining_queue";
+const REVOCATIONS_TABLE: &str = "token_revocations";
+const NAMESPACE_MEMBERS_TABLE: &str = "namespace_members";
 /// Entity nodes (knowledge-graph).
 const ENTITIES_TABLE: &str = "entities";
 /// Triple edges (knowledge-graph).
@@ -86,6 +88,15 @@ impl SurrealStore {
     /// Opens a **persistent** store (the `SurrealKv` engine) at `path`,
     /// with no embedder. Data survives restart. Creates the directory if
     /// absent.
+    ///
+    /// # Locking (surrealdb 3)
+    ///
+    /// The engine holds a directory `LOCK` file while open. Dropping the
+    /// store handle does not release it synchronously — the datastore's
+    /// background tasks must wind down first (a task boundary + yield).
+    /// Cross-process restarts are unaffected (the OS releases the lock at
+    /// process exit); same-process sequential reopens of the same path
+    /// need the spawn-and-yield pattern (see the persistence test).
     ///
     /// # Errors
     ///
@@ -132,7 +143,24 @@ impl SurrealStore {
     /// every query filters on: `namespace` (all scoped reads),
     /// `(namespace, content_hash)` (dedup), `(namespace, session_id)`
     /// (session turns), and the knowledge-graph traversal keys.
+    ///
+    /// The `DEFINE TABLE` statements matter on surrealdb 3: `SELECT FROM
+    /// <table>` on a table that has never been written is a hard error
+    /// (v2 returned an empty set). Boot-time reads — revocation
+    /// hydration, `/status` counts — hit fresh databases, so every table
+    /// is defined up front (schemaless, `IF NOT EXISTS` idempotent).
     const INDEX_DDL: &str = r#"
+        DEFINE TABLE IF NOT EXISTS memories          SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS session_turns     SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS sessions          SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS diaries           SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS mining_queue      SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS entities          SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS triples           SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS token_revocations SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS namespace_members SCHEMALESS;
+        DEFINE INDEX IF NOT EXISTS nmem_ns      ON TABLE namespace_members FIELDS namespace;
+        DEFINE INDEX IF NOT EXISTS nmem_ns_princ ON TABLE namespace_members FIELDS namespace, principal;
         DEFINE INDEX IF NOT EXISTS mem_ns        ON TABLE memories       FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS mem_ns_hash   ON TABLE memories       FIELDS namespace, content_hash;
         DEFINE INDEX IF NOT EXISTS turns_ns_sess ON TABLE session_turns   FIELDS namespace, session_id;
@@ -151,7 +179,7 @@ impl SurrealStore {
         &self,
         ns: &NamespaceId,
     ) -> Result<std::collections::BTreeMap<(String, String), usize>> {
-        #[derive(Deserialize)]
+        #[derive(serde::Serialize, Deserialize)]
         struct Row {
             project: String,
             topic: String,
@@ -164,7 +192,7 @@ impl SurrealStore {
             .bind(("ns", ns.as_str().to_string()))
             .await
             .map_err(store_err)?;
-        let rows: Vec<Row> = result.take(0).map_err(store_err)?;
+        let rows = take_vec::<Row>(&mut result)?;
         let mut counts = std::collections::BTreeMap::new();
         for r in rows {
             *counts.entry((r.project, r.topic)).or_insert(0) += 1;
@@ -184,7 +212,8 @@ impl SurrealStore {
         let mut result = self
             .db
             .query(format!(
-                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace, importance, created_at
+                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
+                        origin, authority, importance, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND project = $proj AND topic = $topic
                  ORDER BY importance DESC, created_at DESC LIMIT $lim"
@@ -195,7 +224,7 @@ impl SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
+        let records = take_vec::<MemoryRecord>(&mut result)?;
         Ok(records.into_iter().map(|r| r.into_memory()).collect())
     }
 
@@ -233,6 +262,23 @@ async fn new_surrealkv(path: impl AsRef<std::path::Path>) -> Result<Surreal<Db>>
         .map_err(|e| IjimaError::Store {
             detail: format!("surrealdb surrealkv init at {}: {e}", path.display()),
         })
+}
+
+// ---------- surrealdb 3.x serde bridge ----------
+// surrealdb 3's `take`/`content` are typed over `SurrealValue`. Our wire
+// records embed ijima-core provenance types (MemorySource, Harness,
+// InstanceId…) that are serde-only — implementing SurrealValue for them
+// would drag a surrealdb dependency into ijima-core. `SerdeWrapper` is
+// the SDK's official bridge for exactly this case ("types where an
+// implementation of SurrealValue isn't available or practical").
+
+/// Takes query result row 0 as `Vec<T>` through the serde bridge.
+fn take_vec<T>(result: &mut surrealdb::IndexedResults) -> Result<Vec<T>>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + 'static,
+{
+    let wrapped: Vec<surrealdb::types::SerdeWrapper<T>> = result.take(0).map_err(store_err)?;
+    Ok(wrapped.into_iter().map(|w| w.0).collect())
 }
 
 // ---------- wire records ----------
@@ -520,6 +566,15 @@ fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
     Ok(Some(embedder.embed(text)?.0))
 }
 
+/// Surreal record key for a memory: `<namespace>:<memory-id>`. Record
+/// ids are global per table in SurrealDB, so the namespace must be part
+/// of the key — otherwise the same logical id (e.g. the same pi-mempalace
+/// row imported from two workstations, WS2) collides across namespaces.
+/// The logical id stays in `memory_id` for wire responses.
+fn memory_key(ns: &NamespaceId, id: &MemoryId) -> String {
+    format!("{}:{}", ns.as_str(), id.0)
+}
+
 #[async_trait]
 impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
@@ -542,12 +597,11 @@ impl Store for SurrealStore {
             }
             None => (None, None),
         };
-        let id_str = memory.id.0.clone();
         let record = MemoryRecord::from_memory(&memory, ns, embedding, embed_model);
-        let _: Option<MemoryRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
             .db
-            .create((MEMORIES_TABLE, id_str.clone()))
-            .content(record)
+            .create((MEMORIES_TABLE, memory_key(ns, &memory.id)))
+            .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
         Ok(memory.id)
@@ -566,34 +620,29 @@ impl Store for SurrealStore {
             .bind(("hash", hash))
             .await
             .map_err(store_err)?;
-        #[derive(Deserialize)]
+        #[derive(serde::Serialize, Deserialize)]
         struct IdRow {
             memory_id: String,
         }
-        let rows: Vec<IdRow> = result.take(0).map_err(store_err)?;
+        let rows = take_vec::<IdRow>(&mut result)?;
         Ok(rows.into_iter().next().map(|r| MemoryId(r.memory_id)))
     }
 
     async fn recall_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<Option<Memory>> {
-        let record: Option<MemoryRecord> = self
+        let record: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
             .db
-            .select((MEMORIES_TABLE, id.0.clone()))
+            .select((MEMORIES_TABLE, memory_key(ns, id)))
             .await
             .map_err(store_err)?;
-        Ok(record
-            .filter(|r| r.namespace == ns.as_str())
-            .map(|r| r.into_memory()))
+        Ok(record.map(|w| w.0.into_memory()))
     }
 
     async fn delete_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<()> {
-        // Verify ownership before deleting (isolation).
-        let existing = self.recall_memory(ns, id).await?;
-        if existing.is_none() {
-            return Ok(()); // absent or wrong namespace — nothing to delete
-        }
-        let _: Option<MemoryRecord> = self
+        // The namespaced record key is unique, so delete is naturally
+        // isolated (no-op when the record is absent).
+        let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
             .db
-            .delete((MEMORIES_TABLE, id.0.clone()))
+            .delete((MEMORIES_TABLE, memory_key(ns, id)))
             .await
             .map_err(store_err)?;
         Ok(())
@@ -603,7 +652,8 @@ impl Store for SurrealStore {
         let mut result = self
             .db
             .query(format!(
-                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace, importance, created_at
+                "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
+                        origin, authority, importance, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns
                  ORDER BY importance DESC, created_at DESC
@@ -613,14 +663,14 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let records: Vec<MemoryRecord> = result.take(0).map_err(store_err)?;
+        let records = take_vec::<MemoryRecord>(&mut result)?;
         Ok(records.into_iter().map(|r| r.into_memory()).collect())
     }
 
     async fn store_stats(&self) -> Result<StoreStats> {
         // One query for all namespaces; aggregate in Rust (avoids
         // SurrealDB aggregate-function ambiguity, fine at v0 scale).
-        #[derive(Deserialize)]
+        #[derive(serde::Serialize, Deserialize)]
         struct NsRow {
             namespace: String,
         }
@@ -629,7 +679,7 @@ impl Store for SurrealStore {
             .query(format!("SELECT namespace FROM {MEMORIES_TABLE}"))
             .await
             .map_err(store_err)?;
-        let rows: Vec<NsRow> = result.take(0).map_err(store_err)?;
+        let rows = take_vec::<NsRow>(&mut result)?;
         let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         for r in &rows {
@@ -796,13 +846,13 @@ impl Store for SurrealStore {
             .map_err(store_err)?;
         // Deserialize each row as a MemoryRecord (missing fields default)
         // flattened alongside the computed `score`.
-        #[derive(Deserialize)]
+        #[derive(serde::Serialize, Deserialize)]
         struct ScoredRecord {
             #[serde(flatten)]
             rec: MemoryRecord,
             score: f64,
         }
-        let rows: Vec<ScoredRecord> = result.take(0).map_err(store_err)?;
+        let rows = take_vec::<ScoredRecord>(&mut result)?;
         Ok(rows
             .into_iter()
             .map(|r| SearchHit {
@@ -821,10 +871,10 @@ impl Store for SurrealStore {
             timestamp: turn.timestamp,
             namespace: ns.as_str().to_string(),
         };
-        let _: Option<SessionTurnRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<SessionTurnRecord>> = self
             .db
             .create(TURNS_TABLE)
-            .content(record)
+            .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
         Ok(())
@@ -849,7 +899,7 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let mut records: Vec<SessionTurnRecord> = result.take(0).map_err(store_err)?;
+        let mut records = take_vec::<SessionTurnRecord>(&mut result)?;
         records.reverse(); // query was DESC for "last N"; return chronological
         Ok(records
             .into_iter()
@@ -868,10 +918,10 @@ impl Store for SurrealStore {
         let record = SessionRecord::from_session(&session, ns);
         // Upsert: create if absent, replace metadata if present. Session
         // ids are globally unique (same convention as memory ids).
-        let _: Option<SessionRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<SessionRecord>> = self
             .db
             .upsert((SESSIONS_TABLE, id_str.clone()))
-            .content(record)
+            .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
         Ok(session.id)
@@ -902,7 +952,7 @@ impl Store for SurrealStore {
         }
         let res = q.await.map_err(store_err)?;
         let mut res = res;
-        let rows: Vec<SessionRecord> = res.take(0).map_err(store_err)?;
+        let rows = take_vec::<SessionRecord>(&mut res)?;
         Ok(rows.into_iter().map(SessionRecord::into_session).collect())
     }
 
@@ -938,10 +988,10 @@ impl Store for SurrealStore {
         let now_ms = now_millis();
         let queue_id = format!("q_{}_{now_ms}", memory.id.0);
         let record = QueueRecord::from_extraction(&queue_id, &memory, confidence, ns, now_ms);
-        let _: Option<QueueRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<QueueRecord>> = self
             .db
             .create((QUEUE_TABLE, queue_id.clone()))
-            .content(record)
+            .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
         Ok(queue_id)
@@ -960,7 +1010,7 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let records: Vec<QueueRecord> = result.take(0).map_err(store_err)?;
+        let records = take_vec::<QueueRecord>(&mut result)?;
         Ok(records.into_iter().map(QueueRecord::into_queued).collect())
     }
 
@@ -982,7 +1032,7 @@ impl Store for SurrealStore {
             .bind(("qid", queue_id.to_string()))
             .await
             .map_err(store_err)?;
-        let records: Vec<QueueRecord> = result.take(0).map_err(store_err)?;
+        let records = take_vec::<QueueRecord>(&mut result)?;
         let Some(record) = records.into_iter().next() else {
             return Err(IjimaError::not_found(format!("queue entry {queue_id}")));
         };
@@ -990,7 +1040,7 @@ impl Store for SurrealStore {
         let memory_id = memory.id.clone();
         // store_memory does content-hash dedup; a duplicate promote is a no-op.
         self.store_memory(ns, memory).await?;
-        let _: Option<QueueRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<QueueRecord>> = self
             .db
             .delete((QUEUE_TABLE, queue_id.to_string()))
             .await
@@ -1018,10 +1068,10 @@ impl Store for SurrealStore {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let record = DiaryRecord::from_entry(&entry, ns, now_ms);
-        let _: Option<DiaryRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<DiaryRecord>> = self
             .db
             .create(DIARY_TABLE)
-            .content(record)
+            .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
         Ok(())
@@ -1046,7 +1096,7 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let mut records: Vec<DiaryRecord> = result.take(0).map_err(store_err)?;
+        let mut records = take_vec::<DiaryRecord>(&mut result)?;
         records.reverse(); // chronological (DESC → reverse)
         Ok(records.into_iter().map(DiaryRecord::into_entry).collect())
     }
@@ -1055,10 +1105,10 @@ impl Store for SurrealStore {
 
     async fn register_repo(&self, repo: RepoDirectory) -> Result<()> {
         let name = repo.name.clone();
-        let _: Option<RepoDirectory> = self
+        let _: Option<surrealdb::types::SerdeWrapper<RepoDirectory>> = self
             .db
             .upsert((REPO_TABLE, name))
-            .content(repo)
+            .content(surrealdb::types::SerdeWrapper(repo))
             .await
             .map_err(store_err)?;
         Ok(())
@@ -1070,8 +1120,81 @@ impl Store for SurrealStore {
             .query(format!("SELECT * FROM {REPO_TABLE} ORDER BY name"))
             .await
             .map_err(store_err)?;
-        let repos: Vec<RepoDirectory> = result.take(0).map_err(store_err)?;
+        let repos = take_vec::<RepoDirectory>(&mut result)?;
         Ok(repos)
+    }
+
+    // ===== Token revocation (WS1b) =====
+
+    async fn revoke_token(&self, revocation: TokenRevocation) -> Result<()> {
+        let hash = revocation.token_hash.clone();
+        let _: Option<surrealdb::types::SerdeWrapper<TokenRevocation>> = self
+            .db
+            .upsert((REVOCATIONS_TABLE, hash))
+            .content(surrealdb::types::SerdeWrapper(revocation))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_revocations(&self) -> Result<Vec<TokenRevocation>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {REVOCATIONS_TABLE} ORDER BY revoked_at_unix"
+            ))
+            .await
+            .map_err(store_err)?;
+        let revs = take_vec::<TokenRevocation>(&mut result)?;
+        Ok(revs)
+    }
+
+    async fn grant_namespace_membership(&self, membership: NamespaceMembership) -> Result<()> {
+        // Upsert by the natural key (ns, principal): re-granting refreshes
+        // granted_at/granted_by without duplicating.
+        let key = format!("{}:{}", membership.namespace, membership.principal);
+        let _: Option<surrealdb::types::SerdeWrapper<NamespaceMembership>> = self
+            .db
+            .upsert((NAMESPACE_MEMBERS_TABLE, key))
+            .content(surrealdb::types::SerdeWrapper(membership))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn revoke_namespace_membership(&self, ns: &NamespaceId, principal: &str) -> Result<()> {
+        let key = format!("{}:{}", ns.as_str(), principal);
+        let _: Option<surrealdb::types::SerdeWrapper<NamespaceMembership>> = self
+            .db
+            .delete((NAMESPACE_MEMBERS_TABLE, key))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn list_namespace_members(&self, ns: &NamespaceId) -> Result<Vec<NamespaceMembership>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {NAMESPACE_MEMBERS_TABLE} WHERE namespace = $ns \
+                 ORDER BY granted_at_unix"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        take_vec::<NamespaceMembership>(&mut result)
+    }
+
+    async fn is_namespace_member(&self, ns: &NamespaceId, principal: &str) -> Result<bool> {
+        // Direct natural-key lookup (`<ns>:<principal>`) — no query,
+        // no aggregation semantics, the same key grant/revoke address.
+        let key = format!("{}:{}", ns.as_str(), principal);
+        let record: Option<surrealdb::types::SerdeWrapper<NamespaceMembership>> = self
+            .db
+            .select((NAMESPACE_MEMBERS_TABLE, key))
+            .await
+            .map_err(store_err)?;
+        Ok(record.is_some())
     }
 }
 
@@ -1140,11 +1263,11 @@ impl KnowledgeGraph for SurrealStore {
                 entity_type: "unknown".into(),
                 namespace: ns_str.clone(),
             };
-            let _: std::result::Result<Option<EntityRecord_>, _> = self
-                .db
-                .create((ENTITIES_TABLE, eid.clone()))
-                .content(record)
-                .await;
+            let _: std::result::Result<Option<surrealdb::types::SerdeWrapper<EntityRecord_>>, _> =
+                self.db
+                    .create((ENTITIES_TABLE, eid.clone()))
+                    .content(surrealdb::types::SerdeWrapper(record))
+                    .await;
             // Ignore errors (record already exists from a prior triple).
         }
         // Store the triple as a record (keyed by deterministic triple_id).
@@ -1162,10 +1285,10 @@ impl KnowledgeGraph for SurrealStore {
             namespace: ns_str.clone(),
             source_memory_id: source_memory_id.map(str::to_string),
         };
-        let _: Option<TripleRecord> = self
+        let _: Option<surrealdb::types::SerdeWrapper<TripleRecord>> = self
             .db
             .create((TRIPLES_TABLE, triple_id.clone()))
-            .content(record)
+            .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
         Ok(Triple {
@@ -1183,12 +1306,13 @@ impl KnowledgeGraph for SurrealStore {
 
     async fn query_entity(&self, ns: &NamespaceId, entity: &EntityId) -> Result<EntityRecord> {
         let eid = entity.0.clone();
-        let ent: Option<EntityRecord_> = self
+        let ent: Option<surrealdb::types::SerdeWrapper<EntityRecord_>> = self
             .db
             .select((ENTITIES_TABLE, eid.clone()))
             .await
             .map_err(store_err)?;
-        let entity_node = ent.and_then(|r| {
+        let entity_node = ent.and_then(|w| {
+            let r = w.0;
             if r.namespace == ns.as_str() {
                 Some(Entity {
                     id: entity.clone(),
@@ -1211,7 +1335,7 @@ impl KnowledgeGraph for SurrealStore {
             .bind(("eid", eid))
             .await
             .map_err(store_err)?;
-        let triples: Vec<TripleRecord> = res.take(0).map_err(store_err)?;
+        let triples = take_vec::<TripleRecord>(&mut res)?;
         let requested = entity.0.as_str();
         let mut outgoing = Vec::new();
         let mut incoming = Vec::new();
@@ -1283,7 +1407,7 @@ impl KnowledgeGraph for SurrealStore {
             q = q.bind(("obj", o.0.clone()));
         }
         let mut res = q.await.map_err(store_err)?;
-        let triples: Vec<TripleRecord> = res.take(0).map_err(store_err)?;
+        let triples = take_vec::<TripleRecord>(&mut res)?;
         Ok(triples.into_iter().map(TripleRecord::into_triple).collect())
     }
 
@@ -1300,7 +1424,7 @@ impl KnowledgeGraph for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let triples: Vec<TripleRecord> = res.take(0).map_err(store_err)?;
+        let triples = take_vec::<TripleRecord>(&mut res)?;
         Ok(triples.into_iter().map(TripleRecord::into_triple).collect())
     }
 
@@ -1314,13 +1438,14 @@ impl KnowledgeGraph for SurrealStore {
             .bind(("ns", ns.as_str().to_string()))
             .await
             .map_err(store_err)?;
-        #[derive(Deserialize)]
+        #[derive(serde::Serialize, Deserialize)]
         struct Row {
             #[allow(dead_code)]
             namespace: String,
         }
-        let entities: Vec<Row> = res.take(0).map_err(store_err)?;
-        let triples: Vec<Row> = res.take(1).map_err(store_err)?;
+        let entities = take_vec::<Row>(&mut res)?;
+        let wrapped: Vec<surrealdb::types::SerdeWrapper<Row>> = res.take(1).map_err(store_err)?;
+        let triples: Vec<Row> = wrapped.into_iter().map(|w| w.0).collect();
         Ok(KgStats {
             entities: entities.len(),
             triples: triples.len(),
@@ -1336,13 +1461,14 @@ impl KnowledgeGraph for SurrealStore {
             ))
             .await
             .map_err(store_err)?;
-        #[derive(Deserialize)]
+        #[derive(serde::Serialize, Deserialize)]
         struct Row {
             #[allow(dead_code)]
             namespace: String,
         }
-        let entities: Vec<Row> = res.take(0).map_err(store_err)?;
-        let triples: Vec<Row> = res.take(1).map_err(store_err)?;
+        let entities = take_vec::<Row>(&mut res)?;
+        let wrapped: Vec<surrealdb::types::SerdeWrapper<Row>> = res.take(1).map_err(store_err)?;
+        let triples: Vec<Row> = wrapped.into_iter().map(|w| w.0).collect();
         Ok(KgStats {
             entities: entities.len(),
             triples: triples.len(),
@@ -1399,6 +1525,65 @@ mod tests {
         // (ADR provenance-tier): origin/authority survive SurrealDB.
         assert_eq!(got.origin, InstanceId::local());
         assert_eq!(got.authority, AuthorityScope::local());
+    }
+
+    #[tokio::test]
+    async fn same_memory_id_in_two_namespaces_does_not_collide() {
+        // WS2: the same source corpus imported under two sources carries
+        // the same logical ids into different namespaces. Record keys must
+        // be namespaced or the second store 500s on `already exists`.
+        let store = fresh().await;
+        let ns_a = NamespaceId::new("ns_import_laptop");
+        let ns_b = NamespaceId::new("ns_import_desktop");
+        store
+            .store_memory(&ns_a, sample_memory("mem_fx1", "laptop copy"))
+            .await
+            .expect("store into ns_a");
+        store
+            .store_memory(&ns_b, sample_memory("mem_fx1", "desktop copy"))
+            .await
+            .expect("same id into ns_b must not collide");
+        // Each namespace recalls its own record under the same logical id.
+        let a = store
+            .recall_memory(&ns_a, &MemoryId("mem_fx1".into()))
+            .await
+            .expect("recall a")
+            .expect("present a");
+        let b = store
+            .recall_memory(&ns_b, &MemoryId("mem_fx1".into()))
+            .await
+            .expect("recall b")
+            .expect("present b");
+        assert_eq!(a.content, "laptop copy");
+        assert_eq!(b.content, "desktop copy");
+        // Deleting in one namespace leaves the other intact.
+        store
+            .delete_memory(&ns_a, &MemoryId("mem_fx1".into()))
+            .await
+            .expect("delete a");
+        assert!(
+            store
+                .recall_memory(&ns_b, &MemoryId("mem_fx1".into()))
+                .await
+                .expect("recall b after a delete")
+                .is_some(),
+            "ns_b record must survive ns_a deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_memories_projects_origin_and_authority() {
+        // The browse SELECT must project origin/authority or the
+        // deserializer defaults them to `local`, silently erasing import
+        // provenance (WS2).
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_originproj");
+        let mut m = sample_memory("m_op", "origin projection probe");
+        m.origin = InstanceId("elliotthall-laptop".into());
+        store.store_memory(&ns, m).await.expect("store");
+        let listed = store.list_memories(&ns, 10).await.expect("list");
+        let got = listed.first().expect("one row");
+        assert_eq!(got.origin.0, "elliotthall-laptop");
     }
 
     #[tokio::test]
@@ -2130,13 +2315,27 @@ mod tests {
         ));
         let ns = NamespaceId::new("ns_persist");
 
-        // Write with one instance.
+        // Phase 1 runs in its own task: surrealdb 3's surrealkv engine
+        // holds a directory LOCK until the datastore's background tasks
+        // drop (which needs the task boundary + a yield, not just
+        // `drop(db)`). Production restarts are cross-process, so the OS
+        // releases the lock; same-process reopens need this pattern.
         {
-            let store = SurrealStore::open_persistent(&dir).await.expect("open");
-            store
-                .store_memory(&ns, sample_memory("mem_p", "survives restart"))
-                .await
-                .expect("store");
+            let dir = dir.clone();
+            let ns = ns.clone();
+            tokio::spawn(async move {
+                let store = SurrealStore::open_persistent(&dir).await.expect("open");
+                store
+                    .store_memory(&ns, sample_memory("mem_p", "survives restart"))
+                    .await
+                    .expect("store");
+            })
+            .await
+            .expect("phase 1 task");
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
         // A fresh instance pointing at the same path must see the memory.
@@ -2176,4 +2375,116 @@ mod tests {
         // Clean up.
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+// surrealdb 3: SELECT FROM a never-written table is a hard error (v2
+// returned an empty set). Boot-time reads — revocation hydration,
+// /status counts — hit fresh databases, so INDEX_DDL defines every table
+// up front. This pins that a fresh store reads cleanly before any write.
+#[tokio::test]
+async fn fresh_store_reads_succeed_before_any_write() {
+    let store = SurrealStore::open_embedded().await.expect("open");
+    let revs = store.list_revocations().await.expect("fresh revocations");
+    assert!(revs.is_empty());
+    let stats = store.store_stats().await.expect("fresh stats");
+    assert_eq!(stats.total_memories, 0);
+    assert!(stats.namespaces.is_empty());
+}
+
+// WS3 org walls: membership CRUD contract — idempotent grant, oldest-
+// first listing, revoke-absent-is-ok, and the hot-path boolean.
+#[tokio::test]
+async fn namespace_membership_crud_round_trips() {
+    let store = SurrealStore::open_embedded().await.expect("open");
+    let ns = NamespaceId::new("ns_ia_shared");
+    let mk = |principal: &str, at: u64| NamespaceMembership {
+        namespace: "ns_ia_shared".into(),
+        principal: principal.into(),
+        granted_at_unix: at,
+        granted_by: "root".into(),
+    };
+
+    // Nobody is a member yet.
+    assert!(
+        !store
+            .is_namespace_member(&ns, "elliott")
+            .await
+            .expect("check")
+    );
+
+    store
+        .grant_namespace_membership(mk("elliott", 100))
+        .await
+        .expect("grant");
+    store
+        .grant_namespace_membership(mk("sara", 200))
+        .await
+        .expect("grant");
+    // Idempotent re-grant refreshes, never duplicates.
+    store
+        .grant_namespace_membership(mk("elliott", 300))
+        .await
+        .expect("re-grant");
+
+    assert!(
+        store
+            .is_namespace_member(&ns, "elliott")
+            .await
+            .expect("check")
+    );
+    let members = store.list_namespace_members(&ns).await.expect("list");
+    assert_eq!(members.len(), 2, "re-grant must not duplicate: {members:?}");
+    // Oldest grant first (elliott's original 100 predates sara's 200;
+    // the refreshed row keeps key order by granted_at).
+    assert_eq!(members[0].principal, "sara");
+    assert_eq!(members[1].principal, "elliott");
+    assert_eq!(members[1].granted_at_unix, 300, "re-grant refreshes");
+
+    store
+        .revoke_namespace_membership(&ns, "elliott")
+        .await
+        .expect("revoke");
+    assert!(
+        !store
+            .is_namespace_member(&ns, "elliott")
+            .await
+            .expect("check")
+    );
+    // Revoking an absent membership is not an error.
+    store
+        .revoke_namespace_membership(&ns, "ghost")
+        .await
+        .expect("revoke absent");
+    // Membership is per-namespace.
+    assert!(
+        !store
+            .is_namespace_member(&NamespaceId::new("ns_kellas_shared"), "sara")
+            .await
+            .expect("check")
+    );
+}
+
+// The revocation round-trip is covered full-stack in api::tests
+// (token_revocation_kills_the_bearer_immediately); here we pin the store
+// contract directly: upsert idempotence + oldest-first ordering.
+#[tokio::test]
+async fn revocation_upsert_and_ordering() {
+    use ijima_core::TokenRevocation;
+    let store = SurrealStore::open_embedded().await.expect("open");
+    let mk = |hash: &str, at: u64| TokenRevocation {
+        token_hash: hash.to_string(),
+        revoked_at_unix: at,
+        reason: None,
+    };
+    store.revoke_token(mk("bbb", 20)).await.expect("revoke b");
+    store.revoke_token(mk("aaa", 10)).await.expect("revoke a");
+    // Idempotent re-upsert of the same hash.
+    store
+        .revoke_token(mk("bbb", 20))
+        .await
+        .expect("re-revoke b");
+    let revs = store.list_revocations().await.expect("list");
+    assert_eq!(revs.len(), 2, "upsert keeps one row per hash");
+    assert_eq!(revs[0].token_hash, "aaa", "oldest first");
+    assert_eq!(revs[1].token_hash, "bbb");
 }

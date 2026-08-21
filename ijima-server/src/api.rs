@@ -44,16 +44,23 @@ use ijima_core::capabilities::MINING_TRIGGER;
 use ijima_core::{
     AcceptedExtraction, DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId,
     NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Room,
-    SearchHit, Session, SessionId, SessionTurn, Store, TunnelTraversal,
+    SearchHit, Session, SessionId, SessionTurn, Store, TokenRevocation, TunnelTraversal,
     capabilities::{
         ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST,
         TRUST_PROMOTE,
     },
     harness::Harness,
+    memory::MemorySource,
 };
 
 use crate::extractor::AuthPrincipal;
 use crate::redaction::Redactor;
+
+#[cfg(feature = "federation")]
+use ijima_core::federation::{
+    AuthoritativeScope, ConflictSignal, FederationState, InstanceFederationConfig, RoutedWrite,
+    RoutedWriteReceipt,
+};
 
 /// Builds the Ijima HTTP application router.
 ///
@@ -66,6 +73,7 @@ pub fn app(
     embedder: Option<Arc<dyn Embedder>>,
     redactor: Arc<Redactor>,
     #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
+    #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health))
@@ -84,6 +92,11 @@ pub fn app(
         .route("/diaries/{agent}", get(read_diary))
         .route("/repos", get(list_repos).post(register_repo))
         .route("/repos/resolve", get(resolve_repo))
+        .route("/tokens/revoke", post(revoke_token_route))
+        .route("/tokens/revocations", get(list_token_revocations))
+        .route("/namespaces/grant", post(grant_ns_membership))
+        .route("/namespaces/revoke", post(revoke_ns_membership))
+        .route("/namespaces/members", get(list_ns_members))
         .route("/doctrine", post(ingest_doctrine))
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
@@ -102,12 +115,21 @@ pub fn app(
         .route("/mining/queue/{id}/reject", post(reject_extraction));
     #[cfg(feature = "mining")]
     let router = router.route("/sessions/{session_id}/mine", post(trigger_mine));
+
+    #[cfg(feature = "federation")]
+    let router = router
+        .route("/federation/state", get(federation_state))
+        .route("/federation/routed-write", post(routed_write))
+        .route("/federation/conflict-signal", post(conflict_signal));
     let router = router
         .layer(Extension(auth))
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
         .layer(Extension(redactor));
+
+    #[cfg(feature = "federation")]
+    let router = router.layer(Extension(federation_config));
 
     #[cfg(feature = "rate-limit")]
     let router = match rate_limiter {
@@ -170,21 +192,44 @@ struct NsQuery {
 /// Resolves the effective namespace for a request: the caller's
 /// personal namespace by default, or the requested one if authorized.
 ///
-/// Authorization (v0, naming-convention based):
+/// Authorization (WS3 org walls, in check order):
 /// - `ns_<this_principal>_private` → allowed (own personal).
-/// - any other `ns_*_private` → **403** (someone else's personal).
-/// - anything else → allowed (shared / global).
-fn resolve_ns(
+/// - any other `*_private` → **403** (someone else's personal).
+/// - `global`, `ns_doctrine` (doctrine), `ns_import_*` (staging) → open
+///   to any authenticated principal (the commons/read-everyone tiers).
+/// - anything else (shared org namespaces, e.g. `ns_ia_shared`) →
+///   **membership-gated**: the store's membership table must contain the
+///   principal, or the grant must carry `admin` (operator bypass).
+async fn resolve_ns(
     principal: &AuthPrincipal,
+    store: &dyn Store,
     requested: Option<&str>,
 ) -> Result<ijima_core::NamespaceId, ApiError> {
     let own = format!("ns_{}_private", principal.0.principal.as_str());
-    match requested {
-        None => Ok(ijima_core::NamespaceId::new(own)),
-        Some(ns) if ns == own => Ok(ijima_core::NamespaceId::new(ns)),
-        Some(ns) if ns.ends_with("_private") => Err(ApiError::Forbidden),
-        Some(ns) => Ok(ijima_core::NamespaceId::new(ns)),
+    let requested = match requested {
+        None => return Ok(ijima_core::NamespaceId::new(own)),
+        Some(ns) => ns,
+    };
+    if requested == own {
+        return Ok(ijima_core::NamespaceId::new(requested));
     }
+    if requested.ends_with("_private") {
+        return Err(ApiError::Forbidden);
+    }
+    let open = requested == "global"
+        || requested == ijima_core::namespace::DOCTRINE_NAMESPACE
+        || requested.starts_with("ns_import_");
+    if !open && !principal.0.may(ADMIN) {
+        let ns = ijima_core::NamespaceId::new(requested);
+        let member = store
+            .is_namespace_member(&ns, principal.0.principal.as_str())
+            .await
+            .map_err(internal)?;
+        if !member {
+            return Err(ApiError::Forbidden);
+        }
+    }
+    Ok(ijima_core::NamespaceId::new(requested))
 }
 
 // ---------- handlers ----------
@@ -193,12 +238,22 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// Process start marker — captured once, when `/status` is first hit
+/// (equivalently: daemon boot, since the router is built at boot).
+static STARTED_AT: std::sync::OnceLock<std::time::SystemTime> = std::sync::OnceLock::new();
+
 #[derive(Serialize)]
 struct StatusResponse {
     memories: usize,
     namespaces: Vec<NamespaceCount>,
     entities: usize,
     triples: usize,
+    /// Server version (crate version at compile time).
+    version: &'static str,
+    /// Wall-clock process start (unix seconds).
+    started_at_unix: u64,
+    /// Seconds since process start.
+    uptime_secs: u64,
 }
 
 /// Global store statistics across all namespaces. Admin-gated (it spans
@@ -214,12 +269,146 @@ async fn status(
     }
     let store_stats = store.store_stats().await.map_err(internal)?;
     let kg_stats = kg.kg_global_stats().await.map_err(internal)?;
+    let started = *STARTED_AT.get_or_init(std::time::SystemTime::now);
+    let uptime_secs = started.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    let started_at_unix = started
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     Ok(Json(StatusResponse {
         memories: store_stats.total_memories,
         namespaces: store_stats.namespaces,
         entities: kg_stats.entities,
         triples: kg_stats.triples,
+        version: env!("CARGO_PKG_VERSION"),
+        started_at_unix,
+        uptime_secs,
     }))
+}
+
+// ===== Token revocation (WS1b — grant kill-switch) =====
+
+/// Body for `POST /tokens/revoke`.
+#[derive(Deserialize)]
+struct RevokeRequest {
+    /// The bearer token to revoke (the raw string; only its SHA-256 is
+    /// persisted).
+    token: String,
+    /// Optional operator note (e.g. `"leaked in CI log"`).
+    reason: Option<String>,
+}
+
+/// Revokes a grant token: persists the hash (survives restarts) and adds
+/// it to the live rejection set. Auth: `admin`. Idempotent.
+async fn revoke_token_route(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(auth): Extension<Arc<crate::IjimaAuth>>,
+    Json(req): Json<RevokeRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let revocation = TokenRevocation {
+        token_hash: crate::auth::bearer_hash(&req.token),
+        revoked_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        reason: req.reason,
+    };
+    // Persist first, then arm the in-memory check: a crash between the two
+    // re-arms at boot (store is source of truth).
+    store
+        .revoke_token(revocation.clone())
+        .await
+        .map_err(internal)?;
+    auth.revoke(&revocation.token_hash);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------- namespace membership (WS3 org walls) ----------
+
+#[derive(Deserialize)]
+struct NsMembershipRequest {
+    /// The shared namespace (e.g. `ns_ia_shared`).
+    namespace: String,
+    /// The principal to grant/revoke.
+    principal: String,
+}
+
+/// Grants namespace membership (upsert). Auth: `admin`. Powers
+/// `ijima namespace grant`.
+async fn grant_ns_membership(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(req): Json<NsMembershipRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let membership = ijima_core::NamespaceMembership {
+        namespace: req.namespace.clone(),
+        principal: req.principal.clone(),
+        granted_at_unix: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        granted_by: principal.0.principal.as_str().to_string(),
+    };
+    store
+        .grant_namespace_membership(membership)
+        .await
+        .map_err(internal)?;
+    Ok(Json(
+        serde_json::json!({ "granted": true, "namespace": req.namespace, "principal": req.principal }),
+    ))
+}
+
+/// Revokes namespace membership (idempotent). Auth: `admin`.
+async fn revoke_ns_membership(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Json(req): Json<NsMembershipRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    store
+        .revoke_namespace_membership(&NamespaceId::new(&req.namespace), &req.principal)
+        .await
+        .map_err(internal)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Lists a namespace's members, oldest grant first. Auth: `admin`.
+async fn list_ns_members(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Json<Vec<ijima_core::NamespaceMembership>>, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = q.namespace.as_deref().ok_or(ApiError::BadRequest(
+        "?namespace=<ns> is required".to_string(),
+    ))?;
+    let members = store
+        .list_namespace_members(&NamespaceId::new(ns))
+        .await
+        .map_err(internal)?;
+    Ok(Json(members))
+}
+
+/// Lists every recorded revocation, oldest first. Auth: `admin`.
+async fn list_token_revocations(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+) -> Result<Json<Vec<TokenRevocation>>, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    Ok(Json(store.list_revocations().await.map_err(internal)?))
 }
 
 #[derive(Serialize)]
@@ -230,12 +419,16 @@ struct IdResponse {
 async fn store_memory(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
     Json(memory): Json<Memory>,
 ) -> Result<Json<IdResponse>, ApiError> {
     if !principal.0.may(MEMORY_WRITE) {
         return Err(ApiError::Forbidden);
     }
-    let ns = principal.0.personal_namespace();
+    // WS2: `?namespace=` routes the write into a shared/import namespace
+    // (grant-checked by resolve_ns — another principal's `_private` is
+    // still forbidden); without it, the caller's personal namespace.
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let mut memory = memory;
     if memory.created_at.is_empty() {
         memory.created_at = std::time::SystemTime::now()
@@ -270,7 +463,7 @@ async fn check_duplicate(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let dup = store
         .check_duplicate(&ns, &req.content)
         .await
@@ -289,7 +482,7 @@ async fn recall_memory(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     match store
         .recall_memory(&ns, &MemoryId(id))
         .await
@@ -309,7 +502,7 @@ async fn delete_memory(
     if !principal.0.may(MEMORY_WRITE) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     store
         .delete_memory(&ns, &MemoryId(id))
         .await
@@ -371,7 +564,7 @@ async fn search_memories(
         };
         merge_search_hits(own_hits, global_hits, limit)
     } else {
-        let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+        let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
         store
             .search_memories(&ns, &query, limit)
             .await
@@ -466,6 +659,32 @@ async fn promote_memory(
         created_at: memory.created_at.clone(),
     };
     let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
+    // WS3: the promotion target goes through the same org-wall rule as
+    // every other write — membership for shared namespaces (admin
+    // bypasses); import staging is not a valid promotion target.
+    {
+        let target = req.target_namespace.as_str();
+        if target.ends_with("_private") && target != personal_ns.as_str() {
+            return Err(ApiError::Forbidden);
+        }
+        let open = target == "global"
+            || target == ijima_core::namespace::DOCTRINE_NAMESPACE
+            || target == personal_ns.as_str();
+        if target.starts_with("ns_import_") {
+            return Err(ApiError::BadRequest(
+                "import staging namespaces are not promotion targets".to_string(),
+            ));
+        }
+        if !open && !principal.0.may(ADMIN) {
+            let member = store
+                .is_namespace_member(&target_ns, principal.0.principal.as_str())
+                .await
+                .map_err(internal)?;
+            if !member {
+                return Err(ApiError::Forbidden);
+            }
+        }
+    }
     store
         .store_memory(&target_ns, promoted)
         .await
@@ -591,7 +810,7 @@ async fn add_triple(
     if !principal.0.may(ijima_core::capabilities::KNOWLEDGE_WRITE) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, None)?;
+    let ns = resolve_ns(&principal, store.as_ref(), None).await?;
     let triple = kg
         .add_triple(
             &ns,
@@ -611,6 +830,7 @@ async fn add_triple(
 
 async fn query_entity(
     principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
     Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
     Path(id): Path<String>,
     Query(q): Query<NsQuery>,
@@ -618,7 +838,7 @@ async fn query_entity(
     if !principal.0.may(KNOWLEDGE_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let rec = kg
         .query_entity(&ns, &EntityId::new(id))
         .await
@@ -628,6 +848,7 @@ async fn query_entity(
 
 async fn invalidate_triple(
     principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
     Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
     Path(id): Path<String>,
     Query(q): Query<NsQuery>,
@@ -635,7 +856,7 @@ async fn invalidate_triple(
     if !principal.0.may(ijima_core::capabilities::KNOWLEDGE_WRITE) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     kg.invalidate_triple(&ns, &id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -650,13 +871,14 @@ struct FindTriplesQuery {
 
 async fn find_triples(
     principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
     Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
     Query(q): Query<FindTriplesQuery>,
 ) -> Result<Json<Vec<ijima_core::Triple>>, ApiError> {
     if !principal.0.may(KNOWLEDGE_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let triples = kg
         .find_triples(
             &ns,
@@ -671,13 +893,14 @@ async fn find_triples(
 
 async fn kg_timeline(
     principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
     Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<Vec<ijima_core::Triple>>, ApiError> {
     if !principal.0.may(KNOWLEDGE_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let triples = kg
         .kg_timeline(&ns, q.limit.unwrap_or(50))
         .await
@@ -687,13 +910,14 @@ async fn kg_timeline(
 
 async fn kg_stats(
     principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
     Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<ijima_core::KgStats>, ApiError> {
     if !principal.0.may(KNOWLEDGE_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let stats = kg.knowledge_stats(&ns).await.map_err(internal)?;
     Ok(Json(stats))
 }
@@ -729,7 +953,7 @@ async fn session_turns(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let turns = store
         .session_turns(&ns, &SessionId::new(session_id), q.limit.unwrap_or(50))
         .await
@@ -780,7 +1004,7 @@ async fn list_sessions(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let harness = q.harness.as_deref().map(Harness::from_wire_str);
     let limit = q.limit.unwrap_or(50).min(500);
     let sessions = store
@@ -826,7 +1050,7 @@ async fn list_pending(
     if !principal.0.may(MINING_REVIEW) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     let pending = store.list_pending(&ns, limit).await.map_err(internal)?;
     Ok(Json(pending))
@@ -882,12 +1106,12 @@ async fn trigger_mine(
     Path(session_id): Path<String>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<crate::mining_pipeline::MiningReport>, ApiError> {
-    use proserpina::backend::http::HttpAgent;
+    use proserpina_agent::http::HttpAgent;
 
     if !principal.0.may(MINING_TRIGGER) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
 
     // Fetch the session's turns (a generous limit — v0 mines the whole session).
     let turns = store
@@ -905,8 +1129,9 @@ async fn trigger_mine(
     // the move into the spawned task.
     let extractions = tokio::task::spawn_blocking(move || {
         let mut agent: Option<HttpAgent> = build_mining_agent();
-        let agent_dyn: Option<&mut dyn proserpina::Agent> =
-            agent.as_mut().map(|a| a as &mut dyn proserpina::Agent);
+        let agent_dyn: Option<&mut dyn proserpina_agent::Agent> = agent
+            .as_mut()
+            .map(|a| a as &mut dyn proserpina_agent::Agent);
         ijima_miner::mine_all(&turn_texts, &ctx, agent_dyn)
     })
     .await
@@ -933,10 +1158,10 @@ async fn trigger_mine(
 /// single-shot). Returns a concrete [`HttpAgent`] (not a trait object) so it
 /// remains `Send` for the blocking-thread move.
 #[cfg(feature = "mining")]
-fn build_mining_agent() -> Option<proserpina::backend::http::HttpAgent> {
-    use proserpina::{
+fn build_mining_agent() -> Option<proserpina_agent::http::HttpAgent> {
+    use proserpina_agent::{
         AgentId, Persona,
-        backend::http::{HttpAgent, HttpConfig},
+        http::{HttpAgent, HttpConfig},
     };
 
     let base_url = std::env::var("IJIMA_LLM_BASE_URL")
@@ -1017,7 +1242,7 @@ async fn list_rooms(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     let rooms = store
         .list_rooms(&ns, q.project.as_deref(), limit)
@@ -1035,7 +1260,7 @@ async fn taxonomy(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     Ok(Json(store.taxonomy(&ns).await.map_err(internal)?))
 }
 
@@ -1048,7 +1273,7 @@ async fn palace_graph(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     Ok(Json(store.palace_graph(&ns).await.map_err(internal)?))
 }
 
@@ -1061,7 +1286,7 @@ async fn traverse_tunnel(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     Ok(Json(
         store
@@ -1095,7 +1320,7 @@ async fn read_diary(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     Ok(Json(
         store
@@ -1115,7 +1340,7 @@ async fn browse_memories(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).min(500);
     Ok(Json(
         store
@@ -1147,7 +1372,7 @@ async fn memory_stats(
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let ns = resolve_ns(&principal, q.namespace.as_deref())?;
+    let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let rooms = store.list_rooms(&ns, None, 1000).await.map_err(internal)?;
     let total: usize = rooms.iter().map(|r| r.count).sum();
     let mut by_project: std::collections::BTreeMap<String, usize> =
@@ -1203,6 +1428,106 @@ async fn resolve_repo(
     }
 }
 
+// ---------- federation control API (scaffold; feature `federation`) ----------
+
+/// `GET /federation/state` — the instance's federated self-description.
+#[cfg(feature = "federation")]
+async fn federation_state(
+    Extension(cfg): Extension<Arc<InstanceFederationConfig>>,
+) -> Json<FederationState> {
+    Json(cfg.to_state())
+}
+
+/// `POST /federation/routed-write` — apply a write under an authoritative scope.
+///
+/// Scaffold: applies the write locally with provenance stamping (origin =
+/// this instance, authority = the scope) but performs **no** boundary
+/// enforcement — no trust-tier egress filtering, scope/airgap deny, or
+/// boundary transformation. Ijima's non-bypassable safety floor is the
+/// follow-on (ADR `federation-control-api` §Deferred).
+#[cfg(feature = "federation")]
+async fn routed_write(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(cfg): Extension<Arc<InstanceFederationConfig>>,
+    Json(write): Json<RoutedWrite>,
+) -> Result<Json<RoutedWriteReceipt>, ApiError> {
+    if !principal.0.may(MEMORY_WRITE) {
+        return Err(ApiError::Forbidden);
+    }
+    let RoutedWrite {
+        target: _,
+        scope,
+        operation: _,
+        payload,
+    } = write;
+
+    // === Boundary enforcement (non-bypassable; the federation ingress path) ===
+    // (1) Airgap: a sovereign instance rejects all federation writes.
+    if cfg.role == ijima_core::federation::InstanceRole::Airgapped {
+        return Err(ApiError::Forbidden);
+    }
+    // (2) Scope filter: accept only writes for scopes this instance is
+    //     authoritative for (default-deny for sovereignty).
+    if !cfg.accepts_scope(&scope) {
+        return Err(ApiError::BadRequest(format!(
+            "out of authoritative scope: {}/{}",
+            scope.namespace, scope.project
+        )));
+    }
+
+    let mut memory: Memory = serde_json::from_value(payload)
+        .map_err(|e| ApiError::BadRequest(format!("payload is not a Memory: {e}")))?;
+    // Stamp federation provenance: this instance applied it; the routed scope
+    // is the source-of-truth authority for the record.
+    memory.origin = ijima_core::provenance::InstanceId::local();
+    memory.authority =
+        ijima_core::provenance::AuthorityScope(format!("{}/{}", scope.namespace, scope.project));
+    if memory.created_at.is_empty() {
+        memory.created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs().to_string())
+            .unwrap_or_default();
+    }
+    let ns = principal.0.personal_namespace();
+
+    // (3) Trust-tier ingress: doctrine arriving via federation is never
+    //     auto-trusted — stage it as PendingReview (never auto-promoted).
+    //     Lower tiers (Explicit/Mined/AutoCapture) cross as-is.
+    let (commit, mut warnings) = if memory.source == MemorySource::Doctrine {
+        let pending = store
+            .enqueue_extraction(&ns, memory, 0.5)
+            .await
+            .map_err(internal)?;
+        (
+            pending,
+            vec!["doctrine downgraded to PendingReview (trust-tier ingress rule)".into()],
+        )
+    } else {
+        let id = store.store_memory(&ns, memory).await.map_err(internal)?;
+        (id.0, Vec::new())
+    };
+    warnings.push("boundary enforcement: scope + airgap + doctrine-downgrade applied".into());
+    Ok(Json(RoutedWriteReceipt {
+        accepted: true,
+        instance: cfg.instance_id.clone(),
+        scope,
+        commit: Some(commit),
+        warnings,
+    }))
+}
+
+/// `POST /federation/conflict-signal` — poll for a conflict on a scope.
+///
+/// Scaffold: no conflict detection yet. Returns `404` (no active conflict);
+/// the single-instance deployment has no peer to conflict with.
+#[cfg(feature = "federation")]
+async fn conflict_signal(
+    Json(_scope): Json<AuthoritativeScope>,
+) -> Result<Json<ConflictSignal>, ApiError> {
+    Err(ApiError::NotFound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1226,6 +1551,33 @@ mod tests {
                 Arc::new(crate::redaction::Redactor::new()),
                 #[cfg(feature = "rate-limit")]
                 None,
+                #[cfg(feature = "federation")]
+                Arc::new(InstanceFederationConfig::default()),
+            ),
+            auth,
+        )
+    }
+
+    /// Like [`app_with_store`] but with a custom federation config — for
+    /// boundary-enforcement tests (airgap, out-of-scope).
+    #[cfg(feature = "federation")]
+    async fn app_with_federation_config(
+        config: InstanceFederationConfig,
+    ) -> (Router, Arc<IjimaAuth>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        (
+            app(
+                auth.clone(),
+                store,
+                kg,
+                None,
+                Arc::new(crate::redaction::Redactor::new()),
+                #[cfg(feature = "rate-limit")]
+                None,
+                Arc::new(config),
             ),
             auth,
         )
@@ -1236,6 +1588,220 @@ mod tests {
             "Bearer {}",
             auth.issue_bearer(principal, cap).expect("issue")
         )
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn federation_state_returns_local_config() {
+        let (app, _auth) = app_with_store().await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/federation/state")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let state = body_json(res).await;
+        assert_eq!(state["instance_id"], "local");
+        assert_eq!(state["role"], "Unifying");
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_applies_a_memory() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "local", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "mem_fed_test",
+                "content": "federated hello",
+                "project": "Dominic",
+                "topic": "federated",
+                "source": "Explicit",
+                "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["accepted"], true);
+        assert!(receipt["commit"].as_str().is_some());
+        assert_eq!(
+            receipt["warnings"][0],
+            "boundary enforcement: scope + airgap + doctrine-downgrade applied"
+        );
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_requires_memory_write() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ); // read cap, not write
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "local", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "x", "content": "c", "project": "p",
+                "topic": "t", "source": "Explicit", "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_rejects_out_of_scope() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        // default config is authoritative for {local, *}; {shared, ...} is out of scope
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "shared", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "x", "content": "c", "project": "p",
+                "topic": "t", "source": "Explicit", "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_rejects_when_airgapped() {
+        let cfg = InstanceFederationConfig {
+            role: ijima_core::federation::InstanceRole::Airgapped,
+            ..InstanceFederationConfig::default()
+        };
+        let (app, auth) = app_with_federation_config(cfg).await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "local", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "x", "content": "c", "project": "p",
+                "topic": "t", "source": "Explicit", "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn routed_write_downgrades_doctrine_to_pending() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "elliott", MEMORY_WRITE);
+        let body = serde_json::json!({
+            "target": "local",
+            "scope": {"namespace": "local", "project": "Dominic"},
+            "operation": "Create",
+            "payload": {
+                "id": "mem_doctrine",
+                "content": "peer-claimed doctrine",
+                "project": "Dominic",
+                "topic": "federated",
+                "source": "Doctrine",
+                "harness": "Dominic"
+            }
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/routed-write")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let receipt = body_json(res).await;
+        assert_eq!(receipt["accepted"], true);
+        assert_eq!(
+            receipt["warnings"][0],
+            "doctrine downgraded to PendingReview (trust-tier ingress rule)"
+        );
+    }
+
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn conflict_signal_returns_404_when_none() {
+        let (app, _auth) = app_with_store().await;
+        let body = serde_json::json!({"namespace": "shared", "project": "Dominic"}).to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/federation/conflict-signal")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     fn sample_memory_json(id: &str) -> String {
@@ -1384,6 +1950,30 @@ mod tests {
         let write = bearer(&auth, "elliott", MEMORY_WRITE);
         let read = bearer(&auth, "elliott", MEMORY_READ);
         let promote = bearer(&auth, "elliott", TRUST_PROMOTE);
+
+        // WS3: elliott must be a member of the promotion target's org
+        // wall — grant via the admin route (full-stack setup).
+        let admin = bearer(&auth, "root", ADMIN);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/grant")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "namespace": "ns_team_shared",
+                            "principal": "elliott"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "membership grant");
 
         // Store a personal memory containing a secret.
         let body = serde_json::json!({
@@ -1543,7 +2133,31 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
-        // A trust:promote holder succeeds.
+        // WS3: the promotion target is membership-gated — grant elliott
+        // into ns_team_shared via the admin route, then the trust:promote
+        // holder succeeds.
+        let admin = bearer(&auth, "root", ADMIN);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/grant")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "namespace": "ns_team_shared",
+                            "principal": "elliott"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "membership grant");
+
         let promote = bearer(&auth, "elliott", TRUST_PROMOTE);
         let promote_body = serde_json::json!({ "target_namespace": "ns_team_shared" }).to_string();
         let res = app
@@ -1559,6 +2173,171 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // ---------- WS3 org walls ----------
+
+    /// The full wall lifecycle: non-member 403 → admin grants → member
+    /// 200 → revoke → 403 again. Also pins the admin bypass.
+    #[tokio::test]
+    async fn shared_namespace_membership_lifecycle() {
+        let (app, auth) = app_with_store().await;
+        let rw = bearer(&auth, "elliott", MEMORY_WRITE);
+        let admin = bearer(&auth, "root", ADMIN);
+
+        let write_into = |app: Router, token: String, n: u8| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories?namespace=ns_ia_shared")
+                    .header("authorization", token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": format!("mem_wall_{n}"),
+                            "content": format!("org-wall probe {n}"),
+                            "project": "ijima",
+                            "topic": "ws3",
+                            "source": "Explicit",
+                            "harness": "Pi",
+                            "importance": 0.5,
+                            "created_at": "0",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        // 1. Non-member is walled out.
+        let res = write_into(app.clone(), rw.clone(), 1).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "non-member must be walled"
+        );
+
+        // 2. Admin bypasses without membership.
+        let res = write_into(app.clone(), admin.clone(), 2).await;
+        assert_eq!(res.status(), StatusCode::OK, "admin bypass");
+
+        // 3. Non-admin cannot grant.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/grant")
+                    .header("authorization", rw.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "namespace": "ns_ia_shared", "principal": "elliott" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "grant requires admin");
+
+        // 4. Admin grants → member writes fine.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/grant")
+                    .header("authorization", admin.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "namespace": "ns_ia_shared", "principal": "elliott" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = write_into(app.clone(), rw.clone(), 3).await;
+        assert_eq!(res.status(), StatusCode::OK, "member passes");
+
+        // 5. Members listing (admin) shows the grant.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/namespaces/members?namespace=ns_ia_shared")
+                    .header("authorization", admin.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let members = body_json(res).await;
+        assert_eq!(members[0]["principal"].as_str(), Some("elliott"));
+        assert_eq!(members[0]["granted_by"].as_str(), Some("root"));
+
+        // 6. Revoke → walled again.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/revoke")
+                    .header("authorization", admin.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "namespace": "ns_ia_shared", "principal": "elliott" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        let res = write_into(app, rw, 4).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "revoked member is walled"
+        );
+    }
+
+    /// Open namespaces stay open: doctrine and import staging need no
+    /// membership.
+    #[tokio::test]
+    async fn doctrine_and_import_namespaces_stay_open() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories?namespace=ns_doctrine&limit=5")
+                    .header("authorization", read.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "doctrine is readable by all");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories?namespace=ns_import_probe&limit=5")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "import staging is open");
     }
 
     #[tokio::test]
@@ -1918,6 +2697,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body["memories"], 1);
+        // Deploy-kit fields: version pinned to the crate version, sane
+        // uptime, real start time.
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        let uptime = body["uptime_secs"].as_u64().expect("uptime is u64");
+        assert!(uptime < 60, "fresh test app should have tiny uptime");
+        assert!(
+            body["started_at_unix"].as_u64().expect("started_at is u64") > 1_000_000_000,
+            "started_at looks like a unix timestamp"
+        );
         assert!(!body["namespaces"].as_array().unwrap().is_empty());
     }
 
@@ -2235,6 +3023,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn store_memory_honors_namespace_query() {
+        let (app, auth) = app_with_store().await;
+        let body = serde_json::json!({
+            "id": "mem_nsimp",
+            "content": "imported via namespace query",
+            "project": "ijima",
+            "topic": "import",
+            "source": "AutoCapture",
+            "harness": "Pi",
+            "importance": 0.5,
+            "created_at": "0",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories?namespace=ns_import_testbox")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Dedup check in that namespace finds it; the caller's personal
+        // namespace does not (isolation held).
+        let read_token = bearer(&auth, "elliott", MEMORY_READ);
+        let check = |uri: &str| {
+            let uri = uri.to_string();
+            let app = app.clone();
+            let body = serde_json::json!({
+                "content": "imported via namespace query"
+            })
+            .to_string();
+            let auth_header = read_token.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", auth_header)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let res = check("/memories/check?namespace=ns_import_testbox").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let found = body_json(res).await;
+        assert_eq!(
+            found["duplicate"].as_str(),
+            Some("mem_nsimp"),
+            "same-namespace dedup check must find the import"
+        );
+        let res = check("/memories/check").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let personal = body_json(res).await;
+        assert_eq!(
+            personal["duplicate"].as_str(),
+            None,
+            "personal namespace must not see the import"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_memory_rejects_foreign_private_namespace() {
+        let (app, auth) = app_with_store().await;
+        let body = serde_json::json!({
+            "id": "mem_sneaky",
+            "content": "cross-tenant write attempt",
+            "project": "ijima",
+            "topic": "security",
+            "source": "Explicit",
+            "harness": "Pi",
+            "importance": 0.5,
+            "created_at": "0",
+        })
+        .to_string();
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories?namespace=ns_bob_private")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn rooms_taxonomy_stats_reflect_seeded_memories() {
         let (app, auth) = app_with_store().await;
         seed_memory(&app, &auth, "mem_a", "ijima", "api").await;
@@ -2524,5 +3413,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn token_revocation_kills_the_bearer_immediately() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "op", ADMIN);
+        let victim = bearer(&auth, "victim", MEMORY_READ);
+
+        // Victim can read before revocation.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories")
+                    .header("authorization", &victim)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Non-admin cannot revoke.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tokens/revoke")
+                    .header("authorization", &victim)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": victim, "reason": "test" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin revokes the victim's bearer.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/tokens/revoke")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "token": victim, "reason": "leaked in test" })
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // The same bearer is now exactly as dead as a bad signature.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories")
+                    .header("authorization", &victim)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // Admin can list the revocation — hash only, never the bearer.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/tokens/revocations")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let revs = body.as_array().expect("list response");
+        assert_eq!(revs.len(), 1);
+        assert_eq!(revs[0]["reason"], "leaked in test");
+        assert_eq!(
+            revs[0]["token_hash"].as_str().expect("hash"),
+            crate::auth::bearer_hash(&victim)
+        );
+        assert!(!revs[0].to_string().contains(&victim), "no raw bearer");
+
+        // Revocation survives restart-by-rehydration: a fresh auth over
+        // the same store re-arms (simulated via hydrate from the store).
+        let listed: Vec<TokenRevocation> =
+            serde_json::from_value(body).expect("deserializes as TokenRevocation");
+        auth.hydrate_revocations(&listed);
+        assert!(auth.is_revoked(&victim));
     }
 }

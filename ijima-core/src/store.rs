@@ -11,8 +11,9 @@ use async_trait::async_trait;
 
 use crate::{
     AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
-    RepoDirectory, Result, Session, SessionId, SessionTurn,
+    RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
     harness::Harness,
+    namespace::NamespaceMembership,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
 };
 
@@ -209,7 +210,6 @@ pub trait Store: Send + Sync {
 
     /// Lists every registered repository (the ecosystem roster).
     async fn list_repos(&self) -> Result<Vec<RepoDirectory>>;
-
     /// Reverse-resolves a working directory to its registered repo: the
     /// most specific repo whose `path` is a prefix of `cwd` (after
     /// normalizing). Powers `GET /repos/resolve` (CWD → project).
@@ -221,6 +221,36 @@ pub trait Store: Send + Sync {
             .filter(|r| target == r.path || target.starts_with(&format!("{}/", r.path)))
             .max_by_key(|r| r.path.len()))
     }
+
+    // ===== Token revocation (WS1b — the grant kill-switch) =====
+
+    /// Records a token revocation (idempotent upsert keyed by hash).
+    /// Powers `POST /tokens/revoke` (admin).
+    async fn revoke_token(&self, revocation: TokenRevocation) -> Result<()>;
+
+    /// Lists every recorded revocation, oldest first. Powers
+    /// `GET /tokens/revocations` (admin) and daemon-boot hydration of the
+    /// in-memory rejection set.
+    async fn list_revocations(&self) -> Result<Vec<TokenRevocation>>;
+
+    // ===== Shared-namespace membership (WS3 org walls) =====
+
+    /// Grants (upserts) a principal's membership in a shared namespace.
+    /// Admin operation; idempotent — re-granting refreshes `granted_at`/
+    /// `granted_by` but never duplicates.
+    async fn grant_namespace_membership(&self, membership: NamespaceMembership) -> Result<()>;
+
+    /// Revokes a membership. Idempotent: revoking an absent membership is
+    /// not an error.
+    async fn revoke_namespace_membership(&self, ns: &NamespaceId, principal: &str) -> Result<()>;
+
+    /// Lists the members of a namespace, oldest grant first. Powers
+    /// `GET /namespaces/members` (admin).
+    async fn list_namespace_members(&self, ns: &NamespaceId) -> Result<Vec<NamespaceMembership>>;
+
+    /// Hot-path membership check behind `resolve_ns` (shared-namespace
+    /// reads/writes).
+    async fn is_namespace_member(&self, ns: &NamespaceId, principal: &str) -> Result<bool>;
 
     // ===== Mining review queue (ADR M2, M3) =====
 

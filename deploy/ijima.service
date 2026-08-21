@@ -1,0 +1,61 @@
+# Ijima daemon — systemd unit for the laniakea central instance.
+#
+# Install:
+#   sudo cp deploy/ijima.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ijima
+#
+# The binary is expected at /usr/local/bin/ijima:
+#   cargo install --git https://github.com/Industrial-Algebra/Ijima ijima-server
+#   # (or build on-target: cargo build --release --bin ijima --features \
+#   #  "http,server-auth,backend-surreal,embeddings-candle,cli,mining" \
+#   #  && sudo cp target/release/ijima /usr/local/bin/)
+#
+# Configuration: /etc/ijima/ijima.toml (see deploy/ijima.toml.example).
+# Env-var overrides still work (IJIMA_HOST, IJIMA_PORT, ...).
+
+[Unit]
+Description=Ijima memory daemon (Anima company brain)
+Documentation=https://github.com/Industrial-Algebra/Ijima
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ijima
+Group=ijima
+
+# Data + config locations. The store lives on NVMe.
+Environment=IJIMA_DIR=/var/lib/ijima
+Environment=IJIMA_CONFIG=/etc/ijima/ijima.toml
+Environment=IJIMA_LOG=ijima=info
+
+ExecStart=/usr/local/bin/ijima serve
+Restart=on-failure
+RestartSec=5
+
+# Hardening — the daemon needs no privileges beyond its data dir.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ijima
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Resource notes: candle embeddings mmap the MiniLM model (~90 MB) and
+# run on CPU; 64 GB host leaves headroom. Raise if the mining pipeline
+# (Proserpina agent) runs in-process.
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target

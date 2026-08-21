@@ -60,6 +60,21 @@ use ijima_core::{
 };
 use serde::Deserialize;
 
+/// Per-source outcome counts from a client-driven import run (WS2).
+/// `deduped` means identical content already existed (this or another
+/// source); `skipped` means a per-memory failure — never fatal to the run.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ImportCounts {
+    /// Rows read from the source.
+    pub attempted: usize,
+    /// Stored in the target namespace.
+    pub added: usize,
+    /// Content-hash duplicate of an already-stored memory.
+    pub deduped: usize,
+    /// Per-memory failure (check or store error).
+    pub skipped: usize,
+}
+
 /// Configuration for connecting to an Ijima server.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -185,6 +200,99 @@ impl Client {
         let resp = self.post("/memories", &memory).await?;
         let r: IdResponse = decode(ok_status(resp).await?).await?;
         Ok(r.id)
+    }
+
+    /// Stores a memory into a specific (grant-checked) namespace
+    /// (`POST /memories?namespace=<ns>`, WS2 import path). Returns the
+    /// stored id.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on any HTTP failure (403 when
+    /// the caller's grant lacks memory:write or the namespace is
+    /// another principal's private one).
+    #[cfg(feature = "remote")]
+    pub async fn store_memory_in(&self, namespace: &str, memory: Memory) -> Result<String> {
+        let resp = self
+            .post(&build_path("/memories", Some(namespace), None), &memory)
+            .await?;
+        let r: IdResponse = decode(ok_status(resp).await?).await?;
+        Ok(r.id)
+    }
+
+    /// Content-hash dedup pre-check (`POST /memories/check`). Returns the
+    /// id of an existing memory with identical content, if any. Pass
+    /// `namespace` to check a shared/import namespace; omit for the
+    /// caller's personal namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IjimaError::Transport`] on non-404 HTTP failures.
+    #[cfg(feature = "remote")]
+    pub async fn check_duplicate(
+        &self,
+        content: &str,
+        namespace: Option<&str>,
+    ) -> Result<Option<String>> {
+        #[derive(serde::Serialize)]
+        struct CheckRequest<'a> {
+            content: &'a str,
+        }
+        #[derive(serde::Deserialize)]
+        struct CheckResponse {
+            duplicate: Option<String>,
+        }
+        let resp = self
+            .post(
+                &build_path("/memories/check", namespace, None),
+                &CheckRequest { content },
+            )
+            .await?;
+        let r: CheckResponse = decode(ok_status(resp).await?).await?;
+        Ok(r.duplicate)
+    }
+
+    /// Dedup-checked bulk import into `namespace` (WS2): every memory is
+    /// pre-checked via [`Self::check_duplicate`] so identical content
+    /// already stored (from this or another source) is counted, not
+    /// duplicated. Per-memory failures are counted as `skipped` — one
+    /// bad row never aborts the run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the request itself could not be sent
+    /// (transport-level); all per-memory outcomes land in the counts.
+    #[cfg(feature = "remote")]
+    pub async fn import_memories(
+        &self,
+        namespace: &str,
+        memories: Vec<Memory>,
+    ) -> Result<ImportCounts> {
+        let mut counts = ImportCounts {
+            attempted: memories.len(),
+            ..Default::default()
+        };
+        for memory in memories {
+            match self.check_duplicate(&memory.content, Some(namespace)).await {
+                Ok(Some(_)) => counts.deduped += 1,
+                Ok(None) => match self.store_memory_in(namespace, memory).await {
+                    Ok(_) => counts.added += 1,
+                    Err(e) => {
+                        if std::env::var("IJIMA_DEBUG").is_ok() {
+                            eprintln!("ijima: import store failed: {e}");
+                        }
+                        counts.skipped += 1;
+                    }
+                },
+                Err(e) => {
+                    if std::env::var("IJIMA_DEBUG").is_ok() {
+                        eprintln!("ijima: import check failed: {e}");
+                    }
+                    counts.skipped += 1;
+                }
+            }
+        }
+        Ok(counts)
     }
 
     /// Recalls a memory by id (`GET /memories/:id`). Pass `namespace`
@@ -610,6 +718,23 @@ fn build_path3(
 mod tests {
     use super::*;
     use ijima_core::MemoryId;
+
+    #[test]
+    fn import_counts_default_to_zero_and_serialize() {
+        let c = ImportCounts::default();
+        assert_eq!((c.attempted, c.added, c.deduped, c.skipped), (0, 0, 0, 0));
+        let mut tally = ImportCounts {
+            attempted: 3,
+            ..Default::default()
+        };
+        tally.added += 1;
+        tally.deduped += 1;
+        tally.skipped += 1;
+        assert_eq!(
+            serde_json::to_string(&tally).unwrap(),
+            "{\"attempted\":3,\"added\":1,\"deduped\":1,\"skipped\":1}"
+        );
+    }
 
     #[test]
     fn config_records_harness_and_url() {
