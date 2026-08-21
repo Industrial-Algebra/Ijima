@@ -43,6 +43,37 @@ pub struct ZeroClawRow {
     pub session_id: Option<String>,
 }
 
+/// A raw pi-mempalace `entities` row (the subset we migrate).
+#[derive(Debug, Clone)]
+pub struct PiPalaceEntity {
+    pub id: String,
+    pub name: String,
+    pub entity_type: String,
+}
+
+/// A raw pi-mempalace `triples` row (the subset we migrate). Subject and
+/// object reference `entities.id` (opaque `ent_*` hashes), not names.
+#[derive(Debug, Clone)]
+pub struct PiPalaceTriple {
+    pub id: i64,
+    pub subject: String,
+    pub predicate: String,
+    pub object: String,
+    pub valid_from: Option<String>,
+    pub valid_to: Option<String>,
+    pub confidence: Option<f32>,
+    pub source_memory_id: Option<String>,
+}
+
+/// A knowledge-graph batch prepared for import: name-addressed triples
+/// plus a count of unmappable source rows (orphans referencing unknown
+/// entities, or empty entity names).
+#[derive(Debug, Clone, Default)]
+pub struct KgImport {
+    pub triples: Vec<ijima_core::ImportTriple>,
+    pub unmapped: usize,
+}
+
 /// Maps a pi-mempalace source string to an Ijima [`MemorySource`].
 /// `auto-capture`→`AutoCapture`; `manual-save` and `diary`→`Explicit`;
 /// unknown→`AutoCapture` (conservative: unverified).
@@ -213,6 +244,109 @@ fn store_err(e: rusqlite::Error) -> ijima_core::IjimaError {
     ijima_core::IjimaError::Store {
         detail: format!("migration sqlite: {e}"),
     }
+}
+
+/// Reads the `entities` + `triples` tables from a pi-mempalace
+/// `memories.db`. Older corpora may lack the knowledge-graph tables —
+/// missing tables read as empty, not an error.
+pub fn read_pipalace_kg(
+    path: &str,
+) -> ijima_core::Result<(Vec<PiPalaceEntity>, Vec<PiPalaceTriple>)> {
+    use rusqlite::Connection;
+    let conn = Connection::open(path).map_err(store_err)?;
+    let has_table = |name: &str| -> ijima_core::Result<bool> {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(store_err)?;
+        Ok(n > 0)
+    };
+    let mut entities = Vec::new();
+    if has_table("entities")? {
+        let mut stmt = conn
+            .prepare("SELECT id, name, entity_type FROM entities ORDER BY id")
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PiPalaceEntity {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    entity_type: row
+                        .get::<_, Option<String>>(2)?
+                        .unwrap_or_else(|| "unknown".into()),
+                })
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            entities.push(row.map_err(store_err)?);
+        }
+    }
+    let mut triples = Vec::new();
+    if has_table("triples")? {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, subject, predicate, object, valid_from, valid_to, \
+                 confidence, source_memory_id FROM triples ORDER BY id",
+            )
+            .map_err(store_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PiPalaceTriple {
+                    id: row.get(0)?,
+                    subject: row.get(1)?,
+                    predicate: row.get(2)?,
+                    object: row.get(3)?,
+                    valid_from: row.get(4)?,
+                    valid_to: row.get(5)?,
+                    confidence: row.get::<_, Option<f32>>(6)?,
+                    source_memory_id: row.get(7)?,
+                })
+            })
+            .map_err(store_err)?;
+        for row in rows {
+            triples.push(row.map_err(store_err)?);
+        }
+    }
+    Ok((entities, triples))
+}
+
+/// Maps pi-mempalace KG rows onto Ijima's id-is-name convention: entity
+/// **names** become `EntityId`s (first entity wins on duplicate names —
+/// same-name source entities merge, which is the desired dedup), and
+/// triples are re-addressed through the id→name table. Triples that
+/// reference unknown entities (orphans) or nameless entities are dropped
+/// and counted in `unmapped`.
+pub fn map_pipalace_kg(entities: &[PiPalaceEntity], triples: &[PiPalaceTriple]) -> KgImport {
+    use std::collections::HashMap;
+    let mut by_id: HashMap<&str, &str> = HashMap::new();
+    for e in entities {
+        let name = e.name.trim();
+        if name.is_empty() {
+            continue; // unmappable; triples referencing it drop below
+        }
+        by_id.entry(e.id.as_str()).or_insert(name);
+    }
+    let mut out = KgImport::default();
+    for t in triples {
+        let (Some(subj), Some(obj)) = (by_id.get(t.subject.as_str()), by_id.get(t.object.as_str()))
+        else {
+            out.unmapped += 1;
+            continue;
+        };
+        out.triples.push(ijima_core::ImportTriple {
+            subject: (*subj).to_string(),
+            predicate: t.predicate.clone(),
+            object: (*obj).to_string(),
+            valid_from: t.valid_from.clone(),
+            valid_to: t.valid_to.clone(),
+            confidence: t.confidence.unwrap_or(1.0),
+            source_memory_id: t.source_memory_id.clone(),
+        });
+    }
+    out
 }
 
 // ===== Import orchestration =====
@@ -452,6 +586,133 @@ mod tests {
         // Reader feeds the mapper cleanly.
         let m = map_pipalace_memory(&rows[0]);
         assert_eq!(m.source, MemorySource::Explicit);
+    }
+
+    #[test]
+    fn read_pipalace_kg_round_trips_and_tolerates_missing_tables() {
+        use rusqlite::Connection;
+        let mut path = std::env::temp_dir();
+        path.push(format!("ijima_mig_kg_{}.db", std::process::id()));
+        let conn = Connection::open(&path).expect("open");
+        conn.execute(
+            "CREATE TABLE entities (id TEXT PRIMARY KEY, name TEXT, entity_type TEXT)",
+            [],
+        )
+        .expect("create entities");
+        conn.execute(
+            "CREATE TABLE triples (id INTEGER PRIMARY KEY AUTOINCREMENT, subject TEXT, \
+             predicate TEXT, object TEXT, valid_from TEXT, valid_to TEXT, confidence REAL, \
+             source_memory_id TEXT)",
+            [],
+        )
+        .expect("create triples");
+        conn.execute(
+            "INSERT INTO entities VALUES ('ent_a','Ijima','project'), ('ent_b','Schubert','project')",
+            [],
+        )
+        .expect("insert entities");
+        conn.execute(
+            "INSERT INTO triples (subject, predicate, object, valid_from, valid_to, confidence, \
+             source_memory_id) VALUES ('ent_a','depends_on','ent_b','2026-08-01',NULL,0.9,'mem_1')",
+            [],
+        )
+        .expect("insert triple");
+        drop(conn);
+        let (entities, triples) = read_pipalace_kg(path.to_str().expect("path")).expect("read kg");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(entities.len(), 2);
+        assert_eq!(triples.len(), 1);
+        assert_eq!(triples[0].subject, "ent_a");
+        assert_eq!(triples[0].confidence, Some(0.9));
+
+        // A corpus without KG tables reads as empty, not an error.
+        let mut bare = std::env::temp_dir();
+        bare.push(format!("ijima_mig_kg_bare_{}.db", std::process::id()));
+        let conn = Connection::open(&bare).expect("open bare");
+        conn.execute("CREATE TABLE memories (id TEXT)", [])
+            .expect("create");
+        drop(conn);
+        let (e, t) = read_pipalace_kg(bare.to_str().expect("path")).expect("read bare");
+        let _ = std::fs::remove_file(&bare);
+        assert!(e.is_empty());
+        assert!(t.is_empty());
+    }
+
+    #[test]
+    fn map_pipalace_kg_translates_ids_to_names() {
+        let entities = vec![
+            PiPalaceEntity {
+                id: "ent_a".into(),
+                name: "Ijima".into(),
+                entity_type: "project".into(),
+            },
+            PiPalaceEntity {
+                id: "ent_b".into(),
+                name: "Schubert".into(),
+                entity_type: "project".into(),
+            },
+            PiPalaceEntity {
+                id: "ent_dup".into(),
+                name: "Ijima".into(), // duplicate name: merges with ent_a
+                entity_type: "project".into(),
+            },
+            PiPalaceEntity {
+                id: "ent_empty".into(),
+                name: "   ".into(), // nameless: unmappable
+                entity_type: "unknown".into(),
+            },
+        ];
+        let triples = vec![
+            PiPalaceTriple {
+                id: 1,
+                subject: "ent_a".into(),
+                predicate: "depends_on".into(),
+                object: "ent_b".into(),
+                valid_from: Some("2026-08-01".into()),
+                valid_to: None,
+                confidence: Some(0.9),
+                source_memory_id: Some("mem_1".into()),
+            },
+            PiPalaceTriple {
+                id: 2,
+                subject: "ent_dup".into(), // same name → dedups onto Ijima
+                predicate: "ships_with".into(),
+                object: "ent_b".into(),
+                valid_from: Some("2026-08-02".into()),
+                valid_to: Some("2026-08-10".into()),
+                confidence: None,
+                source_memory_id: None,
+            },
+            PiPalaceTriple {
+                id: 3,
+                subject: "ent_missing".into(), // orphan → dropped
+                predicate: "broken".into(),
+                object: "ent_a".into(),
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                source_memory_id: None,
+            },
+            PiPalaceTriple {
+                id: 4,
+                subject: "ent_empty".into(), // nameless → dropped
+                predicate: "broken".into(),
+                object: "ent_a".into(),
+                valid_from: None,
+                valid_to: None,
+                confidence: None,
+                source_memory_id: None,
+            },
+        ];
+        let kg = map_pipalace_kg(&entities, &triples);
+        assert_eq!(kg.unmapped, 2);
+        assert_eq!(kg.triples.len(), 2);
+        assert_eq!(kg.triples[0].subject, "Ijima");
+        assert_eq!(kg.triples[0].object, "Schubert");
+        assert_eq!(kg.triples[0].confidence, 0.9);
+        assert_eq!(kg.triples[1].subject, "Ijima"); // ent_dup merged
+        assert_eq!(kg.triples[1].valid_to.as_deref(), Some("2026-08-10"));
+        assert_eq!(kg.triples[1].confidence, 1.0);
     }
 
     #[tokio::test]

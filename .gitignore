@@ -1,3 +1,4 @@
 /target
 book/book/
 /integrations/pi/pkg/
+/integrations/pi/node_modules/
