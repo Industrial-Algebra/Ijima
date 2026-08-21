@@ -10,7 +10,7 @@ policy→issuance linkage (#20.3). Ijima v0.1.0→develop consumes Schubert 0.4.
 Adopt Schubert 0.5 **before the v0.2.0 tag** (full adoption), in the
 zero-re-mint window: no production daemon exists yet, so the GrantToken
 wire-format break (`nonce(16) | tag(1) | expires_at`) costs nothing today
-and would cost a fleet-wide re-mint after laniakea deploys.
+and would cost a fleet-wide re-mint after the central instance deploys.
 
 ### 1. Expiry — adopted, opt-in per grant
 

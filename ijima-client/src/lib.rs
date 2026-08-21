@@ -735,8 +735,8 @@ impl Client {
     }
 
     /// Sends a request, retrying with exponential backoff when the server
-    /// answers `429 Too Many Requests` (the daemon's rate limiter — see
-    /// the laniakea import incident where 13k rows were silently skipped).
+    /// answers `429 Too Many Requests` (the daemon's rate limiter — see a
+    /// production import incident where 13k rows were silently skipped).
     /// Backoff: 250ms · 500ms · 1s · 2s · 4s · 8s (≈16s total) before the
     /// final response is surfaced to the caller.
     #[cfg(feature = "remote")]
