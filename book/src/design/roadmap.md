@@ -11,6 +11,12 @@
   kit, multi-source import over HTTP (WS2), membership-gated org walls
   (WS3), Proserpina agent surface (WS0), surrealdb 3, the book you are
   reading.
+- **v0.2.1 "Laniakea Lessons"** (2026-08-21) — first production
+  deployment hardening: knowledge-graph import (entities + triples
+  alongside memories, id-is-name re-addressing), client 429 backoff
+  (rate-limited daemons slow imports down, never drop rows),
+  reproducible pi-extension build. Found on laniakea, the fleet's
+  central brain.
 
 **Next (0.3 horizon):**
 
