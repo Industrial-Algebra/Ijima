@@ -2548,7 +2548,7 @@ mod tests {
     #[cfg(feature = "rate-limit")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn import_memories_backs_off_through_rate_limit() {
-        // Regression (laniakea, 2026-08-21): the first 14k-row import lost
+        // Regression (production, 2026-08-21): the first 14k-row import lost
         // 13.6k memories because 429s were counted as skips. The client now
         // retries with backoff, so the same import completes — slowly —
         // through a tiny rate bucket. Real socket, real client.

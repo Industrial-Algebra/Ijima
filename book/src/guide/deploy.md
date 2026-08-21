@@ -2,13 +2,13 @@
 
 The reference deployment is a single central instance on a trusted
 server, with every workstation as a thin client. This chapter condenses
-the full runbook (`docs/deploy/laniakea.md` in the repository) to the
+the full runbook (`docs/deploy/central-instance.md` in the repository) to the
 essentials.
 
 ## Topology
 
 ```
-workstations (pi, agents)          laniakea (or any always-on host)
+workstations (pi, agents)          the central instance (always-on host)
 ┌────────────────────┐   HTTP    ┌──────────────────────────┐
 │ IJIMA_URL=...      │──────────▶│ ijima serve (systemd)    │
 │ IJIMA_TOKEN=...    │  tailnet  │ /var/lib/ijima (NVMe)    │
