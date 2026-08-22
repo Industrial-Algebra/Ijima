@@ -161,6 +161,7 @@ impl SurrealStore {
         DEFINE TABLE IF NOT EXISTS namespace_members SCHEMALESS;
         DEFINE INDEX IF NOT EXISTS nmem_ns      ON TABLE namespace_members FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS nmem_ns_princ ON TABLE namespace_members FIELDS namespace, principal;
+        DEFINE INDEX IF NOT EXISTS nmem_princ    ON TABLE namespace_members FIELDS principal;
         DEFINE INDEX IF NOT EXISTS mem_ns        ON TABLE memories       FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS mem_ns_hash   ON TABLE memories       FIELDS namespace, content_hash;
         DEFINE INDEX IF NOT EXISTS turns_ns_sess ON TABLE session_turns   FIELDS namespace, session_id;
@@ -279,6 +280,12 @@ where
 {
     let wrapped: Vec<surrealdb::types::SerdeWrapper<T>> = result.take(0).map_err(store_err)?;
     Ok(wrapped.into_iter().map(|w| w.0).collect())
+}
+
+/// A `SELECT namespace` projection row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NsOnly {
+    namespace: String,
 }
 
 // ---------- wire records ----------
@@ -1195,6 +1202,23 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         Ok(record.is_some())
+    }
+
+    async fn list_namespaces_for_principal(&self, principal: &str) -> Result<Vec<NamespaceId>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT namespace FROM {NAMESPACE_MEMBERS_TABLE} WHERE principal = $p \
+                 ORDER BY namespace"
+            ))
+            .bind(("p", principal.to_string()))
+            .await
+            .map_err(store_err)?;
+        let rows: Vec<NsOnly> = take_vec(&mut result)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| NamespaceId::new(r.namespace))
+            .collect())
     }
 }
 

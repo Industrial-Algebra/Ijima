@@ -62,7 +62,7 @@ pub mod federation;
 
 pub use capabilities::intersection_number;
 pub use diary::DiaryEntry;
-pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding};
+pub use embeddings::{DEFAULT_EMBEDDING_DIM, Embedder, Embedding, HashEmbedder};
 pub use error::IjimaError;
 pub use knowledge::{
     Entity, EntityId, EntityRecord, ImportTriple, KgImportCounts, KgStats, KnowledgeGraph, Triple,
