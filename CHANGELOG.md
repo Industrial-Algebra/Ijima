@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **NixOS support**: root `flake.nix` — `packages.x86_64-linux.ijima`
+  (built from the repo's own source on the pinned nightly toolchain the
+  release was verified on; nixpkgs' stable rustc mis-selects diskann's
+  AVX-512 VNNI intrinsic), `nixosModules.ijima` (hardened systemd service
+  module: `services.ijima.{enable,package,dataDir,bindAddress,port,user,
+  memoryMax}`), and a `module-eval` flake check that integrates the module
+  into a real NixOS evaluation. Book: new "NixOS" guide chapter.
+
+
 - **`HashEmbedder`** (`ijima-core`): deterministic, dependency-free
   embedder for tests/examples — consistent geometry without a model
   (model id `hash-embedder` so provenance detects it). Unblocked the
@@ -24,14 +33,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   empty). New `Store::list_namespaces_for_principal` (backed by a
   principal index on `namespace_members`) drives wall discovery;
   membership still gates — absent walls never appear.
-
-- **NixOS support**: root `flake.nix` — `packages.x86_64-linux.ijima`
-  (built from the repo's own source on the pinned nightly toolchain the
-  release was verified on; nixpkgs' stable rustc mis-selects diskann's
-  AVX-512 VNNI intrinsic), `nixosModules.ijima` (hardened systemd service
-  module: `services.ijima.{enable,package,dataDir,bindAddress,port,user,
-  memoryMax}`), and a `module-eval` flake check that integrates the module
-  into a real NixOS evaluation. Book: new "NixOS" guide chapter.
 
 ## [0.2.1] — 2026-08-21
 
