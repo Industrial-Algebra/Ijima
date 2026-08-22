@@ -1,4 +1,4 @@
-# Ijima daemon configuration — laniakea central instance.
+# Ijima daemon configuration — central instance.
 #
 # Resolution order: built-in defaults < this file < env vars < CLI flags.
 # Install at /etc/ijima/ijima.toml (or point IJIMA_CONFIG at it).
@@ -9,7 +9,7 @@ host = "127.0.0.1"
 port = 7373
 
 # Data directory: SurrealDB store (ijima.db) + issuer key land here.
-# On laniakea this is the NVMe pool (fast random IO for SurrealKv).
+# Keep this on fast storage (SSD/NVMe — random IO for SurrealKv).
 data_dir = "/var/lib/ijima"
 
 # Issuer key (default: <data_dir>/issuer.key). BACK THIS UP — losing it
