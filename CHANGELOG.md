@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **NixOS support**: root `flake.nix` — `packages.x86_64-linux.ijima`
+  (built from the repo's own source on the pinned nightly toolchain the
+  release was verified on; nixpkgs' stable rustc mis-selects diskann's
+  AVX-512 VNNI intrinsic), `nixosModules.ijima` (hardened systemd service
+  module: `services.ijima.{enable,package,dataDir,bindAddress,port,user,
+  memoryMax}`), and a `module-eval` flake check that integrates the module
+  into a real NixOS evaluation. Book: new "NixOS" guide chapter.
+
+## [0.2.1] — 2026-08-21
+
+### Added
+
 - **Knowledge-graph import** (`ijima import mempalace`): pi-mempalace
   `entities` + `triples` tables now import alongside memories — entities
   re-addressed from opaque `ent_*` hashes to Ijima's id-is-name
@@ -15,8 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   temporal range (`valid_to` applied as invalidation), orphan references
   counted as `unmapped`. Client surface: `add_triple_in`,
   `invalidate_triple_in`, `import_kg`; `POST /kg/triples` honors
-  `?namespace=` (found on the first laniakea deployment: rindler's 170
-  entities / 124 triples stayed behind).
+  `?namespace=` (found on the first production deployment: a source
+  corpus's 170 entities / 124 triples stayed behind).
 - CLI import report now nests per-layer counts:
   `{ "memories": …, "knowledge": …, "unmapped": n }`.
 
@@ -25,7 +37,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Client 429 backoff**: all HTTP calls retry on `Too Many Requests`
   with exponential backoff (250 ms doubling, six attempts, ~16 s) before
   surfacing the error. Previously an import against a rate-limited daemon
-  silently counted 429'd rows as `skipped` — the first laniakea import
+  silently counted 429'd rows as `skipped` — the first production import
   lost 13,617 of 14,444 memories this way. Regression-tested E2E against
   a live rate limiter.
 - **pi extension build** (`integrations/pi`): `package.json` now points

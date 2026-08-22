@@ -20,6 +20,7 @@
 - [The Mining Pipeline](./guide/mining.md)
 - [pi Thin-Client Integration](./guide/pi.md)
 - [Deploying on a Server](./guide/deploy.md)
+- [NixOS](./guide/nix.md)
 - [Feature Flags](./guide/feature-flags.md)
 
 # API Reference
