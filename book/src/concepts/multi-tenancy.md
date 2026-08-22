@@ -65,3 +65,18 @@ are computed per namespace; the knowledge graph is namespaced per
 triple/entity; sessions and diaries carry their namespace. The
 `/palace/graph` and `/tunnel` traversals operate within one namespace's
 view by design.
+
+## What a search "sees"
+
+`POST /memories/search` takes a `scope`:
+
+- `personal` (default): the resolved namespace only — the caller's
+  private namespace, or the `?namespace=` override.
+- `visible`: **the principal's readable world** — own private + the
+  `global` commons + open `ns_import_*` staging + every org wall they
+  hold membership in, merged and ranked by similarity across all of
+  them. The pi extension searches `visible` so a fresh session finds
+  the whole brain, not just its own (initially empty) namespace.
+
+Membership still gates: a wall the principal is absent from never
+  appears in `visible` results.

@@ -252,6 +252,10 @@ pub trait Store: Send + Sync {
     /// reads/writes).
     async fn is_namespace_member(&self, ns: &NamespaceId, principal: &str) -> Result<bool>;
 
+    /// Every namespace `principal` holds membership in (their org walls).
+    /// Backs `scope=visible` search: the union of private + global + these
+    /// + open `ns_import_*` staging is the principal's readable world.
+    async fn list_namespaces_for_principal(&self, principal: &str) -> Result<Vec<NamespaceId>>;
     // ===== Mining review queue (ADR M2, M3) =====
 
     /// Stages a PendingReview extraction in the per-namespace queue.

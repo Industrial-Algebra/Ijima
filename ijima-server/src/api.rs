@@ -518,8 +518,9 @@ struct SearchRequest {
     text: String,
     limit: Option<usize>,
     /// Search scope: `personal` (default — the resolved namespace only) or
-    /// `visible` (the principal's private namespace + the `global` commons,
-    /// merged by similarity). The pi integration uses `visible` for parity
+    /// `visible` (the principal's readable world: own private + `global`
+    /// commons + open `ns_import_*` staging + member org walls, merged by
+    /// similarity). The pi integration uses `visible` for parity
     /// with pi-mempalace's global search.
     scope: Option<String>,
 }
@@ -544,25 +545,39 @@ async fn search_memories(
     let query = embedder.embed(&req.text).map_err(internal)?;
     let limit = req.limit.unwrap_or(10);
 
-    // `visible` scope: merge the principal's private namespace + the global
-    // commons, ranked by similarity across both (pi-mempalace parity). The
-    // `personal` default searches only the resolved namespace.
+    // `visible` scope: the principal's readable world — own private
+    // namespace + the `global` commons + open `ns_import_*` staging +
+    // every org wall they hold membership in (WS3) — merged and ranked
+    // by similarity across all of them (pi-mempalace parity; the "empty
+    // brain" incident: the pre-WS2 definition only merged private +
+    // global, so freshly-imported corpora were invisible).
     let hits = if req.scope.as_deref() == Some("visible") {
         let own_ns = principal.0.personal_namespace();
-        let global_ns = NamespaceId::new("global");
-        let own_hits = store
-            .search_memories(&own_ns, &query, limit)
+        let mut namespaces = vec![own_ns.clone(), NamespaceId::new("global")];
+        for ns in store
+            .list_namespaces_for_principal(principal.0.principal.as_str())
             .await
-            .map_err(internal)?;
-        let global_hits = if own_ns == global_ns {
-            Vec::new()
-        } else {
-            store
-                .search_memories(&global_ns, &query, limit)
+            .map_err(internal)?
+        {
+            namespaces.push(ns);
+        }
+        let stats = store.store_stats().await.map_err(internal)?;
+        for ns_count in &stats.namespaces {
+            if ns_count.namespace.starts_with("ns_import_") {
+                namespaces.push(NamespaceId::new(ns_count.namespace.clone()));
+            }
+        }
+        namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        namespaces.dedup_by(|a, b| a.as_str() == b.as_str());
+        let mut merged: Vec<SearchHit> = Vec::new();
+        for ns in namespaces {
+            let hits = store
+                .search_memories(&ns, &query, limit)
                 .await
-                .map_err(internal)?
-        };
-        merge_search_hits(own_hits, global_hits, limit)
+                .map_err(internal)?;
+            merged = merge_search_hits(merged, hits, limit);
+        }
+        merged
     } else {
         let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
         store
@@ -2459,6 +2474,122 @@ mod tests {
         .unwrap();
         assert_eq!(mem.content, "doctrine body");
         assert_eq!(mem.source, ijima_core::memory::MemorySource::Doctrine);
+    }
+
+    #[cfg(feature = "backend-surreal")]
+    #[tokio::test]
+    async fn visible_scope_searches_the_principals_readable_world() {
+        // The "empty brain" regression: scope=visible used to merge only
+        // private + global, so imported corpora and org-wall content were
+        // invisible to the pi integration. Visible must span private +
+        // global + open ns_import_* staging + member walls — and NOT walls
+        // the principal is absent from.
+        use ijima_core::HashEmbedder;
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let embedder: Arc<dyn ijima_core::Embedder> = Arc::new(HashEmbedder::default());
+        let store_inner = Arc::new(
+            crate::SurrealStore::open_embedded_with(embedder.clone())
+                .await
+                .expect("open"),
+        );
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app(
+            auth.clone(),
+            store.clone(),
+            kg,
+            Some(embedder),
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+        );
+        let read = bearer(&auth, "elliott", "memory:read");
+
+        // Seed one distinct memory per tier.
+        let seed = |ns: &'static str, id: &'static str, content: String| {
+            let store = store.clone();
+            async move {
+                store
+                    .store_memory(
+                        &NamespaceId::new(ns),
+                        Memory {
+                            id: MemoryId(id.into()),
+                            content,
+                            project: "ijima".into(),
+                            topic: "test".into(),
+                            source: MemorySource::AutoCapture,
+                            harness: Harness::Pi,
+                            session_id: None,
+                            origin: ijima_core::InstanceId::local(),
+                            authority: ijima_core::AuthorityScope::local(),
+                            importance: 0.5,
+                            created_at: "0".into(),
+                        },
+                    )
+                    .await
+                    .expect("seed")
+            }
+        };
+        seed("global", "mem_vis_global", "global commons row".into()).await;
+        seed(
+            "ns_import_probe",
+            "mem_vis_import",
+            "import staging row".into(),
+        )
+        .await;
+        seed("ns_wall_member", "mem_vis_wall", "member wall row".into()).await;
+        seed("ns_wall_other", "mem_vis_other", "foreign wall row".into()).await;
+        store
+            .grant_namespace_membership(ijima_core::NamespaceMembership {
+                namespace: "ns_wall_member".into(),
+                principal: "elliott".into(),
+                granted_at_unix: 0,
+                granted_by: "root".into(),
+            })
+            .await
+            .expect("grant");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/search")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "import staging row",
+                            "limit": 50,
+                            "scope": "visible"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let hits = body["memories"].as_array().unwrap().clone();
+        let ids: Vec<&str> = hits
+            .iter()
+            .map(|h| h["memory"]["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"mem_vis_import"), "staging must be visible");
+        assert!(ids.contains(&"mem_vis_global"), "global must be visible");
+        assert!(ids.contains(&"mem_vis_wall"), "member wall must be visible");
+        assert!(
+            !ids.contains(&"mem_vis_other"),
+            "a wall the principal is absent from must stay invisible"
+        );
     }
 
     #[tokio::test]

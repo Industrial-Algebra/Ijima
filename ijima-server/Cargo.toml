@@ -56,7 +56,7 @@ proserpina-agent = { workspace = true, optional = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = "0.8"
+toml = "1.1"
 async-trait = "0.1"
 axum = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
