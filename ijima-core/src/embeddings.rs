@@ -79,6 +79,60 @@ pub trait Embedder: Send + Sync {
     }
 }
 
+/// Deterministic, dependency-free embedder for tests, examples, and
+/// embeddings-less deployments.
+///
+/// Hashes the text into a fixed-dimension L2-normalized vector: no
+/// semantics, but consistent geometry — the same text always yields the
+/// same vector, so dedup and round-trip assertions work without a model.
+/// **Not for production**: similarity between different texts is noise.
+/// Model id is `hash-embedder` (embedding provenance still detects it).
+#[derive(Debug, Clone)]
+pub struct HashEmbedder {
+    /// Vector dimensionality (default [`DEFAULT_EMBEDDING_DIM`]).
+    pub dims: usize,
+}
+
+impl Default for HashEmbedder {
+    fn default() -> Self {
+        Self {
+            dims: DEFAULT_EMBEDDING_DIM,
+        }
+    }
+}
+
+impl Embedder for HashEmbedder {
+    fn dim(&self) -> usize {
+        self.dims
+    }
+
+    fn embed(&self, text: &str) -> Result<Embedding> {
+        use std::hash::{Hash, Hasher};
+        let mut vec = vec![0.0f32; self.dims];
+        // Seed one hash per vector lane from (lane, text) — every lane
+        // differs, every text differs, all deterministic.
+        for (lane, slot) in vec.iter_mut().enumerate() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            lane.hash(&mut h);
+            text.hash(&mut h);
+            let raw = h.finish();
+            // Map the u64 to [-1, 1) — deterministic, zero mean.
+            *slot = ((raw >> 11) as f64 / (1u64 << 52) as f64 - 0.5) as f32 * 2.0;
+        }
+        let norm = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if norm > f32::EPSILON {
+            for v in &mut vec {
+                *v /= norm;
+            }
+        }
+        Ok(Embedding(vec))
+    }
+
+    fn model_id(&self) -> &str {
+        "hash-embedder"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

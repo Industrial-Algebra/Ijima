@@ -8,6 +8,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`HashEmbedder`** (`ijima-core`): deterministic, dependency-free
+  embedder for tests/examples — consistent geometry without a model
+  (model id `hash-embedder` so provenance detects it). Unblocked the
+  first route-level search tests.
+
+### Fixed
+
+- **`scope=visible` now spans the principal's readable world**: own
+  private + `global` commons + open `ns_import_*` staging + every org
+  wall they hold membership in (pre-WS2 definition merged only private +
+  global, so imported corpora and wall content were invisible to
+  `scope=visible` searches — the "empty brain" first seen by a live pi
+  session: extension installed, token valid, daemon full, every search
+  empty). New `Store::list_namespaces_for_principal` (backed by a
+  principal index on `namespace_members`) drives wall discovery;
+  membership still gates — absent walls never appear.
+
 - **NixOS support**: root `flake.nix` — `packages.x86_64-linux.ijima`
   (built from the repo's own source on the pinned nightly toolchain the
   release was verified on; nixpkgs' stable rustc mis-selects diskann's
