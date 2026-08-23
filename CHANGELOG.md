@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`ijima` skill ships with the pi package** (`skills/ijima/SKILL.md`,
+  npm 0.2.2): the namespace mental model + diagnostics ladder for agents
+  — why "empty" results are usually scoping (personal-namespace probes,
+  nonexistent-namespace browses), why `memory_search` (`scope=visible`)
+  is the real brain test, why the `/repos` table error is a cosmetic
+  fingerprint on every store, and "never conclude wrong-data-dir without
+  the admin census". Encodes every misdiagnosis observed in the field.
+
 - **pi auto-capture + wake-up injection + token fallback** (npm 0.2.3):
   the extension now closes the memory loop without agent diligence —
   `turn_end` stores each exchange at the `AutoCapture` tier (length
@@ -18,14 +26,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   shell didn't export it. Verified E2E against a live daemon: the
   exchange captured on `turn_end` appears in the very next injected
   system prompt. Ported from pi-mempalace's three-prong design.
-
-- **`ijima` skill ships with the pi package** (`skills/ijima/SKILL.md`,
-  npm 0.2.2): the namespace mental model + diagnostics ladder for agents
-  — why "empty" results are usually scoping (personal-namespace probes,
-  nonexistent-namespace browses), why `memory_search` (`scope=visible`)
-  is the real brain test, why the `/repos` table error is a cosmetic
-  fingerprint on every store, and "never conclude wrong-data-dir without
-  the admin census". Encodes every misdiagnosis observed in the field.
 
 ## [0.2.2] — 2026-08-22
 
