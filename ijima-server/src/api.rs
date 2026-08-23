@@ -3574,6 +3574,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repo_list_on_fresh_store_is_empty_not_error() {
+        // Regression (field, v0.2.2): `repo_directory` was missing from the
+        // open-time DDL — a SELECT from a never-written table hard-errors on
+        // surrealdb 3, so every fresh deployment's `GET /repos` returned 500
+        // "table does not exist". The round-trip test below masked it: its
+        // register-first upsert materializes the table implicitly. List
+        // FIRST on a fresh store must return an empty 200.
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/repos")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body.as_array().map(Vec::len), Some(0));
+    }
+
+    #[tokio::test]
     async fn repo_register_list_resolve_round_trips() {
         let (app, auth) = app_with_store().await;
         let admin = bearer(&auth, "elliott", ADMIN);
