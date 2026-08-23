@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **pi auto-capture + wake-up injection + token fallback** (npm 0.2.3):
+  the extension now closes the memory loop without agent diligence —
+  `turn_end` stores each exchange at the `AutoCapture` tier (length
+  gates, 2000-char truncation, silent failure), `before_agent_start`
+  appends an `## Agent Memory (ACTIVE)` block (tool reminder + wake-up
+  essentials + doctrine, refreshed per session), and `IJIMA_TOKEN`
+  falls back to `~/.config/ijima/token` / `$IJIMA_TOKEN_FILE` when the
+  shell didn't export it. Verified E2E against a live daemon: the
+  exchange captured on `turn_end` appears in the very next injected
+  system prompt. Ported from pi-mempalace's three-prong design.
+
 - **`ijima` skill ships with the pi package** (`skills/ijima/SKILL.md`,
   npm 0.2.2): the namespace mental model + diagnostics ladder for agents
   — why "empty" results are usually scoping (personal-namespace probes,
