@@ -159,6 +159,7 @@ impl SurrealStore {
         DEFINE TABLE IF NOT EXISTS triples           SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS token_revocations SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS namespace_members SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS repo_directory  SCHEMALESS;
         DEFINE INDEX IF NOT EXISTS nmem_ns      ON TABLE namespace_members FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS nmem_ns_princ ON TABLE namespace_members FIELDS namespace, principal;
         DEFINE INDEX IF NOT EXISTS nmem_princ    ON TABLE namespace_members FIELDS principal;
