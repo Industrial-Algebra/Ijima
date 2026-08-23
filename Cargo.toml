@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Industrial-Algebra/Ijima"
@@ -20,11 +20,11 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
-ijima-core = { version = "0.2.1", path = "ijima-core" }
-ijima-server = { version = "0.2.1", path = "ijima-server" }
-ijima-miner = { version = "0.2.1", path = "ijima-miner" }
+ijima-core = { version = "0.2.2", path = "ijima-core" }
+ijima-server = { version = "0.2.2", path = "ijima-server" }
+ijima-miner = { version = "0.2.2", path = "ijima-miner" }
 proserpina-agent = { version = "0.1.0" }
-ijima-client = { version = "0.2.1", path = "ijima-client" }
+ijima-client = { version = "0.2.2", path = "ijima-client" }
 
 # Shared external dependencies
 thiserror = "2"
