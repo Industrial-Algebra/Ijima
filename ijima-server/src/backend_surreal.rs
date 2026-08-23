@@ -1299,6 +1299,32 @@ impl KnowledgeGraph for SurrealStore {
         // Native graph edges (RELATE) are a future optimization for
         // multi-hop traversal; v0 queries via subject/object fields.
         let triple_id = format!("{subj}:{predicate}:{obj}");
+        // Idempotent add (field report, rindler re-import): a `create` that
+        // propagates already-exists turns every re-import into 500+skip;
+        // re-adding a triple the corpus already holds must read back as
+        // success (mirrors memory content-hash dedup semantics).
+        if let Some(existing) = self
+            .db
+            .select::<Option<surrealdb::types::SerdeWrapper<TripleRecord>>>((
+                TRIPLES_TABLE,
+                triple_id.clone(),
+            ))
+            .await
+            .map_err(store_err)?
+        {
+            let e = existing.0;
+            return Ok(Triple {
+                id: triple_id,
+                subject: EntityId(e.subject),
+                predicate: e.predicate,
+                object: EntityId(e.object),
+                valid_from: e.valid_from,
+                valid_to: e.valid_to,
+                confidence: e.confidence,
+                namespace: e.namespace,
+                source_memory_id: e.source_memory_id,
+            });
+        }
         let record = TripleRecord {
             triple_id: triple_id.clone(),
             subject: subj.clone(),
@@ -2025,6 +2051,33 @@ mod tests {
     }
 
     // ===== knowledge graph =====
+
+    #[tokio::test]
+    async fn add_triple_is_idempotent_on_reimport() {
+        // Field report (rindler re-import): create-that-propagates turned
+        // every already-existing triple into a store error (500 + client
+        // skip). Re-adding a triple the corpus already holds must read
+        // back as success — mirror of memory content-hash dedup.
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_kg_idem");
+        let args = (
+            EntityId::new("Ijima"),
+            "depends_on",
+            EntityId::new("Schubert"),
+        );
+        let first = store
+            .add_triple(&ns, args.0.clone(), args.1, args.2.clone(), None, 1.0, None)
+            .await
+            .expect("first add");
+        let second = store
+            .add_triple(&ns, args.0, args.1, args.2, None, 1.0, None)
+            .await
+            .expect("re-add must not error");
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.valid_to, None);
+        let stats = store.knowledge_stats(&ns).await.expect("stats");
+        assert_eq!(stats.triples, 1, "re-add must not duplicate");
+    }
 
     #[tokio::test]
     async fn add_triple_then_query_entity() {

@@ -22,6 +22,7 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true, optional = true }
+urlencoding = "2"
 tokio = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 

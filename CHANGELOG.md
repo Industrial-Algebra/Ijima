@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **KG re-import was error-prone on both ends** (found during the fleet
+  gap-import pass): (1) `invalidate_triple_in` URL-embedded the
+  deterministic triple id unencoded — paragraph-long entity names
+  (common in imported corpora) contain slashes that split the path
+  (404s); the id is now percent-encoded. (2) `add_triple` propagated
+  already-exists on re-add (500 + client skip for every existing
+  triple); re-adding now reads back the existing record — the KG
+  equivalent of memory content-hash dedup, making corpus re-imports
+  true no-ops.
+
+
 - **pi wake-up reminder injection was skipped when wake-up was empty**
   (npm 0.2.4): fresh principals — the ones that need the tool reminder
   most — never saw the `## Agent Memory (ACTIVE)` block. The reminder is

@@ -338,8 +338,14 @@ impl Client {
     /// Returns [`IjimaError::Transport`] on any HTTP failure.
     #[cfg(feature = "remote")]
     pub async fn invalidate_triple_in(&self, namespace: &str, triple_id: &str) -> Result<()> {
+        // Entity names are free-form (id-is-name convention) and appear
+        // inside the deterministic triple id `<subj>:<pred>:<obj>` — URL-
+        // encode the segment so slashes/spaces in names (paragraph-long
+        // entity names are common in imported corpora) don't split the
+        // path (field report: 404s on historical triples, rindler import).
+        let encoded = urlencoding::encode(triple_id);
         let path = build_path(
-            &format!("/kg/triples/{triple_id}/invalidate"),
+            &format!("/kg/triples/{encoded}/invalidate"),
             Some(namespace),
             None,
         );
