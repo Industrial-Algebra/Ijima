@@ -35,10 +35,7 @@ an Ijima daemon running elsewhere. All memories live **server-side**, in
 3. **Browsing a namespace that never existed returns an empty list**,
    indistinguishable from an empty one. Verify names from the table above;
    imports are named after their *source host/system*, not generic words.
-4. **`/repos` failing with "table 'repo_directory' does not exist"** is a
-   known cosmetic bug on **every** store, populated or not. It is NOT a
-   fresh-store fingerprint. Ignore it.
-5. **Empty `scope=visible` searches on a populated daemon** → the daemon is
+4. **Empty `scope=visible` searches on a populated daemon** → the daemon is
    older than v0.2.2 (visible used to span private + global only). Ask the
    operator to check the daemon version; do not repoint data dirs.
 
