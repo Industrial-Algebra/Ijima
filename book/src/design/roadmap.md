@@ -11,6 +11,10 @@
   kit, multi-source import over HTTP (WS2), membership-gated org walls
   (WS3), Proserpina agent surface (WS0), surrealdb 3, the book you are
   reading.
+- **v0.2.3 "Loop-Closers"** (2026-08-23) — the pi extension completes
+  the memory loop: auto-capture per turn, wake-up injection per session,
+  token-file fallback; the bundled agent skill; `repo_directory` DDL fix
+  (fresh-store `/repos` was a 500).
 - **v0.2.2 "Visible World"** (2026-08-22) — the "empty brain" fix:
   `scope=visible` search now spans the principal's readable world
   (private + global + import staging + member org walls); first-party
