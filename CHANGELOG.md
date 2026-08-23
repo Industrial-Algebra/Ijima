@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`ijima` skill ships with the pi package** (`skills/ijima/SKILL.md`,
+  npm 0.2.2): the namespace mental model + diagnostics ladder for agents
+  — why "empty" results are usually scoping (personal-namespace probes,
+  nonexistent-namespace browses), why `memory_search` (`scope=visible`)
+  is the real brain test, why the `/repos` table error is a cosmetic
+  fingerprint on every store, and "never conclude wrong-data-dir without
+  the admin census". Encodes every misdiagnosis observed in the field.
+
 ### Fixed
 
 - **`repo_directory` missing from the open-time DDL**: `GET /repos` on a
