@@ -6,6 +6,7 @@ On merge to `main` touching `doctrine/**`, this workflow ingests the
 name: Ingest doctrine
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -14,6 +15,9 @@ on:
 
 jobs:
   ingest:
+    # No-op until the target daemon + secrets are provisioned (0.2.3:
+    # was failing 0s on every push since inception).
+    if: ${{ vars.IJIMA_INGEST_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
