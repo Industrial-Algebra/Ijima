@@ -4,6 +4,18 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`ijima` skill ships with the pi package** (`skills/ijima/SKILL.md`,
+  npm 0.2.2): the namespace mental model + diagnostics ladder for agents
+  — why "empty" results are usually scoping (personal-namespace probes,
+  nonexistent-namespace browses), why `memory_search` (`scope=visible`)
+  is the real brain test, why the `/repos` table error is a cosmetic
+  fingerprint on every store, and "never conclude wrong-data-dir without
+  the admin census". Encodes every misdiagnosis observed in the field.
+
 ## [0.2.2] — 2026-08-22
 
 ### Added

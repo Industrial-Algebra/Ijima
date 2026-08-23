@@ -15,7 +15,8 @@
     "index.ts",
     "pkg/",
     "README.md",
-    "package.json"
+    "package.json",
+    "skills/"
   ],
   "scripts": {
     "build:wasm": "wasm-pack build ../../ijima-pi --target nodejs --out-dir ../integrations/pi/pkg --out-name ijima_pi",
@@ -26,5 +27,10 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "pi": {
+    "skills": [
+      "skills"
+    ]
   }
 }
