@@ -11,6 +11,10 @@
   kit, multi-source import over HTTP (WS2), membership-gated org walls
   (WS3), Proserpina agent surface (WS0), surrealdb 3, the book you are
   reading.
+- **v0.2.2 "Visible World"** (2026-08-22) — the "empty brain" fix:
+  `scope=visible` search now spans the principal's readable world
+  (private + global + import staging + member org walls); first-party
+  NixOS flake (package + service module); `HashEmbedder` test utility.
 - **v0.2.1 "Field Lessons"** (2026-08-21) — first production
   deployment hardening: knowledge-graph import (entities + triples
   alongside memories, id-is-name re-addressing), client 429 backoff
