@@ -6,6 +6,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import {
   build_search_request,
   parse_search_response,
@@ -33,6 +35,25 @@ type Capability =
 // every route below; the server's geometric `may()` checks containment
 // per-request. See ijimaFetch().
 
+/** Token-file candidates, first hit wins (0600 files, user-owned). */
+const TOKEN_FILES = [
+  process.env.IJIMA_TOKEN_FILE,
+  "~/.config/ijima/token",
+].filter((p): p is string => Boolean(p));
+
+function readTokenFile(): string | null {
+  for (const raw of TOKEN_FILES) {
+    const path = raw.replace("^~", os.homedir());
+    try {
+      const t = fs.readFileSync(path, "utf8").trim();
+      if (t) return t;
+    } catch {
+      // absent/unreadable — next candidate
+    }
+  }
+  return null;
+}
+
 interface FetchResult {
   ok: boolean;
   status: number;
@@ -46,7 +67,11 @@ async function ijimaFetch(
   signal?: AbortSignal,
 ): Promise<FetchResult> {
   const ijimaUrl = process.env.IJIMA_URL ?? "http://127.0.0.1:7373";
-  const token = process.env.IJIMA_TOKEN;
+  // Token resolution: env first, then the well-known private file. The
+  // fallback kills the whole "shell didn't export it" failure class —
+  // systemd units, cron, agent tabs, non-login shells all just work.
+  const token =
+    process.env.IJIMA_TOKEN ?? readTokenFile();
   if (!token) {
     return {
       ok: false,
@@ -552,4 +577,146 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  // ---------------------------------------------------------------------
+  // Auto-capture + wake-up (pi-mempalace parity) — the loop-closers.
+  // Without these the tools exist but nothing reminds the agent they're
+  // there, and conversations evaporate unless saved by hand.
+  // ---------------------------------------------------------------------
+
+  let wakeUpText: string | null = null;
+
+  const refreshWakeUp = async (): Promise<void> => {
+    const { ok, text } = await ijimaFetch("/wakeup", "memory:read", {
+      method: "GET",
+    });
+    if (!ok) {
+      wakeUpText = null;
+      return;
+    }
+    try {
+      const w = JSON.parse(text) as {
+        identity?: unknown;
+        personal_essentials?: Array<{ content?: string }>;
+        doctrine?: Array<{ content?: string }>;
+      };
+      const parts: string[] = [];
+      if (Array.isArray(w.personal_essentials) && w.personal_essentials.length) {
+        parts.push(
+          "### Essentials (from your memory)\n" +
+            w.personal_essentials
+              .slice(0, 20)
+              .map((m) => `- ${(m.content ?? "").slice(0, 200)}`)
+              .join("\n"),
+        );
+      }
+      if (Array.isArray(w.doctrine) && w.doctrine.length) {
+        parts.push(
+          "### Doctrine\n" +
+            w.doctrine
+              .slice(0, 20)
+              .map((m) => `- ${(m.content ?? "").slice(0, 200)}`)
+              .join("\n"),
+        );
+      }
+      wakeUpText = parts.length ? parts.join("\n\n") : null;
+    } catch {
+      wakeUpText = null;
+    }
+  };
+
+  pi.on("session_start", async () => {
+    await refreshWakeUp();
+  });
+
+  // Auto-capture: after each assistant turn, store the exchange. The
+  // extension does the remembering — the agent never has to remember to.
+  // Gates mirror pi-mempalace: min lengths, 2000-char truncation, silent
+  // failure (capture must never interrupt a session). Lands as
+  // AutoCapture provenance server-side; dedup handles repeats.
+  pi.on("turn_end", async (event: any, ctx: any) => {
+    if (event?.message?.role !== "assistant") return;
+    const assistantText = extractText(event?.message?.content);
+    if (!assistantText || assistantText.length < 20) return;
+
+    let userText = "";
+    try {
+      const branch = ctx?.sessionManager?.getBranch?.() ?? [];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
+        if (entry?.type === "message" && entry?.message?.role === "user") {
+          userText = extractText(entry.message.content);
+          break;
+        }
+      }
+    } catch {
+      // branch introspection is best-effort
+    }
+    if (!userText || userText.length < 10) return;
+
+    let exchange = `> ${userText}\n\n${assistantText}`;
+    if (exchange.length > 2000) exchange = exchange.slice(0, 2000) + "\n[truncated]";
+
+    const project = currentProjectName(ctx);
+    const sessionId =
+      ctx?.sessionManager?.getSessionId?.() ??
+      `sess_${Date.now()}`;
+    const id = `mem_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 8)}`;
+    // build_save_request hardcodes Explicit/0.8 (manual-save shape);
+    // auto-capture rewrites the two fields the tiers care about.
+    const body = JSON.parse(
+      build_save_request(id, exchange, project, "general", 0.5),
+    );
+    body.source = "AutoCapture";
+    body.session_id = sessionId;
+    body.created_at = new Date().toISOString();
+    try {
+      await ijimaFetch("/memories", "memory:write", {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    } catch {
+      // silently fail — never interrupt the session
+    }
+  });
+
+  // Wake-up + tool reminder, injected into every system prompt.
+  pi.on("before_agent_start", async (event: any) => {
+    if (!wakeUpText) return;
+    const extra =
+      "\n\n## Agent Memory (ACTIVE)\n" +
+      "You have persistent memory across sessions, backed by the Ijima memory service.\n" +
+      "Use `memory_search` to find past context (try it before concluding anything is new or unknown).\n" +
+      "Use `memory_save` to explicitly remember important decisions, facts, or context.\n" +
+      "Use `knowledge_add` for structured facts (X predicate Y) and `knowledge_query` to query them.\n" +
+      "Conversations are auto-captured at low trust; `memory_save` marks what deserves attention.\n\n" +
+      wakeUpText;
+    return { systemPrompt: event.systemPrompt + extra };
+  });
+}
+
+function extractText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part: any) =>
+        typeof part === "string" ? part : (part?.text ?? ""),
+      )
+      .filter((s: string) => typeof s === "string")
+      .join(" ")
+      .trim();
+  }
+  return "";
+}
+
+function currentProjectName(ctx: any): string {
+  try {
+    const cwd = ctx?.cwd ?? process.cwd();
+    const base = String(cwd).split("/").filter(Boolean).pop();
+    return base ? base.toLowerCase().slice(0, 60) : "general";
+  } catch {
+    return "general";
+  }
 }
