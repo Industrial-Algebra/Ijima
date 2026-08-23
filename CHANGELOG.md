@@ -6,7 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet — v0.3.0 development begins._
+### Fixed
+
+- **pi wake-up reminder injection was skipped when wake-up was empty**
+  (npm 0.2.4): fresh principals — the ones that need the tool reminder
+  most — never saw the `## Agent Memory (ACTIVE)` block. The reminder is
+  now unconditional; wake-up context appends when present. Found by the
+  first live 0.2.3 fleet session.
+- **`pi.extensions` manifest entry was missing — tools and hooks never
+  ran under pi** (npm 0.2.4): the package declared only the skills
+  manifest, so pi file-scanned the skill and never executed `index.js`
+  — silently, on every npm install since 0.2.1. The nine
+  `memory_*`/`knowledge_*` tools, auto-capture, and wake-up injection
+  were absent from every live session (the extension itself was
+  innocent — loads cleanly under a mock API, which is also why our
+  node-level E2E never caught a manifest bug). Found by a fleet session
+  that patched it locally and verified the tools register. Manifest now
+  declares `extensions: ["./index.js"]` alongside the skills.
+- **The injected block now carries the memory-model cheatsheet**: the
+  skill's critical guidance (namespaces, "empty is scoping", visible
+  search first, wake-up self-priming) distilled into every system
+  prompt — the pi-mempalace pattern. Skills are passive (agents must
+  choose to consult them); the cheatsheet is present from turn one. The
+  full skill remains the deep-dive reference.
 
 ## [0.2.3] — 2026-08-23
 
