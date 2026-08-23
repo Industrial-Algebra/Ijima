@@ -516,16 +516,25 @@ export default function (pi) {
     });
     // Wake-up + tool reminder, injected into every system prompt.
     pi.on("before_agent_start", async (event) => {
-        if (!wakeUpText)
-            return;
-        const extra = "\n\n## Agent Memory (ACTIVE)\n" +
+        // The reminder is unconditional — it matters MOST for fresh principals
+        // (no history yet, nothing to recall). Wake-up context appends when
+        // present; the field-reported 0.2.3 flaw skipped the whole injection
+        // when wake-up was empty, so cold principals never saw the reminder.
+        const reminder = "\n\n## Agent Memory (ACTIVE)\n" +
             "You have persistent memory across sessions, backed by the Ijima memory service.\n" +
             "Use `memory_search` to find past context (try it before concluding anything is new or unknown).\n" +
             "Use `memory_save` to explicitly remember important decisions, facts, or context.\n" +
             "Use `knowledge_add` for structured facts (X predicate Y) and `knowledge_query` to query them.\n" +
             "Conversations are auto-captured at low trust; `memory_save` marks what deserves attention.\n\n" +
-            wakeUpText;
-        return { systemPrompt: event.systemPrompt + extra };
+            "### Memory model\n" +
+            "- Memories live in **namespaces**: your personal one starts empty by design; bulk legacy\n" +
+            "  corpora live in `ns_import_*` staging; org walls need membership. An \"empty\" result is\n" +
+            "  usually correct scoping — never conclude the store is broken or misrouted from probes.\n" +
+            "- `memory_search` spans everything you can read. Use it before concluding anything is new.\n" +
+            "- Wake-up context self-primes: auto-captured exchanges surface as essentials next session.";
+        return {
+            systemPrompt: event.systemPrompt + reminder + (wakeUpText ? "\n\n" + wakeUpText : ""),
+        };
     });
 }
 function extractText(content) {
