@@ -32,7 +32,7 @@ let
 in
 rustPlatform.buildRustPackage rec {
   pname = "ijima";
-  version = "0.2.3";
+  version = "0.2.5";
 
   inherit src;
 
