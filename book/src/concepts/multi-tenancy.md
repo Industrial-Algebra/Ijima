@@ -80,3 +80,24 @@ view by design.
 
 Membership still gates: a wall the principal is absent from never
   appears in `visible` results.
+
+## Agent homes
+
+Personal-by-default is right for private notes — and exactly wrong for
+fleet-institutional knowledge, which fragments across per-host silos
+where sibling agents can't recall it. **Agent homes** (0.2.5) point the
+default the other way: clients configured with a home namespace
+(`IJIMA_NAMESPACE`, typically an org wall like `ns_ia_shared`) capture,
+save, dedup-check, *and wake up* in that namespace.
+
+The rules compose cleanly:
+
+- Captures/saves in the home follow the wall's membership — every
+  member agent writes to and reads from one shared pool.
+- Wake-up essentials come from the home: a memory saved on host A
+  greets the next session on host B.
+- Another org's agents set their own wall as home; membership gating
+  applies as always. Homes never widen access — they relocate the
+  default.
+- Unset home = personal namespace: private-by-default stays available
+  for anything that genuinely is per-principal.
