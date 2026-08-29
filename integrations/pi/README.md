@@ -49,7 +49,13 @@ The extension closes the memory loop without agent diligence:
   doctrine (`GET /wakeup`), refreshed per session.
 - **Token fallback** — `IJIMA_TOKEN` env, then `~/.config/ijima/token`
   (or `$IJIMA_TOKEN_FILE`), so shells that didn't source the env still
-  work.
+  work. `IJIMA_URL` falls back to `~/.config/ijima/url` the same way.
+- **Home namespace** — set `IJIMA_NAMESPACE=ns_<org>_shared` and captures,
+  saves, and wake-up operate in that wall instead of the personal
+  namespace: shared knowledge stays shared (and other orgs stay walled).
+  Requires daemon ≥ 0.2.5 for namespaced wake-up; captures work on 0.2.2+.
+- **Content-derived ids** — memories are id'd by content hash
+  (`mem_<hash16>`): same content, same id, meaningful in transcripts.
 
 `memory_save` remains the deliberate path: explicit saves land at the
 `Explicit` tier with higher importance — auto-capture is the floor,

@@ -11,6 +11,10 @@
   kit, multi-source import over HTTP (WS2), membership-gated org walls
   (WS3), Proserpina agent surface (WS0), surrealdb 3, the book you are
   reading.
+- **v0.2.5 "Agent Homes"** (2026-08-29) — shared home namespaces for
+  agents (`IJIMA_NAMESPACE` + namespaced wake-up): fleet knowledge lives
+  in the org wall, not per-host silos; org walls keep other orgs out.
+  Plus URL file fallback and content-derived memory ids.
 - **v0.2.3 "Loop-Closers"** (2026-08-23) — the pi extension completes
   the memory loop: auto-capture per turn, wake-up injection per session,
   token-file fallback; the bundled agent skill; `repo_directory` DDL fix

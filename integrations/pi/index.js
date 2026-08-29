@@ -15,6 +15,49 @@ const TOKEN_FILES = [
     process.env.IJIMA_TOKEN_FILE,
     "~/.config/ijima/token",
 ].filter((p) => Boolean(p));
+/** URL-file candidates, first hit wins (sibling of the token file). */
+const URL_FILES = [
+    process.env.IJIMA_URL_FILE,
+    "~/.config/ijima/url",
+].filter((p) => Boolean(p));
+function readUrlFile() {
+    for (const raw of URL_FILES) {
+        const path = raw.startsWith("~") ? os.homedir() + raw.slice(1) : raw;
+        try {
+            const u = fs.readFileSync(path, "utf8").trim();
+            if (u)
+                return u.replace(/\/$/, "");
+        }
+        catch {
+            // absent — next candidate
+        }
+    }
+    return null;
+}
+/**
+ * The agent's home namespace (env-configured, e.g. `ns_ia_shared`): the
+ * namespace captures/saves/wake-up operate in. Unset = the caller's
+ * personal namespace (server default). Returns "" when unset.
+ */
+function homeNamespace() {
+    return (process.env.IJIMA_NAMESPACE ?? "").trim();
+}
+/** Appends `?namespace=` (or `&`) when a home namespace is configured. */
+function withHome(path) {
+    const ns = homeNamespace();
+    if (!ns)
+        return path;
+    return path + (path.includes("?") ? "&" : "?") + `namespace=${encodeURIComponent(ns)}`;
+}
+/** Deterministic content-derived memory id: same content -> same id. */
+async function contentId(content) {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+    const bytes = new Uint8Array(digest).slice(0, 8);
+    let id = "";
+    for (const b of bytes)
+        id += b.toString(16).padStart(2, "0");
+    return `mem_${id}`;
+}
 function readTokenFile() {
     for (const raw of TOKEN_FILES) {
         const path = raw.replace("^~", os.homedir());
@@ -30,7 +73,9 @@ function readTokenFile() {
     return null;
 }
 async function ijimaFetch(path, cap, init, signal) {
-    const ijimaUrl = process.env.IJIMA_URL ?? "http://127.0.0.1:7373";
+    // URL resolution: env first, then the well-known file — same pattern as
+    // the token, so a configured host needs no shell env at all.
+    const ijimaUrl = process.env.IJIMA_URL ?? readUrlFile() ?? "http://127.0.0.1:7373";
     // Token resolution: env first, then the well-known private file. The
     // fallback kills the whole "shell didn't export it" failure class —
     // systemd units, cron, agent tabs, non-login shells all just work.
@@ -154,9 +199,9 @@ export default function (pi) {
             })),
         }),
         async execute(_tid, params, signal) {
-            const id = `mem_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            const id = await contentId(params.content);
             const body = build_save_request(id, params.content, params.project ?? "general", params.topic ?? "general", params.importance);
-            const { ok, status, text } = await ijimaFetch("/memories", "memory:write", { method: "POST", body }, signal);
+            const { ok, status, text } = await ijimaFetch(withHome("/memories"), "memory:write", { method: "POST", body }, signal);
             if (!ok)
                 return errorContent(status, text);
             const result = JSON.parse(parse_save_response(text));
@@ -206,7 +251,7 @@ export default function (pi) {
         }),
         async execute(_tid, params, signal) {
             const body = build_check_duplicate_request(params.content);
-            const { ok, status, text } = await ijimaFetch("/memories/check", "memory:read", { method: "POST", body }, signal);
+            const { ok, status, text } = await ijimaFetch(withHome("/memories/check"), "memory:read", { method: "POST", body }, signal);
             if (!ok)
                 return errorContent(status, text);
             const result = JSON.parse(parse_check_duplicate_response(text));
@@ -429,7 +474,7 @@ export default function (pi) {
     // ---------------------------------------------------------------------
     let wakeUpText = null;
     const refreshWakeUp = async () => {
-        const { ok, text } = await ijimaFetch("/wakeup", "memory:read", {
+        const { ok, text } = await ijimaFetch(withHome("/wakeup"), "memory:read", {
             method: "GET",
         });
         if (!ok) {
@@ -495,9 +540,7 @@ export default function (pi) {
         const project = currentProjectName(ctx);
         const sessionId = ctx?.sessionManager?.getSessionId?.() ??
             `sess_${Date.now()}`;
-        const id = `mem_${Date.now().toString(36)}_${Math.random()
-            .toString(36)
-            .slice(2, 8)}`;
+        const id = await contentId(exchange);
         // build_save_request hardcodes Explicit/0.8 (manual-save shape);
         // auto-capture rewrites the two fields the tiers care about.
         const body = JSON.parse(build_save_request(id, exchange, project, "general", 0.5));
@@ -505,7 +548,7 @@ export default function (pi) {
         body.session_id = sessionId;
         body.created_at = new Date().toISOString();
         try {
-            await ijimaFetch("/memories", "memory:write", {
+            await ijimaFetch(withHome("/memories"), "memory:write", {
                 method: "POST",
                 body: JSON.stringify(body),
             });
@@ -516,16 +559,25 @@ export default function (pi) {
     });
     // Wake-up + tool reminder, injected into every system prompt.
     pi.on("before_agent_start", async (event) => {
-        if (!wakeUpText)
-            return;
-        const extra = "\n\n## Agent Memory (ACTIVE)\n" +
+        // The reminder is unconditional — it matters MOST for fresh principals
+        // (no history yet, nothing to recall). Wake-up context appends when
+        // present; the field-reported 0.2.3 flaw skipped the whole injection
+        // when wake-up was empty, so cold principals never saw the reminder.
+        const reminder = "\n\n## Agent Memory (ACTIVE)\n" +
             "You have persistent memory across sessions, backed by the Ijima memory service.\n" +
             "Use `memory_search` to find past context (try it before concluding anything is new or unknown).\n" +
             "Use `memory_save` to explicitly remember important decisions, facts, or context.\n" +
             "Use `knowledge_add` for structured facts (X predicate Y) and `knowledge_query` to query them.\n" +
             "Conversations are auto-captured at low trust; `memory_save` marks what deserves attention.\n\n" +
-            wakeUpText;
-        return { systemPrompt: event.systemPrompt + extra };
+            "### Memory model\n" +
+            "- Memories live in **namespaces**: your personal one starts empty by design; bulk legacy\n" +
+            "  corpora live in `ns_import_*` staging; org walls need membership. An \"empty\" result is\n" +
+            "  usually correct scoping — never conclude the store is broken or misrouted from probes.\n" +
+            "- `memory_search` spans everything you can read. Use it before concluding anything is new.\n" +
+            "- Wake-up context self-primes: auto-captured exchanges surface as essentials next session.";
+        return {
+            systemPrompt: event.systemPrompt + reminder + (wakeUpText ? "\n\n" + wakeUpText : ""),
+        };
     });
 }
 function extractText(content) {

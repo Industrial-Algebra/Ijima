@@ -6,7 +6,57 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-_Nothing yet — v0.3.0 development begins._
+_Nothing yet — 0.3.0 development begins.
+
+## [0.2.5] — 2026-08-29
+
+### Added
+
+- **Agent homes** (0.2.5): `IJIMA_NAMESPACE` selects a shared home
+  namespace for pi captures, saves, dedup checks, and wake-up
+  (`?namespace=` on `GET /wakeup`, the last route without it) — shared
+  knowledge stays shared, org walls keep other orgs out. Field origin:
+  fleet-institutional memory landed in per-host private namespaces and
+  sibling agents could not recall it across hosts.
+- **`IJIMA_URL` file fallback** (`~/.config/ijima/url`): hosts work with
+  no shell env at all (token file + url file).
+- **Content-derived memory ids** in the pi shim (`mem_<hash16>`):
+  deterministic, meaningful in transcripts, idempotent.
+
+### Fixed
+
+- **KG re-import was error-prone on both ends** (found during the fleet
+  gap-import pass): (1) `invalidate_triple_in` URL-embedded the
+  deterministic triple id unencoded — paragraph-long entity names
+  (common in imported corpora) contain slashes that split the path
+  (404s); the id is now percent-encoded. (2) `add_triple` propagated
+  already-exists on re-add (500 + client skip for every existing
+  triple); re-adding now reads back the existing record — the KG
+  equivalent of memory content-hash dedup, making corpus re-imports
+  true no-ops.
+
+
+- **pi wake-up reminder injection was skipped when wake-up was empty**
+  (npm 0.2.4): fresh principals — the ones that need the tool reminder
+  most — never saw the `## Agent Memory (ACTIVE)` block. The reminder is
+  now unconditional; wake-up context appends when present. Found by the
+  first live 0.2.3 fleet session.
+- **`pi.extensions` manifest entry was missing — tools and hooks never
+  ran under pi** (npm 0.2.4): the package declared only the skills
+  manifest, so pi file-scanned the skill and never executed `index.js`
+  — silently, on every npm install since 0.2.1. The nine
+  `memory_*`/`knowledge_*` tools, auto-capture, and wake-up injection
+  were absent from every live session (the extension itself was
+  innocent — loads cleanly under a mock API, which is also why our
+  node-level E2E never caught a manifest bug). Found by a fleet session
+  that patched it locally and verified the tools register. Manifest now
+  declares `extensions: ["./index.js"]` alongside the skills.
+- **The injected block now carries the memory-model cheatsheet**: the
+  skill's critical guidance (namespaces, "empty is scoping", visible
+  search first, wake-up self-priming) distilled into every system
+  prompt — the pi-mempalace pattern. Skills are passive (agents must
+  choose to consult them); the cheatsheet is present from turn one. The
+  full skill remains the deep-dive reference.
 
 ## [0.2.3] — 2026-08-23
 

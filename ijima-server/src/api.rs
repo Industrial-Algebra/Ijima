@@ -785,15 +785,20 @@ struct WakeupResponse {
 async fn wakeup(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
 ) -> Result<Json<WakeupResponse>, ApiError> {
     if !principal.0.may(MEMORY_READ) {
         return Err(ApiError::Forbidden);
     }
-    let personal_ns = principal.0.personal_namespace();
+    // Agent homes (0.2.5): `?namespace=` selects the essentials source —
+    // the caller's personal namespace by default, or a shared home
+    // (e.g. `ns_ia_shared`) when the client is configured with one.
+    // Doctrine stays universal.
+    let essentials_ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
 
     let (personal_essentials, doctrine) = tokio::join!(
-        store.list_memories(&personal_ns, WAKEUP_PERSONAL_LIMIT),
+        store.list_memories(&essentials_ns, WAKEUP_PERSONAL_LIMIT),
         store.list_memories(&doctrine_ns, WAKEUP_DOCTRINE_LIMIT),
     );
 
@@ -2474,6 +2479,96 @@ mod tests {
         .unwrap();
         assert_eq!(mem.content, "doctrine body");
         assert_eq!(mem.source, ijima_core::memory::MemorySource::Doctrine);
+    }
+
+    #[tokio::test]
+    async fn wakeup_honors_namespace_param() {
+        // Agent homes (0.2.5): a member's wakeup with ?namespace= reads
+        // that home's essentials; the default stays the personal namespace.
+        // Field origin: fleet-institutional knowledge landed in per-host
+        // private namespaces and other agents couldn't recall it — the
+        // walls were pointed the wrong way for shared knowledge.
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", "memory:read");
+        let write = bearer(&auth, "elliott", "memory:write");
+
+        // Seed one memory into a shared home (open staging tier for the
+        // test — resolve_ns allows ns_import_*).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories?namespace=ns_import_homes")
+                    .header("authorization", &write)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "mem_home_wake",
+                            "content": "agent-homes wakeup regression row",
+                            "project": "ijima",
+                            "topic": "test",
+                            "source": "Explicit",
+                            "harness": "Pi",
+                            "importance": 0.9,
+                            "created_at": "2026-08-29T00:00:00Z",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Wake-up with the home namespace: the row appears.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup?namespace=ns_import_homes")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let essentials = body["personal_essentials"].as_array().unwrap();
+        assert!(
+            essentials.iter().any(|m| m["id"] == "mem_home_wake"),
+            "home essentials must surface via ?namespace="
+        );
+
+        // Default wake-up (personal): the row must NOT appear.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let essentials = body["personal_essentials"].as_array().unwrap();
+        assert!(
+            !essentials.iter().any(|m| m["id"] == "mem_home_wake"),
+            "default wakeup stays personal"
+        );
     }
 
     #[cfg(feature = "backend-surreal")]
