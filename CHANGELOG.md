@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+_Nothing yet — 0.3.0 development begins.
+
+## [0.2.5] — 2026-08-29
+
 ### Added
 
 - **Agent homes** (0.2.5): `IJIMA_NAMESPACE` selects a shared home
