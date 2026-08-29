@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Agent homes** (0.2.5): `IJIMA_NAMESPACE` selects a shared home
+  namespace for pi captures, saves, dedup checks, and wake-up
+  (`?namespace=` on `GET /wakeup`, the last route without it) — shared
+  knowledge stays shared, org walls keep other orgs out. Field origin:
+  fleet-institutional memory landed in per-host private namespaces and
+  sibling agents could not recall it across hosts.
+- **`IJIMA_URL` file fallback** (`~/.config/ijima/url`): hosts work with
+  no shell env at all (token file + url file).
+- **Content-derived memory ids** in the pi shim (`mem_<hash16>`):
+  deterministic, meaningful in transcripts, idempotent.
+
 ### Fixed
 
 - **KG re-import was error-prone on both ends** (found during the fleet
