@@ -61,6 +61,23 @@ systemctl stop ijima && <install new binary> && systemctl start ijima
 Schema definitions are idempotent at open. Check the CHANGELOG for
 on-disk-layout notes before skipping multiple minors.
 
+## Backups and restore drills
+
+SurrealKV is a directory; a naive file copy of a *live* store can be
+torn (manifest/WAL disagreeing mid-write) — recoverable, but you want
+to know *before* an incident. The pattern that works in production:
+
+1. **Mirror hourly** — rsync the data dir to bulk storage (a snapshot-
+   managed filesystem if you have one). A torn copy is possible; the
+   next hour's mirror replaces it.
+2. **Drill weekly** — copy the mirror aside, boot a throwaway daemon
+   on it (second port, same binary), compare the census against live.
+   Log PASS / DEGRADED (opens, counts differ — writes during the
+   mirror window) / FAIL (does not open). A backup you have never
+   opened is a hope, not a backup.
+3. **Mind permissions** — a root-run mirror leaves secrets root-owned;
+   a restore runbook needs the chown step.
+
 ## First-day verification
 
 After provisioning: import one real workstation, run a pi session against
