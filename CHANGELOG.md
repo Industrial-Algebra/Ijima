@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **npm publishing wired into CI** (trusted publishing / OIDC, the Amari
+  pattern): the tag workflow builds the extension from source (wasm-pack +
+  tsc via new devDependencies), verifies the package version matches the
+  tag, checks npm for the version, and publishes with automatic provenance —
+  no token in the common path, idempotent on re-tags. One-time setup: link
+  `@industrialalgebra/ijima-pi` on npmjs.com to this repo + `publish.yml`;
+  fallback remains a granular `NPM_TOKEN` secret. The 0.2.5 publish was the
+  last manual 2FA step.
+
+### Added
+
 - **Agent homes** (0.2.5): `IJIMA_NAMESPACE` selects a shared home
   namespace for pi captures, saves, dedup checks, and wake-up
   (`?namespace=` on `GET /wakeup`, the last route without it) — shared
