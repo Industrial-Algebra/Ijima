@@ -139,6 +139,10 @@ struct IngestArgs {
     /// Directory containing `*.md` doctrine files (frontmatter + body).
     #[arg(long, value_name = "DIR")]
     dir: PathBuf,
+    /// Target namespace (default: the global curated `ns_doctrine`).
+    /// Retarget to a wall for org-scoped corpora (admin still required).
+    #[arg(long, value_name = "NAMESPACE")]
+    namespace: Option<String>,
     /// Daemon base URL (e.g. `http://127.0.0.1:7373`).
     #[arg(long, value_name = "URL")]
     url: String,
@@ -733,7 +737,13 @@ async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
     }
     tracing::info!(entries = entries.len(), "ingesting doctrine");
     let parsed: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
-    ijima_server::doctrine::ingest_to_daemon(&args.url, &args.token, &parsed).await
+    ijima_server::doctrine::ingest_to_daemon(
+        &args.url,
+        &args.token,
+        &parsed,
+        args.namespace.as_deref(),
+    )
+    .await
 }
 
 async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {

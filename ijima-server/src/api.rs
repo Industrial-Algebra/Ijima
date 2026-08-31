@@ -730,12 +730,23 @@ struct DoctrineRequest {
 async fn ingest_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
 ) -> Result<Json<IdResponse>, ApiError> {
     if !principal.0.may(ijima_core::capabilities::ADMIN) {
         return Err(ApiError::Forbidden);
     }
-    let ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
+    // Doctrine defaults to the global curated namespace; ?namespace=
+    // retargets it to a wall (e.g. an org-scoped corpus that must not be
+    // visible instance-wide). resolve_ns keeps validation consistent —
+    // private namespaces stay rejected, admin bypasses membership.
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE.to_string();
+    let ns = resolve_ns(
+        &principal,
+        store.as_ref(),
+        Some(q.namespace.as_deref().unwrap_or(&default_ns)),
+    )
+    .await?;
     // Idempotent upsert: remove any existing entry, then store.
     store
         .delete_memory(&ns, &MemoryId(req.id.clone()))
@@ -2479,6 +2490,99 @@ mod tests {
         .unwrap();
         assert_eq!(mem.content, "doctrine body");
         assert_eq!(mem.source, ijima_core::memory::MemorySource::Doctrine);
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_honors_namespace_param() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+
+        // Ingest into a custom wall namespace via ?namespace=.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine?namespace=ns_ia_doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "d-w",
+                            "content": "wall-scoped doctrine",
+                            "project": "ia",
+                            "topic": "strategy",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The row lives in the wall namespace …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-w?namespace=ns_ia_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // … and NOT in the global doctrine namespace.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-w?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Default (no param) still lands in the global namespace.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "d-g",
+                            "content": "global doctrine",
+                            "project": "ijima",
+                            "topic": "arch",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-g?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
