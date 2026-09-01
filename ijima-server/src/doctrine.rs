@@ -121,28 +121,55 @@ pub fn read_doctrine_dir(dir: &Path) -> Result<Vec<(PathBuf, DoctrineEntry)>> {
 ///
 /// Returns [`IjimaError::Transport`] on any HTTP failure.
 #[cfg(feature = "cli")]
-pub async fn ingest_to_daemon(url: &str, token: &str, entries: &[DoctrineEntry]) -> Result<usize> {
+pub async fn ingest_to_daemon(
+    url: &str,
+    token: &str,
+    entries: &[DoctrineEntry],
+    namespace: Option<&str>,
+) -> Result<usize> {
     let client = reqwest::Client::new();
-    let endpoint = format!("{}/doctrine", url.trim_end_matches('/'));
+    let base = format!("{}/doctrine", url.trim_end_matches('/'));
+    let endpoint = match namespace {
+        Some(ns) => format!("{base}?namespace={ns}"),
+        None => base,
+    };
     let mut count = 0;
     for entry in entries {
-        let resp = client
-            .post(&endpoint)
-            .bearer_auth(token)
-            .json(&serde_json::json!({
-                "id": entry.id,
-                "content": entry.content,
-                "project": entry.project,
-                "topic": entry.topic,
-            }))
-            .send()
-            .await
-            .map_err(|e| IjimaError::Transport {
+        // Rate limiter stays on server-side; back off on 429/503
+        // (the 0.2.1 import lesson - 250ms x 2^n, six retries).
+        let mut attempt = 0u32;
+        loop {
+            let resp = client
+                .post(&endpoint)
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "id": entry.id,
+                    "content": entry.content,
+                    "project": entry.project,
+                    "topic": entry.topic,
+                }))
+                .send()
+                .await
+                .map_err(|e| IjimaError::Transport {
+                    detail: format!("ingest {}: {e}", entry.id),
+                })?;
+            let status = resp.status().as_u16();
+            if status == 429 || status == 503 {
+                attempt += 1;
+                if attempt > 6 {
+                    return Err(IjimaError::Transport {
+                        detail: format!("ingest {}: rate limited after retries", entry.id),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250u64 << attempt.min(6)))
+                    .await;
+                continue;
+            }
+            resp.error_for_status().map_err(|e| IjimaError::Transport {
                 detail: format!("ingest {}: {e}", entry.id),
             })?;
-        resp.error_for_status().map_err(|e| IjimaError::Transport {
-            detail: format!("ingest {}: {e}", entry.id),
-        })?;
+            break;
+        }
         count += 1;
     }
     Ok(count)
