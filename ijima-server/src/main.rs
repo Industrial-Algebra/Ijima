@@ -136,19 +136,37 @@ enum DoctrineAction {
 
 #[derive(Args)]
 struct IngestArgs {
-    /// Directory containing `*.md` doctrine files (frontmatter + body).
-    #[arg(long, value_name = "DIR")]
-    dir: PathBuf,
+    /// Flat directory of `*.md` doctrine files (frontmatter + body).
+    #[arg(long, value_name = "DIR", group = "source")]
+    dir: Option<PathBuf>,
+    /// Tree mode: walk this corpus root, synthesizing stable ids for
+    /// id-less files (upsert-safe re-runs). Mutually exclusive with
+    /// `--dir`.
+    #[arg(long, value_name = "TREE", group = "source")]
+    root: Option<PathBuf>,
+    /// fnmatch include against the posix relpath (repeatable; default
+    /// all `*.md`). `*` crosses `/`. Tree mode only.
+    #[arg(long, value_name = "GLOB")]
+    include: Vec<String>,
+    /// fnmatch exclude against the posix relpath (repeatable; wins over
+    /// includes). Tree mode only.
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+    /// Print the ingestion plan without contacting the daemon.
+    #[arg(long)]
+    dry_run: bool,
     /// Target namespace (default: the global curated `ns_doctrine`).
     /// Retarget to a wall for org-scoped corpora (admin still required).
     #[arg(long, value_name = "NAMESPACE")]
     namespace: Option<String>,
-    /// Daemon base URL (e.g. `http://127.0.0.1:7373`).
+    /// Daemon base URL (e.g. `http://127.0.0.1:7373`). Optional with
+    /// `--dry-run`.
     #[arg(long, value_name = "URL")]
-    url: String,
+    url: Option<String>,
     /// Admin bearer token (`ijima token issue --capability admin`).
+    /// Optional with `--dry-run`.
     #[arg(long, value_name = "TOKEN")]
-    token: String,
+    token: Option<String>,
 }
 
 #[derive(Args)]
@@ -360,7 +378,7 @@ fn main() -> ExitCode {
                 match rt {
                     Ok(rt) => match rt.block_on(run_doctrine_ingest(args)) {
                         Ok(n) => {
-                            tracing::info!(entries = n, "doctrine ingested");
+                            tracing::info!(entries = n, "doctrine ingest finished");
                             ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -730,20 +748,47 @@ async fn run_revocations(args: RevocationsArgs) -> ijima_core::Result<()> {
 }
 
 async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
-    let entries = ijima_server::doctrine::read_doctrine_dir(&args.dir)?;
+    let entries: Vec<ijima_server::doctrine::TreeEntry> = if let Some(root) = &args.root {
+        ijima_server::doctrine::read_doctrine_tree(root, &args.include, &args.exclude)?
+    } else if let Some(dir) = &args.dir {
+        ijima_server::doctrine::read_doctrine_dir(dir)?
+            .into_iter()
+            .map(|(path, entry)| (path, entry, true))
+            .collect()
+    } else {
+        return Err(ijima_core::IjimaError::invalid_input(
+            "one of --dir or --root is required",
+        ));
+    };
+    if args.dry_run {
+        for (path, entry, verbatim) in &entries {
+            let kind = if *verbatim { "keep" } else { "wrap " };
+            println!(
+                "{kind} {} [{}/{}] {}",
+                entry.id,
+                entry.project,
+                entry.topic,
+                path.display()
+            );
+        }
+        println!("files matched: {}", entries.len());
+        return Ok(entries.len());
+    }
     if entries.is_empty() {
-        tracing::warn!(dir = %args.dir.display(), "no *.md doctrine files found");
+        tracing::warn!(?args.root, ?args.dir, "no *.md doctrine files matched");
         return Ok(0);
     }
     tracing::info!(entries = entries.len(), "ingesting doctrine");
-    let parsed: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
-    ijima_server::doctrine::ingest_to_daemon(
-        &args.url,
-        &args.token,
-        &parsed,
-        args.namespace.as_deref(),
-    )
-    .await
+    let (url, token) = match (args.url.as_deref(), args.token.as_deref()) {
+        (Some(u), Some(t)) => (u, t),
+        _ => {
+            return Err(ijima_core::IjimaError::invalid_input(
+                "--url and --token are required (only --dry-run may omit them)",
+            ));
+        }
+    };
+    let parsed: Vec<_> = entries.iter().map(|(_, e, _)| e.clone()).collect();
+    ijima_server::doctrine::ingest_to_daemon(url, token, &parsed, args.namespace.as_deref()).await
 }
 
 async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
