@@ -763,6 +763,19 @@ async fn ingest_doctrine(
         .delete_memory(&ns, &MemoryId(req.id.clone()))
         .await
         .map_err(internal)?;
+    // Content dedup is upsert-compatible here: if the exact content
+    // already lives in this namespace under another id (byte-identical
+    // corpus files), doctrine semantics say one row suffices — return
+    // the existing id instead of failing. Without this, re-ingesting a
+    // corpus containing duplicates 409s forever on the second file
+    // (found in the v0.3.0 U3 rehearsal).
+    if let Some(existing) = store
+        .check_duplicate(&ns, &req.content)
+        .await
+        .map_err(internal)?
+    {
+        return Ok(Json(IdResponse { id: existing.0 }));
+    }
     let memory = Memory {
         id: MemoryId(req.id.clone()),
         content: req.content,
@@ -2594,6 +2607,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_collapses_duplicate_content() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+
+        let post = |id: &str| {
+            let body = serde_json::json!({
+                "id": id,
+                "content": "byte-identical corpus text",
+                "project": "p",
+                "topic": "t",
+            })
+            .to_string();
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/doctrine?namespace=ns_w")
+                            .header("authorization", &admin)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Two ids, identical content: both succeed …
+        for id in ["doct_a", "doct_b"] {
+            let res = post(id).await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        // … but the content lives under ONE id (the first).
+        for (id, expect_ok) in [("doct_a", true), ("doct_b", false)] {
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/memories/{id}?namespace=ns_w"))
+                        .header("authorization", &admin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(
+                status == StatusCode::OK,
+                expect_ok,
+                "{id}: expected {}",
+                if expect_ok { "OK" } else { "404" }
+            );
+        }
+        // Re-ingest stays idempotent (no 409, ever).
+        for _ in 0..2 {
+            let res = post("doct_b").await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]
