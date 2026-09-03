@@ -733,20 +733,31 @@ async fn ingest_doctrine(
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
 ) -> Result<Json<IdResponse>, ApiError> {
-    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+    if !principal.0.may(ijima_core::capabilities::ADMIN)
+        && !principal.0.may(ijima_core::capabilities::DOCTRINE_WRITE)
+    {
         return Err(ApiError::Forbidden);
     }
-    // Doctrine defaults to the global curated namespace; ?namespace=
-    // retargets it to a wall (e.g. an org-scoped corpus that must not be
-    // visible instance-wide). resolve_ns keeps validation consistent —
-    // private namespaces stay rejected, admin bypasses membership.
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE.to_string();
-    let ns = resolve_ns(
-        &principal,
-        store.as_ref(),
-        Some(q.namespace.as_deref().unwrap_or(&default_ns)),
-    )
-    .await?;
+    // Targeting rules (v0.3.0 U1b):
+    //   - no `?namespace=` -> the global curated namespace, admin-only;
+    //   - admin may target anything `resolve_ns` allows (never private);
+    //   - `doctrine:write` may target any non-private wall explicitly —
+    //     the capability itself is the write authority, so membership is
+    //     not consulted (the ingest timer is not a reader).
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let ns = if let Some(requested) = q.namespace.as_deref() {
+        if principal.0.may(ijima_core::capabilities::ADMIN) {
+            resolve_ns(&principal, store.as_ref(), Some(requested)).await?
+        } else if requested.ends_with("_private") || requested == default_ns {
+            return Err(ApiError::Forbidden);
+        } else {
+            ijima_core::NamespaceId::new(requested)
+        }
+    } else if principal.0.may(ijima_core::capabilities::ADMIN) {
+        ijima_core::NamespaceId::new(default_ns)
+    } else {
+        return Err(ApiError::Forbidden);
+    };
     // Idempotent upsert: remove any existing entry, then store.
     store
         .delete_memory(&ns, &MemoryId(req.id.clone()))
@@ -2583,6 +2594,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn doctrine_write_capability_targets_walls_only() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let ingest = bearer(&auth, "research-ingest", "doctrine:write");
+        let plain = bearer(&auth, "anyone", MEMORY_READ);
+
+        let post = |app: &Router, token: &str, uri: &str| {
+            let body = serde_json::json!({
+                "id": "d-cap",
+                "content": "cap test",
+                "project": "p",
+                "topic": "t",
+            })
+            .to_string();
+            let (app, token, uri) = (app.clone(), token.to_string(), uri.to_string());
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", &token)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Wall namespace: doctrine:write is sufficient.
+        let res = post(&app, &ingest, "/doctrine?namespace=ns_ia_doctrine").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-cap?namespace=ns_ia_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The global default namespace stays admin-only.
+        let res = post(&app, &ingest, "/doctrine").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Private namespaces stay rejected for the narrow capability.
+        let res = post(&app, &ingest, "/doctrine?namespace=ns_bob_private").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // No capability, no write — wall or otherwise.
+        let res = post(&app, &plain, "/doctrine?namespace=ns_ia_doctrine").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
