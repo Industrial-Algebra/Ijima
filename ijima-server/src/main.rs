@@ -49,6 +49,9 @@ enum Command {
     },
     /// Run the HTTP daemon.
     Serve(ServeArgs),
+    /// Hard-delete a knowledge-graph triple in a namespace (v0.3.0 U5,
+    /// the misplaced-data cleanup tool; admin bearer required).
+    KgDelete(KgDeleteArgs),
     /// Export the SurrealDB store as a SQL dump.
     Export(ExportArgs),
     /// Migrate the legacy pi-mempalace / ZeroClaw SQLite corpora into the
@@ -135,6 +138,23 @@ enum DoctrineAction {
 }
 
 #[derive(Args)]
+struct KgDeleteArgs {
+    /// Triple id to hard-delete (percent-encoded ids are accepted as-is).
+    #[arg(long, value_name = "ID")]
+    id: String,
+    /// Namespace holding the triple — REQUIRED (destructive ops are
+    /// explicit; private walls are valid targets).
+    #[arg(long, value_name = "NAMESPACE")]
+    namespace: String,
+    /// Daemon base URL (e.g. `http://127.0.0.1:7373`).
+    #[arg(long, value_name = "URL")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long, value_name = "TOKEN")]
+    token: String,
+}
+
+#[derive(clap::Args)]
 struct IngestArgs {
     /// Flat directory of `*.md` doctrine files (frontmatter + body).
     #[arg(long, value_name = "DIR", group = "source")]
@@ -393,6 +413,24 @@ fn main() -> ExitCode {
                 }
             }
         },
+        Command::KgDelete(args) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => match rt.block_on(run_kg_delete(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "kg delete failed");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "runtime build failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Serve(args) => {
             let mut config = ijima_server::server::DaemonConfig::default();
             if let Some(h) = args.host {
@@ -745,6 +783,14 @@ async fn run_revocations(args: RevocationsArgs) -> ijima_core::Result<()> {
             detail: format!("daemon returned {status}"),
         }),
     }
+}
+
+async fn run_kg_delete(args: KgDeleteArgs) -> ijima_core::Result<()> {
+    let config =
+        ijima_client::ClientConfig::new(args.url.clone(), ijima_core::harness::Harness::Other)
+            .with_token(args.token.clone());
+    let client = ijima_client::Client::new(config);
+    client.delete_triple_in(&args.namespace, &args.id).await
 }
 
 async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {

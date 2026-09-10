@@ -354,6 +354,19 @@ impl Client {
         Ok(())
     }
 
+    /// HARD-deletes a triple in `namespace` (v0.3.0 U5 — the misplaced-
+    /// data cleanup tool; admin-only server-side). Errors with
+    /// [`IjimaError::NotFound`]-equivalent transport error when the id is
+    /// absent. The namespace is always explicit; private walls are valid
+    /// targets.
+    pub async fn delete_triple_in(&self, namespace: &str, triple_id: &str) -> Result<()> {
+        let encoded = urlencoding::encode(triple_id);
+        let path = build_path(&format!("/kg/triples/{encoded}"), Some(namespace), None);
+        let resp = self.delete(&path).await?;
+        ok_status(resp).await?;
+        Ok(())
+    }
+
     /// Bulk knowledge-graph import into `namespace`: each triple is added
     /// via [`Self::add_triple_in`] and, when the source carried a
     /// `valid_to`, invalidated so the historical range is preserved.

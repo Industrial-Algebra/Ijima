@@ -1425,6 +1425,22 @@ impl KnowledgeGraph for SurrealStore {
         })
     }
 
+    async fn delete_triple(&self, ns: &NamespaceId, triple_id: &str) -> Result<u64> {
+        let mut result = self
+            .db
+            .query(format!(
+                "DELETE FROM {TRIPLES_TABLE}
+                  WHERE triple_id = $tid AND namespace = $ns
+                  RETURN BEFORE"
+            ))
+            .bind(("tid", triple_id.to_string()))
+            .bind(("ns", ns.as_str().to_string()))
+            .await
+            .map_err(store_err)?;
+        let deleted: Vec<serde_json::Value> = result.take(0).map_err(store_err)?;
+        Ok(deleted.len() as u64)
+    }
+
     async fn invalidate_triple(&self, ns: &NamespaceId, triple_id: &str) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

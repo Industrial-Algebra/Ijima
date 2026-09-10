@@ -158,6 +158,14 @@ pub trait KnowledgeGraph: Send + Sync {
     /// Idempotent.
     async fn invalidate_triple(&self, ns: &NamespaceId, triple_id: &str) -> Result<()>;
 
+    /// HARD-deletes a triple (v0.3.0 U5). Unlike
+    /// [`Self::invalidate_triple`] (which soft-retires via `valid_to`,
+    /// preserving history), this removes the row — the misplaced-data
+    /// cleanup tool. Admin-gated at the API; returns the number of
+    /// rows deleted (0 when the id is absent in `ns`). Orphaned
+    /// entities are left in place (inert; entity GC is future work).
+    async fn delete_triple(&self, ns: &NamespaceId, triple_id: &str) -> Result<u64>;
+
     /// Finds triples matching any combination of subject / predicate /
     /// object (`None` = wildcard).
     async fn find_triples(
