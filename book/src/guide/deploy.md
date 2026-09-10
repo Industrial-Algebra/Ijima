@@ -78,6 +78,35 @@ to know *before* an incident. The pattern that works in production:
 3. **Mind permissions** — a root-run mirror leaves secrets root-owned;
    a restore runbook needs the chown step.
 
+## Logical export (JSONL through the daemon)
+
+`ijima export --url <daemon> --token <admin> [--namespace <ns>] [--out file]`
+streams every memory (or one wall's) as JSONL — one `{"namespace": …,
+"memory": {…}}` object per line, row count in the `x-export-count`
+header. It runs through the daemon API and so works against a live
+instance; the old direct-to-store SQL dump lost the store LOCK race
+to the running daemon and is gone (v0.3.0).
+
+**The honest tiering:** the mirror + drill above remains the *primary*
+restore path. Export is the extractable corpus — verification,
+offline analysis, compliance — and an ad-hoc restore is a documented
+loop rather than a first-class command:
+
+```bash
+# restore one wall's rows into another daemon (jq, not a database tool)
+ijima export --url old --token t --namespace ns_wall --out wall.jsonl
+jq -c '.memory' wall.jsonl | while read -r mem; do
+  curl -s -X POST -H "Authorization: Bearer $TOKEN" \
+    -H 'content-type: application/json' \
+    -d "$mem" "$NEW_URL/memories?namespace=ns_wall" > /dev/null
+done
+```
+
+Re-POSTing is idempotent at the content layer (duplicates collapse),
+but provenance fields (source, harness) are re-stamped — a logical
+restore is a re-ingestion, not a byte copy. Point-in-time fidelity
+stays with the mirror.
+
 ## First-day verification
 
 After provisioning: import one real workstation, run a pi session against

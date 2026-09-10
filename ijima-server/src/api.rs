@@ -76,6 +76,7 @@ pub fn app(
     #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
 ) -> Router {
     let router = Router::new()
+        .route("/export", get(export))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/memories", get(browse_memories).post(store_memory))
@@ -916,6 +917,57 @@ async fn invalidate_triple(
     let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     kg.invalidate_triple(&ns, &id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Logical export as JSONL (v0.3.0 U6): one `{"namespace": ..., "memory":
+/// {...}}` object per line; `x-export-count` header carries the row count.
+/// Admin-only. `?namespace=` filters (private walls are valid explicit
+/// targets — same self-resolution as kg delete); absent = every
+/// namespace. Works against the running daemon — no store LOCK race.
+/// The extractable-corpus tier of the backup story; the mirror remains
+/// the primary restore path.
+async fn export(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Response, ApiError> {
+    use serde::Serialize;
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = match q.namespace.as_deref() {
+        None => None,
+        Some(name) if !name.trim().is_empty() => Some(ijima_core::NamespaceId::new(name)),
+        Some(_) => return Err(ApiError::BadRequest("namespace must not be empty".into())),
+    };
+    let rows = store.export_memories(ns.as_ref()).await.map_err(internal)?;
+    let mut body = String::new();
+    for (ns, memory) in &rows {
+        #[derive(Serialize)]
+        struct Line<'a> {
+            namespace: &'a str,
+            memory: &'a Memory,
+        }
+        let line = Line {
+            namespace: ns.as_str(),
+            memory,
+        };
+        body.push_str(
+            &serde_json::to_string(&line).map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
+        body.push('\n');
+    }
+    let mut resp = Response::new(axum::body::Body::from(body));
+    *resp.status_mut() = StatusCode::OK;
+    let headers = resp.headers_mut();
+    headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/x-ndjson"),
+    );
+    if let Ok(count) = axum::http::HeaderValue::from_str(&rows.len().to_string()) {
+        headers.insert("x-export-count", count);
+    }
+    Ok(resp)
 }
 
 /// HARD-deletes a triple (v0.3.0 U5): the misplaced-data cleanup tool.
@@ -3401,6 +3453,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn export_streams_jsonl_and_filters_by_namespace() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let reader = bearer(&auth, "anyone", MEMORY_READ);
+
+        let ingest = |id: &str, ns: &str| {
+            let body = serde_json::json!({
+                "id": id, "content": format!("export probe {id}"),
+                "project": "p", "topic": "t",
+            })
+            .to_string();
+            let uri = format!("/doctrine?namespace={ns}");
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", &admin)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(ingest("e1", "ns_wall_a").await.status(), StatusCode::OK);
+        assert_eq!(ingest("e2", "ns_wall_b").await.status(), StatusCode::OK);
+
+        // Non-admin never exports.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .header("authorization", &reader)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin all-namespace export: one JSON object per line, both
+        // walls present, count header matches.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let count: usize = res
+            .headers()
+            .get("x-export-count")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), count);
+        assert!(count >= 2);
+        let mut namespaces = std::collections::HashSet::new();
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            namespaces.insert(v["namespace"].as_str().unwrap().to_string());
+            assert!(v["memory"]["id"].is_string());
+            assert!(v["memory"]["content"].is_string());
+        }
+        assert!(namespaces.contains("ns_wall_a"));
+        assert!(namespaces.contains("ns_wall_b"));
+
+        // Per-namespace export filters exactly.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/export?namespace=ns_wall_a")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["namespace"], "ns_wall_a");
+        }
     }
 
     #[tokio::test]

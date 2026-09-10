@@ -354,6 +354,17 @@ impl Client {
         Ok(())
     }
 
+    /// Logical JSONL export through the daemon (v0.3.0 U6) — works
+    /// against a running daemon (no store LOCK conflict, unlike a
+    /// direct `open_persistent`). `None` exports every namespace.
+    /// Returns the raw JSONL body (one `{"namespace": ..., "memory":
+    /// ...}` object per line).
+    pub async fn export(&self, namespace: Option<&str>) -> Result<String> {
+        let path = build_path("/export", namespace, None);
+        let resp = self.get(&path).await?;
+        ok_status(resp).await?.text().await.map_err(transport)
+    }
+
     /// HARD-deletes a triple in `namespace` (v0.3.0 U5 — the misplaced-
     /// data cleanup tool; admin-only server-side). Errors with
     /// [`IjimaError::NotFound`]-equivalent transport error when the id is
