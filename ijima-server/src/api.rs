@@ -35,7 +35,7 @@ use axum::{
     extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +101,7 @@ pub fn app(
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
         .route("/kg/entities/{id}", get(query_entity))
+        .route("/kg/triples/{id}", delete(delete_triple_route))
         .route("/kg/triples/{id}/invalidate", post(invalidate_triple))
         .route("/kg/timeline", get(kg_timeline))
         .route("/kg/stats", get(kg_stats))
@@ -915,6 +916,37 @@ async fn invalidate_triple(
     let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     kg.invalidate_triple(&ns, &id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// HARD-deletes a triple (v0.3.0 U5): the misplaced-data cleanup tool.
+/// Admin-only; `?namespace=` is REQUIRED (destructive ops never default
+/// silently) and may target private walls — the canonical case is
+/// cleaning rows a namespace-blind import wrote into a principal's
+/// private namespace, which `resolve_ns` would reject outright.
+async fn delete_triple_route(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Path(id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let Some(ns_name) = q.namespace.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "?namespace= is required for kg delete (destructive ops are explicit)".into(),
+        ));
+    };
+    if ns_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("namespace must not be empty".into()));
+    }
+    let _ = store; // present for symmetry with other kg handlers
+    let ns = ijima_core::NamespaceId::new(ns_name);
+    match kg.delete_triple(&ns, &id).await.map_err(internal)? {
+        0 => Err(ApiError::NotFound),
+        _ => Ok(StatusCode::NO_CONTENT),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -3078,6 +3110,138 @@ mod tests {
         assert_eq!(counts.attempted, 5);
         assert_eq!(counts.added, 5, "no memory may be lost to 429s");
         assert_eq!(counts.skipped, 0);
+    }
+
+    #[tokio::test]
+    async fn kg_delete_is_admin_explicit_and_reflected() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let writer = bearer(&auth, "elliott", "knowledge:write");
+
+        // Seed a triple in the cleanup-target namespace.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/kg/triples?namespace=ns_cleanup")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "subject": "Kaiizen", "predicate": "uses", "object": "Ijima",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // knowledge:write must NOT hard-delete.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}?namespace=ns_cleanup"))
+                    .header("authorization", &writer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Namespace is required — destructive ops never default silently.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Admin with explicit target (private walls included — the
+        // misplaced-import cleanup case) deletes it …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}?namespace=ns_cleanup"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // … the census reflects it …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/kg/stats?namespace=ns_cleanup")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stats = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(stats["triples"].as_u64().unwrap_or(1), 0);
+
+        // … and deleting it again 404s (hard delete, not invalidate).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}?namespace=ns_cleanup"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Private targets are reachable for admin cleanup (the misplaced-
+        // import case): an absent id there is 404-from-the-store, not a
+        // 403 from namespace resolution.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/kg/triples/no-such-id?namespace=ns_lucien-kaiizen_private")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
