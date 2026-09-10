@@ -60,6 +60,10 @@ pub struct IjimaToml {
     /// Hugging Face model id for candle embeddings
     /// (default `sentence-transformers/all-MiniLM-L6-v2`).
     pub embedding_model: Option<String>,
+    /// AutoCapture TTL in days — ambient chatter older than this is
+    /// swept daily; other tiers never age out (v0.3.0 U4).
+    /// (env `IJIMA_AUTOCAPTURE_TTL_DAYS`, default `30`; `0` disables).
+    pub autocapture_ttl_days: Option<u32>,
 }
 
 /// Returns the config file path if one exists, per the discovery order.
@@ -141,6 +145,19 @@ pub fn resolve_path(env_key: &str, file: Option<String>) -> Option<PathBuf> {
 
 /// Resolves an `f64` setting: env var > config field > default. Malformed
 /// env values fall through to the next layer.
+/// Env > file > default resolution for `u32` knobs (v0.3.0 U4). An
+/// unparsable env var falls back to the file/default (knobs degrade
+/// gracefully rather than failing the boot).
+pub fn resolve_u32(env_key: &str, file: Option<u32>, default: u32) -> u32 {
+    if let Some(v) = std::env::var(env_key)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+    {
+        return v;
+    }
+    file.unwrap_or(default)
+}
+
 pub fn resolve_f64(env_key: &str, file: Option<f64>, default: f64) -> f64 {
     std::env::var(env_key)
         .ok()
@@ -296,5 +313,18 @@ mod tests {
         unsafe { std::env::set_var("IJIMA_NOPE_XYZ", "not-a-number") };
         assert_eq!(resolve_f64("IJIMA_NOPE_XYZ", Some(2.5), 1.0), 2.5);
         unsafe { std::env::remove_var("IJIMA_NOPE_XYZ") };
+    }
+
+    #[test]
+    fn resolve_u32_env_beats_file_beats_default() {
+        assert_eq!(resolve_u32("IJIMA_NOPE_U32", Some(7), 30), 7);
+        assert_eq!(resolve_u32("IJIMA_NOPE_U32", None, 30), 30);
+        // SAFETY: unique env key touched only by this test.
+        unsafe { std::env::set_var("IJIMA_NOPE_U32", "14") };
+        assert_eq!(resolve_u32("IJIMA_NOPE_U32", Some(7), 30), 14);
+        // malformed env degrades gracefully to the file value.
+        unsafe { std::env::set_var("IJIMA_NOPE_U32", "forever") };
+        assert_eq!(resolve_u32("IJIMA_NOPE_U32", Some(7), 30), 7);
+        unsafe { std::env::remove_var("IJIMA_NOPE_U32") };
     }
 }

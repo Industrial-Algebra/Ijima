@@ -21,6 +21,38 @@ pub struct DaemonConfig {
     pub port: u16,
 }
 
+/// The AutoCapture TTL cutoff: rows stamped strictly before this
+/// epoch-seconds string are eligible for the daily sweep.
+fn autocapture_cutoff(now_secs: u64, ttl_days: u64) -> String {
+    (now_secs.saturating_sub(ttl_days.saturating_mul(86_400))).to_string()
+}
+
+/// Spawns the daily lifecycle sweeper (v0.3.0 U4). First pass runs
+/// shortly after boot (catches restart cycles), then every 24h. Only
+/// `AutoCapture` rows older than the TTL are deleted — the deliberate
+/// saves and curated doctrine are untouchable by construction (the
+/// store method is tier-gated, not age-gated-across-the-board).
+fn spawn_autocapture_sweeper(store: Arc<dyn Store>, ttl_days: u64) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        loop {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            match store
+                .delete_aged_autocapture(&autocapture_cutoff(now, ttl_days))
+                .await
+            {
+                Ok(0) => tracing::debug!("autocapture ttl sweep: nothing eligible"),
+                Ok(n) => tracing::info!(deleted = n, ttl_days, "autocapture ttl sweep"),
+                Err(e) => tracing::error!(error = %e, "autocapture ttl sweep failed"),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+        }
+    });
+}
+
 /// Initializes structured logging (`tracing`) if not already installed.
 /// Idempotent — safe to call from both the daemon and CLI paths.
 pub fn init_tracing() {
@@ -140,6 +172,19 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     #[cfg(not(feature = "embeddings-candle"))]
     let store_inner = Arc::new(crate::SurrealStore::open_persistent(&db_path).await?);
     let store: Arc<dyn Store> = store_inner.clone();
+
+    // Lifecycle sweeper (v0.3.0 U4): env > config file > 30d; 0 disables.
+    let ttl_days = crate::config::resolve_u32(
+        "IJIMA_AUTOCAPTURE_TTL_DAYS",
+        file_config.autocapture_ttl_days,
+        30,
+    ) as u64;
+    if ttl_days > 0 {
+        spawn_autocapture_sweeper(store.clone(), ttl_days);
+        tracing::info!(ttl_days, "autocapture ttl sweeper armed");
+    } else {
+        tracing::info!("autocapture ttl sweeper disabled (ttl=0)");
+    }
     let kg: Arc<dyn ijima_core::KnowledgeGraph> = store_inner;
 
     // Hydrate the grant-revocation set from the store (WS1b): any bearer
@@ -225,4 +270,22 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
             detail: format!("serve: {e}"),
         })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::autocapture_cutoff;
+
+    #[test]
+    fn cutoff_subtracts_ttl_days() {
+        // 30 days before a fixed now.
+        assert_eq!(
+            autocapture_cutoff(1_000_000_000, 30),
+            "997_408_000".replace('_', "")
+        );
+        // Zero TTL sweeps nothing (cutoff = now; strictly-older rows only).
+        assert_eq!(autocapture_cutoff(1_000_000_000, 0), "1000000000");
+        // Saturating: tiny now with a huge TTL floors at epoch zero.
+        assert_eq!(autocapture_cutoff(10, 30), "0");
+    }
 }

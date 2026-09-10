@@ -656,6 +656,27 @@ impl Store for SurrealStore {
         Ok(())
     }
 
+    async fn delete_aged_autocapture(&self, cutoff_epoch_secs: &str) -> Result<u64> {
+        // Tier-gated lifecycle sweep (v0.3.0 U4). `created_at` is an
+        // epoch-seconds string; fixed-width epochs compare correctly
+        // lexicographically, and empty stamps (legacy rows) are excluded
+        // from eligibility rather than treated as oldest.
+        let mut result = self
+            .db
+            .query(format!(
+                "DELETE FROM {MEMORIES_TABLE}
+                  WHERE source = 'AutoCapture'
+                    AND created_at != ''
+                    AND created_at < $cutoff
+                  RETURN BEFORE"
+            ))
+            .bind(("cutoff", cutoff_epoch_secs.to_string()))
+            .await
+            .map_err(store_err)?;
+        let deleted: Vec<serde_json::Value> = result.take(0).map_err(store_err)?;
+        Ok(deleted.len() as u64)
+    }
+
     async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>> {
         let mut result = self
             .db
@@ -1635,6 +1656,115 @@ mod tests {
         let listed = store.list_memories(&ns, 10).await.expect("list");
         let got = listed.first().expect("one row");
         assert_eq!(got.origin.0, "elliotthall-laptop");
+    }
+
+    #[tokio::test]
+    async fn ttl_sweep_deletes_only_old_autocapture() {
+        let store = SurrealStore::open_embedded().await.expect("open");
+        let old = "1000000000".to_string(); // far past any cutoff
+        let ns_a = NamespaceId::new("ns_a");
+        let ns_b = NamespaceId::new("ns_b");
+        let mk = |id: &str, content: &str, source: MemorySource, created_at: String| Memory {
+            id: MemoryId(id.into()),
+            content: content.into(),
+            project: "p".into(),
+            topic: "t".into(),
+            source,
+            harness: ijima_core::harness::Harness::Other,
+            session_id: None,
+            origin: ijima_core::InstanceId::local(),
+            authority: ijima_core::AuthorityScope::local(),
+            importance: 0.5,
+            created_at,
+        };
+        // Old chatter in two namespaces (both must go) …
+        store
+            .store_memory(
+                &ns_a,
+                mk(
+                    "m1",
+                    "old chatter one",
+                    MemorySource::AutoCapture,
+                    old.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .store_memory(
+                &ns_b,
+                mk(
+                    "m2",
+                    "old chatter two",
+                    MemorySource::AutoCapture,
+                    old.clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        // … fresh chatter stays …
+        store
+            .store_memory(
+                &ns_a,
+                mk(
+                    "m3",
+                    "fresh chatter",
+                    MemorySource::AutoCapture,
+                    "9999999999".into(),
+                ),
+            )
+            .await
+            .unwrap();
+        // … and every other tier is untouchable, however old.
+        store
+            .store_memory(
+                &ns_a,
+                mk("m4", "old explicit", MemorySource::Explicit, old.clone()),
+            )
+            .await
+            .unwrap();
+        store
+            .store_memory(&ns_a, mk("m5", "old doctrine", MemorySource::Doctrine, old))
+            .await
+            .unwrap();
+
+        let deleted = store.delete_aged_autocapture("2000000000").await.unwrap();
+        assert_eq!(deleted, 2);
+        assert!(
+            store
+                .recall_memory(&ns_a, &MemoryId("m1".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .recall_memory(&ns_b, &MemoryId("m2".into()))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .recall_memory(&ns_a, &MemoryId("m3".into()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .recall_memory(&ns_a, &MemoryId("m4".into()))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .recall_memory(&ns_a, &MemoryId("m5".into()))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
