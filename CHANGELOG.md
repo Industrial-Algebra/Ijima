@@ -56,6 +56,15 @@ daemon.
 
 ### Fixed
 
+- Dependency advisories (final read-over sweep): ammonia 4.1.3→4.1.4
+  (RUSTSEC-2026-0213, XSS via SVG animation tags — transitive via
+  surrealdb), h2 0.4.15→0.4.19 (RUSTSEC-2026-0258, unbounded empty
+  DATA frames — on the HTTP listening path via axum/hyper), and
+  crossbeam-epoch 0.9.18→0.9.21 (RUSTSEC-2026-0204). Remaining,
+  documented: rkyv 0.7 OOB reads (RUSTSEC-2026-0235 — fix requires
+  surrealdb to move to rkyv 0.8; 3.2.4 is the latest stable) and
+  rsa Marvin-attack timing (RUSTSEC-2023-0071 — no upstream fix; not
+  in the Linux build path).
 - Soak-log split-brain class of issue documented in ops (canonical on
   the primary, never inside a mirror target) — see the deploy guide.
 
