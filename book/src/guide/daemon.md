@@ -32,6 +32,23 @@ The unit runs with a dedicated user, `ProtectSystem=strict`,
 - Structured logs via `tracing` (`IJIMA_LOG` filter; `RUST_LOG` also
   respected by convention).
 
+## Lifecycle (AutoCapture TTL)
+
+A daily background sweep deletes `source = AutoCapture` memories
+older than the TTL — tier-gated by construction: `Explicit`,
+`Doctrine`, `Mined`, and imported rows never age out, however old.
+Only ambient chatter expires.
+
+| Knob | Default |
+|---|---|
+| config `autocapture_ttl_days` | `30` |
+| env `IJIMA_AUTOCAPTURE_TTL_DAYS` | overrides config |
+| `0` | disables the sweeper |
+
+First pass runs ~10s after boot (so restart cycles catch up), then
+every 24h. Deleted counts land in the journal (`autocapture ttl
+sweep`) — soak-log evidence by design.
+
 ## TLS
 
 With the `tls` feature, set `IJIMA_TLS_CERT` and `IJIMA_TLS_KEY` (PEM

@@ -21,6 +21,11 @@ No request spans namespaces; there is no implicit cross-namespace read.
   admins bypass).
 - Open namespaces — `global`, `ns_doctrine`, `ns_import_*` staging —
   are readable/writable by any authenticated principal.
+- Curated corpora land in **org-scoped doctrine walls** (`ns_<org>_doctrine`):
+  `POST /doctrine?namespace=` (admin, or the narrow `doctrine:write`
+  capability for unattended ingest timers) upserts into the wall with
+  stable path-derived ids; the instance-global `ns_doctrine` stays
+  admin-only. Same membership rules as any wall for reads.
 - Writes require `memory:write` (or `knowledge:write`) *and* namespace
   eligibility; reads are personal-by-default and explicit otherwise.
 - Promotion targets go through the same rule (`trust:promote` cannot

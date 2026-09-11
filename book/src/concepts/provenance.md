@@ -21,7 +21,7 @@ metadata garnish — it is the basis for trust decisions, promotion, and
 - **`AutoCapture`** — an automatic hook wrote it. Unverified.
 - **`Mined`** — extracted from a session transcript by the miner,
   carrying a confidence score until reviewed.
-- **`Doctrine`** — curated, Git-versioned, PR-reviewed memory mirrored
+- **`Doctrine`** — curated, Git-versioned, PR-reviewed memory mirrored; since 0.3.0 it can live in org-scoped walls (`POST /doctrine?namespace=`), keeping internal corpora out of the instance-global namespace.
   from the repository seed pack. Never written directly by agents.
 
 Trust *transitions* are themselves capabilities: `trust:promote` raises an

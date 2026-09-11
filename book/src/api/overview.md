@@ -4,7 +4,9 @@ Ijima's stable contract is a REST/JSON surface; every route is guarded by
 a Schubert capability check and scoped to a namespace. The typed client
 is `ijima-client`. Namespace-sensitive routes accept `?namespace=<ns>`
 (omit for the caller's personal namespace; foreign `*_private`
-namespaces are always rejected).
+namespaces are always rejected — except the explicit admin cleanup
+paths: `DELETE /kg/triples/:id` and `GET /export` accept private walls
+as deliberate, logged maintenance targets).
 
 ## Route map (selected)
 
@@ -21,7 +23,9 @@ namespaces are always rejected).
 | `POST` | `/memories/:id/promote` | `trust:promote` |
 | `GET` | `/wakeup` | `memory:read` (top-N wake-up context) |
 | `GET` | `/rooms`, `/taxonomy`, `/palace/graph`, `/tunnel` | `memory:read` |
-| `POST` | `/kg/triples` | `knowledge:write` |
+| `POST` | `/kg/triples[?namespace=]` | `knowledge:write` |
+| `POST` | `/kg/triples/:id/invalidate?namespace=` | `knowledge:write` |
+| `DELETE` | `/kg/triples/:id?namespace=` | `admin` (hard delete; namespace required) |
 | `GET` | `/kg/entities/:id`, `/kg/timeline/:entity` | `knowledge:read` |
 | `POST` | `/sessions`, `/sessions/:id/turns`, `/sessions/:id/end` | `session:ingest` |
 | `POST` | `/sessions/:id/mine` | `mining:trigger` |
@@ -32,6 +36,8 @@ namespaces are always rejected).
 | `GET` | `/tokens/revocations` | `admin` |
 | `POST` | `/namespaces/grant`, `/namespaces/revoke` | `admin` |
 | `GET` | `/namespaces/members?namespace=` | `admin` |
+| `POST` | `/doctrine[?namespace=]` | `admin` (global) or `doctrine:write` (wall-scoped) |
+| `GET` | `/export[?namespace=]` | `admin` (JSONL; x-export-count header) |
 | `GET` | `/federation/state`, routed-write, conflict-signal | `federation` feature |
 
 The full table (with the store method each route maps to) lives in the
