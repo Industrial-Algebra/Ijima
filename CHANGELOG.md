@@ -4,6 +4,70 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-09-10 — "The Curated Brain"
+
+The curated half of the two-store model goes live: markdown corpora
+ingest into org-scoped walls, ambient chatter learns to age out, and
+the operator gains cleanup + extract tools that work against a live
+daemon.
+
+### Added
+
+- **Namespace-scoped doctrine** — `POST /doctrine?namespace=<wall>`
+  upserts curated entries into an org-scoped wall instead of the
+  instance-global namespace (visibility fix for internal corpora);
+  admin gate unchanged.
+- **`doctrine:write` capability** — the least-privilege write for
+  unattended ingest timers: explicitly-targeted non-private walls
+  only; the global default namespace stays admin-only.
+- **Tree-mode ingest** — `ijima doctrine ingest --root <TREE>` walks a
+  markdown corpus (fnmatch include/exclude over posix relpaths,
+  `*` crosses `/`), synthesizes stable `doct_<hash12(relpath)>` ids so
+  re-runs upsert edits and append additions without duplication, and
+  passes id-carrying files through verbatim. `--dry-run` prints the
+  plan without a daemon. Ingest rides 429/503 backoff.
+- **AutoCapture TTL sweeper** — daily daemon task deleting
+  `source = AutoCapture` rows older than the TTL (default 30 days;
+  `autocapture_ttl_days` / `IJIMA_AUTOCAPTURE_TTL_DAYS`, `0`
+  disables). Tier-gated by construction: Explicit, Doctrine, Mined,
+  and imported rows never age out.
+- **KG hard-delete** — `DELETE /kg/triples/{id}?namespace=<ns>`
+  (admin, namespace required, private walls valid targets) plus
+  client `delete_triple_in` and `ijima kg-delete`: the misplaced-data
+  cleanup tool.
+- **Logical JSONL export** — `GET /export` (admin) and a rewritten
+  `ijima export --url --token [--namespace] [--out]`: one
+  `{"namespace": …, "memory": {…}}` object per line, count header.
+  Works against the running daemon; the runbook documents the
+  tiering (mirror remains the primary restore; logical restore is a
+  re-ingestion).
+- **npm publishing via trusted publishing (OIDC)** in the tag
+  workflow — build-from-source, tag/version match guard, idempotent
+  re-tags, provenance automatic. No token in the common path.
+
+### Changed
+
+- Doctrine ingest collapses byte-identical content to the existing id
+  (upsert-compatible dedup; corpora with duplicate files re-ingest
+  idempotently instead of 409ing forever).
+- `ijima export` now requires `--url`/`--token` (daemon API path);
+  the direct-to-store SQL dump is removed — it lost the store LOCK
+  race to the running daemon.
+
+### Fixed
+
+- Dependency advisories (final read-over sweep): ammonia 4.1.3→4.1.4
+  (RUSTSEC-2026-0213, XSS via SVG animation tags — transitive via
+  surrealdb), h2 0.4.15→0.4.19 (RUSTSEC-2026-0258, unbounded empty
+  DATA frames — on the HTTP listening path via axum/hyper), and
+  crossbeam-epoch 0.9.18→0.9.21 (RUSTSEC-2026-0204). Remaining,
+  documented: rkyv 0.7 OOB reads (RUSTSEC-2026-0235 — fix requires
+  surrealdb to move to rkyv 0.8; 3.2.4 is the latest stable) and
+  rsa Marvin-attack timing (RUSTSEC-2023-0071 — no upstream fix; not
+  in the Linux build path).
+- Soak-log split-brain class of issue documented in ops (canonical on
+  the primary, never inside a mirror target) — see the deploy guide.
+
 ## [Unreleased]
 
 _Nothing yet — 0.3.0 development begins.

@@ -18,6 +18,7 @@ Eleven capabilities, each a partition on Gr(4,8):
 | `memory:write` | 2 | Store/delete memories, diary |
 | `knowledge:write` | 2 | Write triples |
 | `session:ingest` | 3 | Ingest session turns |
+| `doctrine:write` | 3 | Ingest doctrine into explicitly-targeted walls (global stays admin-only) |
 | `mining:trigger` | 3+1 | Trigger mining runs |
 | `trust:promote` | 3+1 | Raise a memory's trust tier |
 | `trust:endorse` | 4+1 | Cross-tier endorsement |

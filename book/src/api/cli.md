@@ -58,13 +58,52 @@ daemon — admin capability required. Grants are upserts (idempotent),
 revokes are idempotent, members list oldest-grant-first with the
 audit trail (`granted_by`, `granted_at_unix`).
 
+## `ijima doctrine ingest`
+
+Flat seed-pack mode (frontmatter + body files):
+
+```bash
+ijima doctrine ingest --dir doctrine/ --url http://127.0.0.1:7373 --token <admin>
+```
+
+Tree mode (v0.3.0) — walk a markdown corpus into a wall:
+
+```bash
+ijima doctrine ingest --root ../IA-documents \
+  --include 'RESEARCH_REPORTS/*' --exclude 'ARXIV*' \
+  --namespace ns_ia_doctrine --url ... --token <admin-or-doctrine:write> \
+  --dry-run
+```
+
+Stable `doct_<hash12(relpath)>` ids make re-runs idempotent (edits
+upsert, additions append); id-carrying frontmatter passes through
+verbatim; byte-identical files collapse to one row. `--dry-run`
+prints the plan without a daemon (`--url`/`--token` optional there).
+
+## `ijima kg-delete`
+
+Hard-deletes one triple (the misplaced-data cleanup tool — soft
+retirement is `invalidate`):
+
+```bash
+ijima kg-delete --id 'X:relates_to:Y' --namespace ns_wall --url ... --token <admin>
+```
+
+Admin-only; `--namespace` is required (destructive ops never default
+silently); private walls are valid targets.
+
 ## `ijima export`
 
 ```bash
-ijima export --out dump.sql
+ijima export --url http://127.0.0.1:7373 --token <admin> [--namespace ns] [--out file]
 ```
 
-Dumps the store as SurrealDB SQL (backup/migration aid).
+Logical JSONL export through the daemon (v0.3.0): one
+`{"namespace": …, "memory": {…}}` object per line, row count in the
+`x-export-count` header, stdout by default. Works against a live
+daemon — the old direct-to-store SQL dump (which lost the store LOCK
+race) is gone. See the deploy guide for the backup tiering and the
+re-ingest restore loop.
 
 ## Exit codes and errors
 

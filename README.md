@@ -16,8 +16,11 @@ turns raw sessions into curated memories with full provenance.
 
 **Is:** a standalone, multi-tenant memory daemon. Long-term semantic
 memory, temporal knowledge-graph triples, raw session storage, automated
-session→memory mining, Schubert capability auth, local candle embeddings.
-Generalized — any harness can adapt to it.
+session→memory mining, Schubert capability auth, local candle embeddings,
+curated-corpus ingestion into org-scoped walls (markdown trees, stable
+ids, idempotent re-runs), tier-gated lifecycle (AutoCapture TTL), and
+live-daemon KG cleanup + JSONL export. Generalized — any harness can
+adapt to it.
 
 **Isn't:** a pi extension, a per-harness adapter, or an in-process store.
 Harnesses speak Ijima's HTTP API (or embed `ijima-client`); they don't
@@ -105,7 +108,7 @@ curl http://127.0.0.1:7373/mining/queue -H "authorization: Bearer <review-token>
 | `mining` | session-mining pipeline (rules + Proserpina llm + review queue) |
 | `rate-limit` | Schubert rate limiting (capacity scales with capability codim) |
 | `tls` | optional HTTPS (`IJIMA_TLS_CERT` / `IJIMA_TLS_KEY`) |
-| `cli` | the `ijima` binary (serve / token / ingest / export / doctrine) |
+| `cli` | the `ijima` binary (serve / token / import / doctrine tree-ingest / kg-delete / JSONL export) |
 
 ## Workspace
 
