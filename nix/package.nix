@@ -32,7 +32,9 @@ let
 in
 rustPlatform.buildRustPackage rec {
   pname = "ijima";
-  version = "0.2.5";
+  # Single source of truth: the workspace Cargo.toml (release bumps
+  # land there; a hardcoded copy here silently mislabeled nix builds).
+  version = (lib.importTOML "${src}/Cargo.toml").workspace.package.version;
 
   inherit src;
 
