@@ -52,7 +52,7 @@ enum Command {
     /// Hard-delete a knowledge-graph triple in a namespace (v0.3.0 U5,
     /// the misplaced-data cleanup tool; admin bearer required).
     KgDelete(KgDeleteArgs),
-    /// Export the SurrealDB store as a SQL dump.
+    /// Export memories as JSONL through the daemon API (admin).
     Export(ExportArgs),
     /// Migrate the legacy pi-mempalace / ZeroClaw SQLite corpora into the
     /// SurrealDB store (one-time import).
@@ -68,9 +68,21 @@ enum Command {
 /// Arguments to `ijima export`.
 #[derive(Args, Debug)]
 struct ExportArgs {
-    /// Output path for the SurrealDB SQL dump.
-    #[arg(long, short)]
-    out: std::path::PathBuf,
+    /// Daemon base URL (e.g. `http://127.0.0.1:7373`) — export runs
+    /// through the daemon API (v0.3.0 U6), never by opening the store
+    /// directly (the LOCK race that made the old SQL dump unusable
+    /// against a running daemon).
+    #[arg(long, value_name = "URL")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long, value_name = "TOKEN")]
+    token: String,
+    /// Restrict the export to one namespace (default: every namespace).
+    #[arg(long, value_name = "NAMESPACE")]
+    namespace: Option<String>,
+    /// Output file (default: stdout).
+    #[arg(long, value_name = "FILE")]
+    out: Option<std::path::PathBuf>,
 }
 
 /// Which SQLite corpus `ijima import` reads.
@@ -838,11 +850,24 @@ async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
 }
 
 async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
-    let data_dir = ijima_server::config::resolve_data_dir()?;
-    let db_path = data_dir.join("ijima.db");
-    let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
-    store.export_to(&args.out).await?;
-    eprintln!("ijima: exported to {}", args.out.display());
+    let config =
+        ijima_client::ClientConfig::new(args.url.clone(), ijima_core::harness::Harness::Other)
+            .with_token(args.token.clone());
+    let client = ijima_client::Client::new(config);
+    let body = client.export(args.namespace.as_deref()).await?;
+    let lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, &body).map_err(|e| ijima_core::IjimaError::Store {
+                detail: format!("write {}: {e}", path.display()),
+            })?;
+            eprintln!("ijima: exported {lines} memories to {}", path.display());
+        }
+        None => {
+            print!("{body}");
+            eprintln!("ijima: exported {lines} memories",);
+        }
+    }
     Ok(())
 }
 

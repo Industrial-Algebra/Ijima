@@ -69,6 +69,18 @@ pub trait Store: Send + Sync {
     /// Deletes a memory by id within `ns`.
     async fn delete_memory(&self, ns: &NamespaceId, id: &MemoryId) -> Result<()>;
 
+    /// Logical export (v0.3.0 U6): all memories, optionally filtered to
+    /// one namespace, as `(namespace, memory)` pairs in scan order —
+    /// the wire format for JSONL export through the daemon (no LOCK
+    /// conflict with the running store, unlike a direct `open_persistent`).
+    /// Default: empty (backends without export support).
+    async fn export_memories(
+        &self,
+        _ns: Option<&NamespaceId>,
+    ) -> Result<Vec<(NamespaceId, Memory)>> {
+        Ok(Vec::new())
+    }
+
     /// Deletes `source = AutoCapture` memories strictly older than
     /// `cutoff_epoch_secs` across ALL namespaces. Returns the count
     /// deleted. The lifecycle sweeper (v0.3.0 U4) — tier-gated by

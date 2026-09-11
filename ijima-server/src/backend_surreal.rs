@@ -696,6 +696,35 @@ impl Store for SurrealStore {
         Ok(records.into_iter().map(|r| r.into_memory()).collect())
     }
 
+    async fn export_memories(
+        &self,
+        ns: Option<&NamespaceId>,
+    ) -> Result<Vec<(NamespaceId, Memory)>> {
+        let mut result = match ns {
+            Some(ns) => self
+                .db
+                .query(format!(
+                    "SELECT * FROM {MEMORIES_TABLE} WHERE namespace = $ns"
+                ))
+                .bind(("ns", ns.as_str().to_string()))
+                .await
+                .map_err(store_err)?,
+            None => self
+                .db
+                .query(format!("SELECT * FROM {MEMORIES_TABLE}"))
+                .await
+                .map_err(store_err)?,
+        };
+        let rows = take_vec::<MemoryRecord>(&mut result)?;
+        Ok(rows
+            .into_iter()
+            .map(|rec| {
+                let ns = NamespaceId::new(rec.namespace.clone());
+                (ns, rec.into_memory())
+            })
+            .collect())
+    }
+
     async fn store_stats(&self) -> Result<StoreStats> {
         // One query for all namespaces; aggregate in Rust (avoids
         // SurrealDB aggregate-function ambiguity, fine at v0 scale).
