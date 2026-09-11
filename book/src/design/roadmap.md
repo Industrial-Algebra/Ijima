@@ -30,16 +30,31 @@
   reproducible pi-extension build. Found on the fleet's first production
 deployment.
 
-**Next (0.3 horizon):**
+**Shipped (0.3.0 — "The Curated Brain", 2026-09-10):**
+
+- **Markdown corpora into walls** — namespace-scoped doctrine ingest
+  (`?namespace=`), the `doctrine:write` capability for unattended
+  timers, tree-mode CLI (`--root`, stable path-derived ids,
+  dry-run), and duplicate-collapse semantics for idempotent re-runs.
+  The first corpus: the research-report corpus, two walls
+  (reports+docs / arxiv), a daily morning ingest ahead of the day's
+  sessions.
+- **AutoCapture TTL sweeper** — tier-gated lifecycle: ambient chatter
+  ages out (30d default), deliberate saves and doctrine never do.
+- **KG hard-delete** + **logical JSONL export** through the daemon —
+  operator hygiene that works against a live instance.
+- **npm publishing via trusted publishing (OIDC)** in CI.
+
+**Next (0.4 horizon):**
 
 - **Satellite sync** — full local instances with checkpoint export/push
   to the center (the WS6 design seed); the federation control API grows
   into enforcement.
 - **Batch ingest (`turns:batch`)** for machine feeds (Minoru mining,
-  Quantizon experiments) and **scheduled mining** (CLI + systemd timer)
-  ride the 0.2.x line.
-- **Schubert 0.5 adoption** — GrantToken expiry + nonce; reconciliation
-  with instance-side revocation as defense in depth.
+  Quantizon experiments) and **scheduled mining** (CLI + systemd timer).
+- **Contemplative loop plumbing** — the daily reflection organ reads
+  wake-up + deltas + a randomness seed and writes back into the corpus
+  (IA-research hosts the prompt; Ijima already carries the loop).
 - **Block↔memory promotion boundary** — the doctrine note (Lonis Block
   kinds × promotability × trust tiers) that Wallace and Ijima will
   implement against.

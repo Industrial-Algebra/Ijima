@@ -53,6 +53,12 @@ kind = "WriteLike"
 label = "Ingest session context"
 description = "Append raw session-context turns to the repository."
 
+[capabilities."doctrine:write"]
+partition = [3]
+kind = "WriteLike"
+label = "Ingest doctrine into walls"
+description = "Ingest curated doctrine entries into explicitly targeted wall namespaces (v0.3.0 U1b). Narrower than admin: the global default namespace stays admin-only."
+
 [capabilities."mining:trigger"]
 partition = [3, 1]
 kind = "WriteLike"

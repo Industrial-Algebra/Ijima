@@ -35,7 +35,7 @@ use axum::{
     extract::{Path, Query},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +76,7 @@ pub fn app(
     #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
 ) -> Router {
     let router = Router::new()
+        .route("/export", get(export))
         .route("/health", get(health))
         .route("/status", get(status))
         .route("/memories", get(browse_memories).post(store_memory))
@@ -101,6 +102,7 @@ pub fn app(
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
         .route("/kg/entities/{id}", get(query_entity))
+        .route("/kg/triples/{id}", delete(delete_triple_route))
         .route("/kg/triples/{id}/invalidate", post(invalidate_triple))
         .route("/kg/timeline", get(kg_timeline))
         .route("/kg/stats", get(kg_stats))
@@ -730,17 +732,52 @@ struct DoctrineRequest {
 async fn ingest_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
 ) -> Result<Json<IdResponse>, ApiError> {
-    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+    if !principal.0.may(ijima_core::capabilities::ADMIN)
+        && !principal.0.may(ijima_core::capabilities::DOCTRINE_WRITE)
+    {
         return Err(ApiError::Forbidden);
     }
-    let ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
+    // Targeting rules (v0.3.0 U1b):
+    //   - no `?namespace=` -> the global curated namespace, admin-only;
+    //   - admin may target anything `resolve_ns` allows (never private);
+    //   - `doctrine:write` may target any non-private wall explicitly —
+    //     the capability itself is the write authority, so membership is
+    //     not consulted (the ingest timer is not a reader).
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let ns = if let Some(requested) = q.namespace.as_deref() {
+        if principal.0.may(ijima_core::capabilities::ADMIN) {
+            resolve_ns(&principal, store.as_ref(), Some(requested)).await?
+        } else if requested.ends_with("_private") || requested == default_ns {
+            return Err(ApiError::Forbidden);
+        } else {
+            ijima_core::NamespaceId::new(requested)
+        }
+    } else if principal.0.may(ijima_core::capabilities::ADMIN) {
+        ijima_core::NamespaceId::new(default_ns)
+    } else {
+        return Err(ApiError::Forbidden);
+    };
     // Idempotent upsert: remove any existing entry, then store.
     store
         .delete_memory(&ns, &MemoryId(req.id.clone()))
         .await
         .map_err(internal)?;
+    // Content dedup is upsert-compatible here: if the exact content
+    // already lives in this namespace under another id (byte-identical
+    // corpus files), doctrine semantics say one row suffices — return
+    // the existing id instead of failing. Without this, re-ingesting a
+    // corpus containing duplicates 409s forever on the second file
+    // (found in the v0.3.0 U3 rehearsal).
+    if let Some(existing) = store
+        .check_duplicate(&ns, &req.content)
+        .await
+        .map_err(internal)?
+    {
+        return Ok(Json(IdResponse { id: existing.0 }));
+    }
     let memory = Memory {
         id: MemoryId(req.id.clone()),
         content: req.content,
@@ -880,6 +917,88 @@ async fn invalidate_triple(
     let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     kg.invalidate_triple(&ns, &id).await.map_err(internal)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Logical export as JSONL (v0.3.0 U6): one `{"namespace": ..., "memory":
+/// {...}}` object per line; `x-export-count` header carries the row count.
+/// Admin-only. `?namespace=` filters (private walls are valid explicit
+/// targets — same self-resolution as kg delete); absent = every
+/// namespace. Works against the running daemon — no store LOCK race.
+/// The extractable-corpus tier of the backup story; the mirror remains
+/// the primary restore path.
+async fn export(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+) -> Result<Response, ApiError> {
+    use serde::Serialize;
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let ns = match q.namespace.as_deref() {
+        None => None,
+        Some(name) if !name.trim().is_empty() => Some(ijima_core::NamespaceId::new(name)),
+        Some(_) => return Err(ApiError::BadRequest("namespace must not be empty".into())),
+    };
+    let rows = store.export_memories(ns.as_ref()).await.map_err(internal)?;
+    let mut body = String::new();
+    for (ns, memory) in &rows {
+        #[derive(Serialize)]
+        struct Line<'a> {
+            namespace: &'a str,
+            memory: &'a Memory,
+        }
+        let line = Line {
+            namespace: ns.as_str(),
+            memory,
+        };
+        body.push_str(
+            &serde_json::to_string(&line).map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
+        body.push('\n');
+    }
+    let mut resp = Response::new(axum::body::Body::from(body));
+    *resp.status_mut() = StatusCode::OK;
+    let headers = resp.headers_mut();
+    headers.insert(
+        "content-type",
+        axum::http::HeaderValue::from_static("application/x-ndjson"),
+    );
+    if let Ok(count) = axum::http::HeaderValue::from_str(&rows.len().to_string()) {
+        headers.insert("x-export-count", count);
+    }
+    Ok(resp)
+}
+
+/// HARD-deletes a triple (v0.3.0 U5): the misplaced-data cleanup tool.
+/// Admin-only; `?namespace=` is REQUIRED (destructive ops never default
+/// silently) and may target private walls — the canonical case is
+/// cleaning rows a namespace-blind import wrote into a principal's
+/// private namespace, which `resolve_ns` would reject outright.
+async fn delete_triple_route(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(kg): Extension<Arc<dyn KnowledgeGraph>>,
+    Path(id): Path<String>,
+    Query(q): Query<NsQuery>,
+) -> Result<StatusCode, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let Some(ns_name) = q.namespace.as_deref() else {
+        return Err(ApiError::BadRequest(
+            "?namespace= is required for kg delete (destructive ops are explicit)".into(),
+        ));
+    };
+    if ns_name.trim().is_empty() {
+        return Err(ApiError::BadRequest("namespace must not be empty".into()));
+    }
+    let _ = store; // present for symmetry with other kg handlers
+    let ns = ijima_core::NamespaceId::new(ns_name);
+    match kg.delete_triple(&ns, &id).await.map_err(internal)? {
+        0 => Err(ApiError::NotFound),
+        _ => Ok(StatusCode::NO_CONTENT),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -2482,6 +2601,223 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doctrine_ingest_honors_namespace_param() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+
+        // Ingest into a custom wall namespace via ?namespace=.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine?namespace=ns_ia_doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "d-w",
+                            "content": "wall-scoped doctrine",
+                            "project": "ia",
+                            "topic": "strategy",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The row lives in the wall namespace …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-w?namespace=ns_ia_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // … and NOT in the global doctrine namespace.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-w?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Default (no param) still lands in the global namespace.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "d-g",
+                            "content": "global doctrine",
+                            "project": "ijima",
+                            "topic": "arch",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-g?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_collapses_duplicate_content() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+
+        let post = |id: &str| {
+            let body = serde_json::json!({
+                "id": id,
+                "content": "byte-identical corpus text",
+                "project": "p",
+                "topic": "t",
+            })
+            .to_string();
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/doctrine?namespace=ns_w")
+                            .header("authorization", &admin)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // Two ids, identical content: both succeed …
+        for id in ["doct_a", "doct_b"] {
+            let res = post(id).await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+        // … but the content lives under ONE id (the first).
+        for (id, expect_ok) in [("doct_a", true), ("doct_b", false)] {
+            let status = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/memories/{id}?namespace=ns_w"))
+                        .header("authorization", &admin)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status();
+            assert_eq!(
+                status == StatusCode::OK,
+                expect_ok,
+                "{id}: expected {}",
+                if expect_ok { "OK" } else { "404" }
+            );
+        }
+        // Re-ingest stays idempotent (no 409, ever).
+        for _ in 0..2 {
+            let res = post("doct_b").await;
+            assert_eq!(res.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn doctrine_write_capability_targets_walls_only() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let ingest = bearer(&auth, "research-ingest", "doctrine:write");
+        let plain = bearer(&auth, "anyone", MEMORY_READ);
+
+        let post = |app: &Router, token: &str, uri: &str| {
+            let body = serde_json::json!({
+                "id": "d-cap",
+                "content": "cap test",
+                "project": "p",
+                "topic": "t",
+            })
+            .to_string();
+            let (app, token, uri) = (app.clone(), token.to_string(), uri.to_string());
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", &token)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Wall namespace: doctrine:write is sufficient.
+        let res = post(&app, &ingest, "/doctrine?namespace=ns_ia_doctrine").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d-cap?namespace=ns_ia_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // The global default namespace stays admin-only.
+        let res = post(&app, &ingest, "/doctrine").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Private namespaces stay rejected for the narrow capability.
+        let res = post(&app, &ingest, "/doctrine?namespace=ns_bob_private").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // No capability, no write — wall or otherwise.
+        let res = post(&app, &plain, "/doctrine?namespace=ns_ia_doctrine").await;
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn wakeup_honors_namespace_param() {
         // Agent homes (0.2.5): a member's wakeup with ?namespace= reads
         // that home's essentials; the default stays the personal namespace.
@@ -2829,6 +3165,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kg_delete_is_admin_explicit_and_reflected() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let writer = bearer(&auth, "elliott", "knowledge:write");
+
+        // Seed a triple in the cleanup-target namespace.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/kg/triples?namespace=ns_cleanup")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "subject": "Kaiizen", "predicate": "uses", "object": "Ijima",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let tid = serde_json::from_slice::<serde_json::Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // knowledge:write must NOT hard-delete.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}?namespace=ns_cleanup"))
+                    .header("authorization", &writer)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Namespace is required — destructive ops never default silently.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // Admin with explicit target (private walls included — the
+        // misplaced-import cleanup case) deletes it …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}?namespace=ns_cleanup"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+
+        // … the census reflects it …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/kg/stats?namespace=ns_cleanup")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let stats = serde_json::from_slice::<serde_json::Value>(&body).unwrap();
+        assert_eq!(stats["triples"].as_u64().unwrap_or(1), 0);
+
+        // … and deleting it again 404s (hard delete, not invalidate).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/kg/triples/{tid}?namespace=ns_cleanup"))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // Private targets are reachable for admin cleanup (the misplaced-
+        // import case): an absent id there is 404-from-the-store, not a
+        // 403 from namespace resolution.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/kg/triples/no-such-id?namespace=ns_lucien-kaiizen_private")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn knowledge_graph_add_honors_namespace_param() {
         let (app, auth) = app_with_store().await;
         let write = bearer(&auth, "elliott", "knowledge:write");
@@ -2985,6 +3453,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn export_streams_jsonl_and_filters_by_namespace() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let reader = bearer(&auth, "anyone", MEMORY_READ);
+
+        let ingest = |id: &str, ns: &str| {
+            let body = serde_json::json!({
+                "id": id, "content": format!("export probe {id}"),
+                "project": "p", "topic": "t",
+            })
+            .to_string();
+            let uri = format!("/doctrine?namespace={ns}");
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.clone()
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("authorization", &admin)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(ingest("e1", "ns_wall_a").await.status(), StatusCode::OK);
+        assert_eq!(ingest("e2", "ns_wall_b").await.status(), StatusCode::OK);
+
+        // Non-admin never exports.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .header("authorization", &reader)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+        // Admin all-namespace export: one JSON object per line, both
+        // walls present, count header matches.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/export")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let count: usize = res
+            .headers()
+            .get("x-export-count")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), count);
+        assert!(count >= 2);
+        let mut namespaces = std::collections::HashSet::new();
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            namespaces.insert(v["namespace"].as_str().unwrap().to_string());
+            assert!(v["memory"]["id"].is_string());
+            assert!(v["memory"]["content"].is_string());
+        }
+        assert!(namespaces.contains("ns_wall_a"));
+        assert!(namespaces.contains("ns_wall_b"));
+
+        // Per-namespace export filters exactly.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/export?namespace=ns_wall_a")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["namespace"], "ns_wall_a");
+        }
     }
 
     #[tokio::test]

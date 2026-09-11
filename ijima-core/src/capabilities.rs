@@ -34,6 +34,7 @@
 //! | [`MEMORY_WRITE`] | WriteLike | σ₂ | 2 | store palace entries (dedup-aware) |
 //! | [`KNOWLEDGE_WRITE`] | WriteLike | σ₂ | 2 | add/invalidate triples |
 //! | [`SESSION_INGEST`] | WriteLike | σ₃ | 3 | append session-context turns |
+//! | [`DOCTRINE_WRITE`] | WriteLike | σ₃ | 3 | ingest curated doctrine into wall namespaces (v0.3.0) |
 //! | [`MINING_TRIGGER`] | WriteLike | σ₃₁ | 4 | trigger an extraction pass |
 //! | [`TRUST_PROMOTE`] | WriteLike | σ₃₁ | 4 | promote content to a higher trust tier / shared namespace |
 //! | [`TRUST_ENDORSE`] | WriteLike | σ₃₂ | 5 | endorse mined/auto content as Explicit |
@@ -59,6 +60,10 @@ pub const KNOWLEDGE_WRITE: &str = "knowledge:write";
 pub const SESSION_INGEST: &str = "session:ingest";
 /// Trigger a mining/extraction pass over session context.
 pub const MINING_TRIGGER: &str = "mining:trigger";
+/// Ingest curated doctrine entries into wall namespaces (v0.3.0 U1b) —
+/// the machine-feed write the corpus-ingest timer runs on. Narrower
+/// than `admin`: wall targets only, never the global default.
+pub const DOCTRINE_WRITE: &str = "doctrine:write";
 /// Full administrative control (the point class σ₄₄₄₄; implies all others).
 pub const ADMIN: &str = "admin";
 
@@ -87,6 +92,7 @@ pub const ALL_CAPABILITIES: &[&str] = &[
     KNOWLEDGE_WRITE,
     SESSION_INGEST,
     MINING_TRIGGER,
+    DOCTRINE_WRITE,
     TRUST_PROMOTE,
     TRUST_ENDORSE,
     TRUST_OVERRIDE,
@@ -112,7 +118,7 @@ pub fn intersection_number(capability: &str) -> u64 {
     match capability {
         MEMORY_READ | KNOWLEDGE_READ => 1,
         MINING_REVIEW | MEMORY_WRITE | KNOWLEDGE_WRITE => 2,
-        SESSION_INGEST => 3,
+        SESSION_INGEST | DOCTRINE_WRITE => 3,
         MINING_TRIGGER | TRUST_PROMOTE => 4,
         TRUST_ENDORSE => 5,
         TRUST_OVERRIDE => 6,

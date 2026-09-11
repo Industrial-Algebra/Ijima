@@ -21,6 +21,85 @@ on:
   workflow_dispatch:
 
 jobs:
+  publish-npm:
+    name: Publish npm extension (@industrialalgebra/ijima-pi)
+    runs-on: ubuntu-latest
+    # npm authentication uses trusted publishing (OIDC), not a long-lived
+    # token — mirrors Amari's publish.yml pattern (classic tokens were
+    # revoked in npm's granular-token transition). One-time setup: link the
+    # package on npmjs.com to this repository + this workflow file
+    # (publish.yml). Trusted publishing requires GitHub-hosted runners,
+    # Node >= 22.14.0, npm >= 11.5.1 (Node 24 bundles it); provenance is
+    # generated automatically. Fallback if OIDC is not configured: a
+    # granular access token (read+write on the package, 2FA-bypass enabled,
+    # 90-day expiry) supplied via the NPM_TOKEN secret.
+    permissions:
+      id-token: write # required for npm trusted publishing (OIDC)
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repo's rust-toolchain.toml (stable) governs — rustup show
+      # installs it if absent.
+      - name: Install Rust toolchain + wasm target
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          package-manager-cache: false # never cache in release builds
+
+      - name: Verify npm CLI supports trusted publishing
+        run: |
+          npm --version
+          npm --version | awk -F. '{ if ($1 < 11 || ($1 == 11 && ($2 < 5 || ($2 == 5 && $3 < 1)))) exit 1 }'
+
+      - name: Build the extension from source
+        run: |
+          cd integrations/pi
+          npm install --no-fund --no-audit
+          npm run build # wasm-pack (ijima-pi crate) + tsc shim
+          test -f pkg/ijima_pi_bg.wasm
+          test -f index.js
+
+      - name: Verify package version matches the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG=$(node -p "require('./integrations/pi/package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::tag v$TAG but package.json $PKG — bump integrations/pi before tagging"
+            exit 1
+          fi
+
+      - name: Check if version exists on npm
+        id: npm-version-check
+        run: |
+          PKG=$(node -p "require('./integrations/pi/package.json').version")
+          if npm view @industrialalgebra/ijima-pi@$PKG version >/dev/null 2>&1; then
+            echo "version-exists=true" >> "$GITHUB_OUTPUT"
+            echo "Version $PKG already exists on npm"
+          else
+            echo "version-exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.npm-version-check.outputs.version-exists == 'false'
+        # Trusted publishing: the npm CLI detects the GitHub Actions OIDC
+        # environment and authenticates without any token.
+        run: |
+          cd integrations/pi
+          npm publish --ignore-scripts --access public
+
+      - name: Skip npm publish (version exists)
+        if: steps.npm-version-check.outputs.version-exists == 'true'
+        run: echo "Skipping npm publish — version already exists (idempotent re-tag)"
+
   publish:
     runs-on: ubuntu-latest
     steps:

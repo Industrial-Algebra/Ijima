@@ -354,6 +354,30 @@ impl Client {
         Ok(())
     }
 
+    /// Logical JSONL export through the daemon (v0.3.0 U6) — works
+    /// against a running daemon (no store LOCK conflict, unlike a
+    /// direct `open_persistent`). `None` exports every namespace.
+    /// Returns the raw JSONL body (one `{"namespace": ..., "memory":
+    /// ...}` object per line).
+    pub async fn export(&self, namespace: Option<&str>) -> Result<String> {
+        let path = build_path("/export", namespace, None);
+        let resp = self.get(&path).await?;
+        ok_status(resp).await?.text().await.map_err(transport)
+    }
+
+    /// HARD-deletes a triple in `namespace` (v0.3.0 U5 — the misplaced-
+    /// data cleanup tool; admin-only server-side). Errors with
+    /// [`IjimaError::NotFound`]-equivalent transport error when the id is
+    /// absent. The namespace is always explicit; private walls are valid
+    /// targets.
+    pub async fn delete_triple_in(&self, namespace: &str, triple_id: &str) -> Result<()> {
+        let encoded = urlencoding::encode(triple_id);
+        let path = build_path(&format!("/kg/triples/{encoded}"), Some(namespace), None);
+        let resp = self.delete(&path).await?;
+        ok_status(resp).await?;
+        Ok(())
+    }
+
     /// Bulk knowledge-graph import into `namespace`: each triple is added
     /// via [`Self::add_triple_in`] and, when the source carried a
     /// `valid_to`, invalidated so the historical range is preserved.

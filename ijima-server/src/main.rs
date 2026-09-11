@@ -49,7 +49,10 @@ enum Command {
     },
     /// Run the HTTP daemon.
     Serve(ServeArgs),
-    /// Export the SurrealDB store as a SQL dump.
+    /// Hard-delete a knowledge-graph triple in a namespace (v0.3.0 U5,
+    /// the misplaced-data cleanup tool; admin bearer required).
+    KgDelete(KgDeleteArgs),
+    /// Export memories as JSONL through the daemon API (admin).
     Export(ExportArgs),
     /// Migrate the legacy pi-mempalace / ZeroClaw SQLite corpora into the
     /// SurrealDB store (one-time import).
@@ -65,9 +68,21 @@ enum Command {
 /// Arguments to `ijima export`.
 #[derive(Args, Debug)]
 struct ExportArgs {
-    /// Output path for the SurrealDB SQL dump.
-    #[arg(long, short)]
-    out: std::path::PathBuf,
+    /// Daemon base URL (e.g. `http://127.0.0.1:7373`) — export runs
+    /// through the daemon API (v0.3.0 U6), never by opening the store
+    /// directly (the LOCK race that made the old SQL dump unusable
+    /// against a running daemon).
+    #[arg(long, value_name = "URL")]
+    url: String,
+    /// Admin bearer token.
+    #[arg(long, value_name = "TOKEN")]
+    token: String,
+    /// Restrict the export to one namespace (default: every namespace).
+    #[arg(long, value_name = "NAMESPACE")]
+    namespace: Option<String>,
+    /// Output file (default: stdout).
+    #[arg(long, value_name = "FILE")]
+    out: Option<std::path::PathBuf>,
 }
 
 /// Which SQLite corpus `ijima import` reads.
@@ -135,16 +150,55 @@ enum DoctrineAction {
 }
 
 #[derive(Args)]
-struct IngestArgs {
-    /// Directory containing `*.md` doctrine files (frontmatter + body).
-    #[arg(long, value_name = "DIR")]
-    dir: PathBuf,
+struct KgDeleteArgs {
+    /// Triple id to hard-delete (percent-encoded ids are accepted as-is).
+    #[arg(long, value_name = "ID")]
+    id: String,
+    /// Namespace holding the triple — REQUIRED (destructive ops are
+    /// explicit; private walls are valid targets).
+    #[arg(long, value_name = "NAMESPACE")]
+    namespace: String,
     /// Daemon base URL (e.g. `http://127.0.0.1:7373`).
     #[arg(long, value_name = "URL")]
     url: String,
-    /// Admin bearer token (`ijima token issue --capability admin`).
+    /// Admin bearer token.
     #[arg(long, value_name = "TOKEN")]
     token: String,
+}
+
+#[derive(clap::Args)]
+struct IngestArgs {
+    /// Flat directory of `*.md` doctrine files (frontmatter + body).
+    #[arg(long, value_name = "DIR", group = "source")]
+    dir: Option<PathBuf>,
+    /// Tree mode: walk this corpus root, synthesizing stable ids for
+    /// id-less files (upsert-safe re-runs). Mutually exclusive with
+    /// `--dir`.
+    #[arg(long, value_name = "TREE", group = "source")]
+    root: Option<PathBuf>,
+    /// fnmatch include against the posix relpath (repeatable; default
+    /// all `*.md`). `*` crosses `/`. Tree mode only.
+    #[arg(long, value_name = "GLOB")]
+    include: Vec<String>,
+    /// fnmatch exclude against the posix relpath (repeatable; wins over
+    /// includes). Tree mode only.
+    #[arg(long, value_name = "GLOB")]
+    exclude: Vec<String>,
+    /// Print the ingestion plan without contacting the daemon.
+    #[arg(long)]
+    dry_run: bool,
+    /// Target namespace (default: the global curated `ns_doctrine`).
+    /// Retarget to a wall for org-scoped corpora (admin still required).
+    #[arg(long, value_name = "NAMESPACE")]
+    namespace: Option<String>,
+    /// Daemon base URL (e.g. `http://127.0.0.1:7373`). Optional with
+    /// `--dry-run`.
+    #[arg(long, value_name = "URL")]
+    url: Option<String>,
+    /// Admin bearer token (`ijima token issue --capability admin`).
+    /// Optional with `--dry-run`.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 }
 
 #[derive(Args)]
@@ -356,7 +410,7 @@ fn main() -> ExitCode {
                 match rt {
                     Ok(rt) => match rt.block_on(run_doctrine_ingest(args)) {
                         Ok(n) => {
-                            tracing::info!(entries = n, "doctrine ingested");
+                            tracing::info!(entries = n, "doctrine ingest finished");
                             ExitCode::SUCCESS
                         }
                         Err(e) => {
@@ -371,6 +425,24 @@ fn main() -> ExitCode {
                 }
             }
         },
+        Command::KgDelete(args) => {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => match rt.block_on(run_kg_delete(args)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        tracing::error!(error = %e, "kg delete failed");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "runtime build failed");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Serve(args) => {
             let mut config = ijima_server::server::DaemonConfig::default();
             if let Some(h) = args.host {
@@ -725,23 +797,77 @@ async fn run_revocations(args: RevocationsArgs) -> ijima_core::Result<()> {
     }
 }
 
+async fn run_kg_delete(args: KgDeleteArgs) -> ijima_core::Result<()> {
+    let config =
+        ijima_client::ClientConfig::new(args.url.clone(), ijima_core::harness::Harness::Other)
+            .with_token(args.token.clone());
+    let client = ijima_client::Client::new(config);
+    client.delete_triple_in(&args.namespace, &args.id).await
+}
+
 async fn run_doctrine_ingest(args: IngestArgs) -> ijima_core::Result<usize> {
-    let entries = ijima_server::doctrine::read_doctrine_dir(&args.dir)?;
+    let entries: Vec<ijima_server::doctrine::TreeEntry> = if let Some(root) = &args.root {
+        ijima_server::doctrine::read_doctrine_tree(root, &args.include, &args.exclude)?
+    } else if let Some(dir) = &args.dir {
+        ijima_server::doctrine::read_doctrine_dir(dir)?
+            .into_iter()
+            .map(|(path, entry)| (path, entry, true))
+            .collect()
+    } else {
+        return Err(ijima_core::IjimaError::invalid_input(
+            "one of --dir or --root is required",
+        ));
+    };
+    if args.dry_run {
+        for (path, entry, verbatim) in &entries {
+            let kind = if *verbatim { "keep" } else { "wrap " };
+            println!(
+                "{kind} {} [{}/{}] {}",
+                entry.id,
+                entry.project,
+                entry.topic,
+                path.display()
+            );
+        }
+        println!("files matched: {}", entries.len());
+        return Ok(entries.len());
+    }
     if entries.is_empty() {
-        tracing::warn!(dir = %args.dir.display(), "no *.md doctrine files found");
+        tracing::warn!(?args.root, ?args.dir, "no *.md doctrine files matched");
         return Ok(0);
     }
     tracing::info!(entries = entries.len(), "ingesting doctrine");
-    let parsed: Vec<_> = entries.iter().map(|(_, e)| e.clone()).collect();
-    ijima_server::doctrine::ingest_to_daemon(&args.url, &args.token, &parsed).await
+    let (url, token) = match (args.url.as_deref(), args.token.as_deref()) {
+        (Some(u), Some(t)) => (u, t),
+        _ => {
+            return Err(ijima_core::IjimaError::invalid_input(
+                "--url and --token are required (only --dry-run may omit them)",
+            ));
+        }
+    };
+    let parsed: Vec<_> = entries.iter().map(|(_, e, _)| e.clone()).collect();
+    ijima_server::doctrine::ingest_to_daemon(url, token, &parsed, args.namespace.as_deref()).await
 }
 
 async fn run_export(args: ExportArgs) -> ijima_core::Result<()> {
-    let data_dir = ijima_server::config::resolve_data_dir()?;
-    let db_path = data_dir.join("ijima.db");
-    let store = ijima_server::SurrealStore::open_persistent(&db_path).await?;
-    store.export_to(&args.out).await?;
-    eprintln!("ijima: exported to {}", args.out.display());
+    let config =
+        ijima_client::ClientConfig::new(args.url.clone(), ijima_core::harness::Harness::Other)
+            .with_token(args.token.clone());
+    let client = ijima_client::Client::new(config);
+    let body = client.export(args.namespace.as_deref()).await?;
+    let lines = body.lines().filter(|l| !l.trim().is_empty()).count();
+    match &args.out {
+        Some(path) => {
+            std::fs::write(path, &body).map_err(|e| ijima_core::IjimaError::Store {
+                detail: format!("write {}: {e}", path.display()),
+            })?;
+            eprintln!("ijima: exported {lines} memories to {}", path.display());
+        }
+        None => {
+            print!("{body}");
+            eprintln!("ijima: exported {lines} memories",);
+        }
+    }
     Ok(())
 }
 
