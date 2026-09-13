@@ -55,14 +55,20 @@ deployment.
 - **Contemplative loop plumbing** — the daily reflection organ reads
   wake-up + deltas + a randomness seed and writes back into the corpus
   (IA-research hosts the prompt; Ijima already carries the loop).
+- **Evidence grading & context-poisoning protection** — elevated from the
+  long game (2026-09-13): the report apparatus now writes agent-authored
+  memory daily (learned facts, archaeology gap-closure), so
+  speculation-as-fact is a structural exposure, not a hypothetical.
+  Candidate direction D: evidence-class markers on saves
+  (`observed` vs `interpreted`), citation requirements, retrieval-side
+  weighting. Prompt-layer gate already shipped in IA-research as
+  containment; the enforced mechanism lands here.
 - **Block↔memory promotion boundary** — the doctrine note (Lonis Block
   kinds × promotability × trust tiers) that Wallace and Ijima will
   implement against.
 
 **Long game:**
 
-- Context-poisoning protection (defending trusted-tier doctrine going
-  pathological) — designed, gated on a real incident report.
 - Networked instances / federation cross-talk policies.
 - The doctrine-authority question: is Ijima the authoritative doctrine
   store, or an opt-in doctrine-health contract?

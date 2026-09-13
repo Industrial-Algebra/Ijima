@@ -169,9 +169,10 @@ promoted to team) is documented but not implemented.
 
 ---
 
-## Phase 4 — Security: doctrine health & context-poisoning protection (proposed)
+## Phase 4 — Security: doctrine health & context-poisoning protection (active)
 
-**Status: under investigation — blocked on an incident report.**
+**Status: elevated to 0.4-horizon active work (2026-09-13). Originally gated
+on an incident report; the gate is now satisfied structurally — see below.**
 
 A trusted, front-loaded system/doctrine prompt degraded a GPT-5.6 session
 to uselessness — but only on one task class (AI research: "overbearing and
@@ -180,6 +181,17 @@ retrieved-content sandboxing defense does not apply. The leading hypothesis
 is a **dose-dependent stance/persona directive** that activates on a
 specific task domain and accreted via drift. Full analysis and resume
 checklist: [`docs/discovery/context-poisoning-protection.md`](discovery/context-poisoning-protection.md).
+
+**Why the gate lifted (2026-09-13).** v0.3.0 shipped the contemplative
+loop: the report apparatus now *writes memory daily* — learned facts (the
+first organic learning event: an agent-derived arXiv publishing-cadence
+model) and mandatory archaeology gap-closure (backward memories
+reconstructing pre-brain history from git evidence). Agent-authored
+memory at steady volume is a new, structural exposure: an interpretation
+saved as fact is poison that every future session retrieves as ground
+truth. Containment shipped at the prompt layer (IA-research: backward
+memories carry observed facts only; interpretation must be saved
+attributed-as-claim); the durable, enforced mechanism belongs in Ijima.
 
 Candidate directions (to be confirmed against the report):
 
@@ -191,6 +203,12 @@ Candidate directions (to be confirmed against the report):
 - **A-slice — Ingest-time stance-directive validation** (cheap static
   checks, not full behavioral regression). Catches obvious pathological
   directives before they serve.
+- **D — Evidence grading for agent-authored memory** (new, from the 2026-09
+  trigger): an evidence-class marker on `memory_save` (`observed` vs
+  `interpreted`), citation requirements for `observed` claims (hashes,
+  dates, source report), and retrieval-side weighting so attributed claims
+  never masquerade as observed facts. Composes with the provenance-tier
+  model rather than replacing it.
 
 **Gating open question:** is Ijima the authoritative doctrine store
 (ingest+serve gating on the table), or is the poisoned context largely
