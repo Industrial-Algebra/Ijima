@@ -4,6 +4,27 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-09-21 — extension: declarative per-project namespaces
+
+The pi extension gains project-local configuration: a repo declares which
+memory wall it belongs to, and an org's repo cloned anywhere lands in that
+wall on first launch — no shell env, no direnv, no launch wrappers.
+
+- **`.pi/ijima.json`** (nearest, walking up from the session root):
+  `{ "namespace": "ns_orthant_shared", "url": …, "token_file": … }` —
+  all keys optional. Precedence: environment variable → project file →
+  default, for all three knobs.
+- **`IJIMA_HOME`** overrides home-directory expansion (`~` paths) — for
+  containers, sandboxes, and tests.
+- **Fix: the well-known token-file fallback (`~/.config/ijima/token`) never
+  expanded `~`** (`replace("^~")` matched a literal caret) — silently
+  unreadable since 0.2.x. Now expanded correctly.
+- Offline unit tests for the resolution chain (`config.test.mjs`, 15
+  checks) plus a live E2E: a bare directory with a two-line config captured
+  into its declared namespace through a production daemon.
+- Rust crates are version-companions to the npm package (no server changes
+  in this release); the whole workspace bumps so the tag publishes cleanly.
+
 ## [0.3.0] — 2026-09-10 — "The Curated Brain"
 
 The curated half of the two-store model goes live: markdown corpora
