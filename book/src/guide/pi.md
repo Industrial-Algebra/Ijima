@@ -43,6 +43,23 @@ other member host. A separate org's machine sets its own wall instead
 keep meaning what walls mean. Unset = personal, private by default.
 (Namespaced wake-up requires daemon ≥ 0.2.5; captures work on 0.2.2+.)
 
+### The declarative form: `.pi/ijima.json` (0.3.1+)
+
+Instead of exporting the variable per shell (or per systemd unit), a
+**repository can declare its wall** — put this at the project root:
+
+```json
+{ "namespace": "ns_orthant_shared" }
+```
+
+The extension reads the nearest `.pi/ijima.json` walking up from the
+session root (nearest wins, so a monorepo can override a parent). Optional
+`url` and `token_file` keys pin the daemon and credentials the same way.
+Precedence is always **environment → project file → default**, so an
+exported `IJIMA_NAMESPACE` overrides the declaration — and an org repo
+cloned anywhere lands in its wall on first launch, no shell configuration
+at all. This is the recommended form for multi-org fleets.
+
 ## The loop-closers
 
 The extension does the remembering so the agent doesn't have to:

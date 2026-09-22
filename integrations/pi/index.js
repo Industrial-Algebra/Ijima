@@ -6,25 +6,66 @@
 import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { build_search_request, parse_search_response, build_save_request, parse_save_response, build_check_duplicate_request, parse_check_duplicate_response, build_knowledge_add_request, parse_knowledge_add_response, parse_knowledge_query_response, parse_knowledge_timeline_response, } from "./pkg/ijima_pi.js";
 // One multi-capability Schubert GrantToken (env `IJIMA_TOKEN`) admits
 // every route below; the server's geometric `may()` checks containment
 // per-request. See ijimaFetch().
-/** Token-file candidates, first hit wins (0600 files, user-owned). */
-const TOKEN_FILES = [
-    process.env.IJIMA_TOKEN_FILE,
-    "~/.config/ijima/token",
-].filter((p) => Boolean(p));
 /** URL-file candidates, first hit wins (sibling of the token file). */
 const URL_FILES = [
     process.env.IJIMA_URL_FILE,
     "~/.config/ijima/url",
 ].filter((p) => Boolean(p));
+/** Expand a leading `~` to the user's home directory
+ *  (`IJIMA_HOME` overrides — for containers and tests). */
+function expandHome(raw) {
+    if (!raw.startsWith("~"))
+        return raw;
+    const home = (process.env.IJIMA_HOME || "").trim() || os.homedir();
+    return home + raw.slice(1);
+}
+/**
+ * Reads the nearest `.pi/ijima.json` walking up from the process cwd —
+ * the repo declares which wall it belongs to, so an org repo cloned
+ * anywhere lands in its namespace on first launch. Invalid JSON is
+ * ignored silently (a broken config never breaks the session).
+ */
+export function resolveProjectConfig() {
+    let dir = process.cwd();
+    for (;;) {
+        const candidate = path.join(dir, ".pi", "ijima.json");
+        try {
+            const raw = fs.readFileSync(candidate, "utf8");
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === "object") {
+                const o = parsed;
+                const str = (k) => typeof o[k] === "string" ? o[k].trim() || undefined : undefined;
+                const cfg = {};
+                const ns = str("namespace");
+                const url = str("url");
+                const tf = str("token_file");
+                if (ns)
+                    cfg.namespace = ns;
+                if (url)
+                    cfg.url = url;
+                if (tf)
+                    cfg.token_file = tf;
+                return cfg;
+            }
+        }
+        catch {
+            // absent or invalid — keep walking
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir)
+            return {};
+        dir = parent;
+    }
+}
 function readUrlFile() {
     for (const raw of URL_FILES) {
-        const path = raw.startsWith("~") ? os.homedir() + raw.slice(1) : raw;
         try {
-            const u = fs.readFileSync(path, "utf8").trim();
+            const u = fs.readFileSync(expandHome(raw), "utf8").trim();
             if (u)
                 return u.replace(/\/$/, "");
         }
@@ -34,16 +75,49 @@ function readUrlFile() {
     }
     return null;
 }
+/** Daemon URL: env → project file → well-known file → default. */
+export function resolveIjimaUrl() {
+    return ((process.env.IJIMA_URL ?? "").trim() ||
+        resolveProjectConfig().url ||
+        readUrlFile() ||
+        "http://127.0.0.1:7373");
+}
+/** Token-file candidates, first hit wins (0600 files, user-owned). */
+function tokenFileCandidates() {
+    return [
+        process.env.IJIMA_TOKEN_FILE,
+        resolveProjectConfig().token_file,
+        "~/.config/ijima/token",
+    ].filter((p) => Boolean(p && p.trim()));
+}
+function readTokenFile() {
+    for (const raw of tokenFileCandidates()) {
+        try {
+            const t = fs.readFileSync(expandHome(raw), "utf8").trim();
+            if (t)
+                return t;
+        }
+        catch {
+            // absent/unreadable — next candidate
+        }
+    }
+    return null;
+}
+/** Bearer token: env → file chain (env file → project file → well-known). */
+export function resolveIjimaToken() {
+    return (process.env.IJIMA_TOKEN ?? "").trim() || readTokenFile();
+}
 /**
- * The agent's home namespace (env-configured, e.g. `ns_ia_shared`): the
- * namespace captures/saves/wake-up operate in. Unset = the caller's
- * personal namespace (server default). Returns "" when unset.
+ * The agent's home namespace: env `IJIMA_NAMESPACE` → the project's
+ * `.pi/ijima.json` → "" (the caller's personal namespace, server
+ * default). The project file is the declarative form — the repo declares
+ * which wall it belongs to.
  */
-function homeNamespace() {
-    return (process.env.IJIMA_NAMESPACE ?? "").trim();
+export function homeNamespace() {
+    return ((process.env.IJIMA_NAMESPACE ?? "").trim() || resolveProjectConfig().namespace || "");
 }
 /** Appends `?namespace=` (or `&`) when a home namespace is configured. */
-function withHome(path) {
+export function withHome(path) {
     const ns = homeNamespace();
     if (!ns)
         return path;
@@ -58,28 +132,14 @@ async function contentId(content) {
         id += b.toString(16).padStart(2, "0");
     return `mem_${id}`;
 }
-function readTokenFile() {
-    for (const raw of TOKEN_FILES) {
-        const path = raw.replace("^~", os.homedir());
-        try {
-            const t = fs.readFileSync(path, "utf8").trim();
-            if (t)
-                return t;
-        }
-        catch {
-            // absent/unreadable — next candidate
-        }
-    }
-    return null;
-}
 async function ijimaFetch(path, cap, init, signal) {
-    // URL resolution: env first, then the well-known file — same pattern as
-    // the token, so a configured host needs no shell env at all.
-    const ijimaUrl = process.env.IJIMA_URL ?? readUrlFile() ?? "http://127.0.0.1:7373";
-    // Token resolution: env first, then the well-known private file. The
-    // fallback kills the whole "shell didn't export it" failure class —
-    // systemd units, cron, agent tabs, non-login shells all just work.
-    const token = process.env.IJIMA_TOKEN ?? readTokenFile();
+    // URL resolution: env → project file → well-known file — a configured
+    // host needs no shell env at all.
+    const ijimaUrl = resolveIjimaUrl();
+    // Token resolution: env → file chain. The fallback kills the whole
+    // "shell didn't export it" failure class — systemd units, cron, agent
+    // tabs, non-login shells all just work.
+    const token = resolveIjimaToken();
     if (!token) {
         return {
             ok: false,

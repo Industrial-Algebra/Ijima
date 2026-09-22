@@ -20,7 +20,9 @@ an Ijima daemon running elsewhere. All memories live **server-side**, in
 | `ns_import_<source>` | **Bulk-imported legacy corpora** — this is where most memories usually live | Everyone (staging) |
 | `ns_<org>_shared` | Org/team walls (e.g. company projects) | **Members only** |
 
-Many deployments configure a **home namespace** (`IJIMA_NAMESPACE`, e.g.
+Many deployments configure a **home namespace** (`IJIMA_NAMESPACE`, or the
+declarative `.pi/ijima.json` at the project root — see the extension
+README — e.g.
 `ns_ia_shared`): captures, saves, and wake-up then operate there instead of
 the personal namespace — shared knowledge stays shared, one org wall keeps
 the other org walled. Unset = personal (private by default).

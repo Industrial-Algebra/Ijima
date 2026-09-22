@@ -10,6 +10,21 @@ Registers nine tools backed by a wasm-mapped client core:
 - `knowledge_add`, `knowledge_query`, `knowledge_status`,
   `knowledge_invalidate`, `knowledge_timeline`
 
+## Per-project configuration (`.pi/ijima.json`)
+
+A repo can declare which memory wall it belongs to — the declarative form
+of org scoping. Put a config at the project root:
+
+```json
+{ "namespace": "ns_orthant_shared" }
+```
+
+Optional keys `url` and `token_file` pin the daemon and credentials the
+same way. Resolution walks up from the session root (nearest file wins),
+and precedence is always **environment variable → project file → default**,
+so an exported `IJIMA_NAMESPACE` still overrides the declaration. Invalid
+JSON is ignored silently — a broken config never breaks a session.
+
 ## Setup
 
 In `~/.pi/agent/settings.json`:
