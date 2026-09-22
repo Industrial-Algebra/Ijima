@@ -8,11 +8,17 @@ store, no local daemon. The extension is `@industrialalgebra/ijima-pi`
 
 Three environment variables — only the token is required:
 
-| Variable | Meaning | Fallback file |
+| Variable | Meaning | Fallback / default |
 |---|---|---|
-| `IJIMA_TOKEN` | A multi-capability grant (below) | `~/.config/ijima/token` |
-| `IJIMA_URL` | Daemon base URL | `~/.config/ijima/url` |
-| `IJIMA_NAMESPACE` | **Home namespace** (see below) | — (personal when unset) |
+| `IJIMA_TOKEN` | A multi-capability grant (below) | `IJIMA_TOKEN_FILE` → `~/.config/ijima/token` |
+| `IJIMA_URL` | Daemon base URL | `IJIMA_URL_FILE` → `~/.config/ijima/url` → `http://127.0.0.1:7373` |
+| `IJIMA_NAMESPACE` | **Home namespace** (see below) | `.pi/ijima.json` `namespace` (see below) → personal |
+| `IJIMA_HOME` | Overrides `~` expansion (containers, tests) | the real home directory |
+
+Precedence is always **environment → project file (`.pi/ijima.json`, nearest
+walking up from the session root) → default** — for all three connection
+knobs (`namespace`, `url`, `token_file`). The file may also set `url` and
+`token_file` directly.
 
 Mint the grant on the daemon:
 

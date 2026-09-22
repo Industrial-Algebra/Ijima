@@ -25,6 +25,15 @@ and precedence is always **environment variable → project file → default**,
 so an exported `IJIMA_NAMESPACE` still overrides the declaration. Invalid
 JSON is ignored silently — a broken config never breaks a session.
 
+### Environment variables
+
+| Variable | Meaning | Fallback / default |
+|---|---|---|
+| `IJIMA_TOKEN` | Multi-capability grant | `IJIMA_TOKEN_FILE` → `token_file` (project) → `~/.config/ijima/token` |
+| `IJIMA_URL` | Daemon base URL | `IJIMA_URL_FILE` → `url` (project) → `~/.config/ijima/url` → `http://127.0.0.1:7373` |
+| `IJIMA_NAMESPACE` | Home namespace | `namespace` (project) → personal |
+| `IJIMA_HOME` | Overrides `~` expansion (containers, tests) | real home directory |
+
 ## Setup
 
 In `~/.pi/agent/settings.json`:
