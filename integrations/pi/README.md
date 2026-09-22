@@ -10,6 +10,21 @@ Registers nine tools backed by a wasm-mapped client core:
 - `knowledge_add`, `knowledge_query`, `knowledge_status`,
   `knowledge_invalidate`, `knowledge_timeline`
 
+## Per-project configuration (`.pi/ijima.json`)
+
+A repo can declare which memory wall it belongs to — the declarative form
+of org scoping. Put a config at the project root:
+
+```json
+{ "namespace": "ns_orthant_shared" }
+```
+
+Optional keys `url` and `token_file` pin the daemon and credentials the
+same way. Resolution walks up from the session root (nearest file wins),
+and precedence is always **environment variable → project file → default**,
+so an exported `IJIMA_NAMESPACE` still overrides the declaration. Invalid
+JSON is ignored silently — a broken config never breaks a session.
+
 ## Setup
 
 In `~/.pi/agent/settings.json`:
@@ -69,6 +84,32 @@ tools): the namespace mental model, why "empty" results are usually
 scoping rather than missing data, a diagnostics ladder, and
 memory-saving conventions. If an agent reports the brain looks empty,
 point it at that skill before it speculates about server state.
+
+## Production track record (stability report)
+
+First production deployment: August 2026. Reviewed at six weeks of soak
+(2026-09-21). One central daemon, a seven-host agent fleet, ~38,700
+memories across namespace walls at review time.
+
+| Signal | State at review |
+|---|---|
+| Uptime | All restarts operator-driven (config switches); zero crashes, zero auto-restarts |
+| Error log | 43 error lines total across the whole soak — all from one known incident (a database lock race against a backup drill, cause fixed and doctrine-encoded); **error-free since** |
+| Capture volume | ~90–180 new memories/day; growth is entirely agent captures + curated corpus |
+| Release cadence | 0.1.0 → 0.3.0 in two months; npm publishes via OIDC trusted publishing in CI |
+| Backup discipline | Hourly mirror to a second filesystem, weekly restore drills that boot the mirror, daily census snapshots |
+
+The loop features (`memory_search` priming at wake-up, auto-capture at low
+trust, `memory_save` for deliberate persistence) have been running unattended
+across the fleet for the entire soak. Three documented organic-learning
+events from that period — an agent that learned a publishing calendar it was
+never told about, a research radar that identified a transferable
+architecture seam, and a cross-repo sprint planned from remembered dives on a
+different repository — are written up on the
+[company blog](https://industrialalgebra.com/blog).
+
+The full soak log, runbooks, and restore-drill records live in the
+[repository](https://github.com/Industrial-Algebra/Ijima).
 
 ## License
 
