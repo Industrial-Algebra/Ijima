@@ -28,12 +28,14 @@ re-implement memory logic.
 
 ## Status
 
-**Unreleased — in active development toward 0.1.0.** The features below
-are merged to `develop` (118 tests) but **not yet shipped**: nothing is
-0.1.0 until the crates are published to crates.io and the release is
-tagged. See [`CHANGELOG.md`](CHANGELOG.md) and
+**v0.3.1 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
+the pi extension on npm ([`@industrialalgebra/ijima-pi`](https://www.npmjs.com/package/@industrialalgebra/ijima-pi)).
+In production as a fleet's central memory service since August 2026
+(six-week soak reviewed 2026-09-21: error-free since 08-21, hourly mirror,
+weekly restore drills). See [`CHANGELOG.md`](CHANGELOG.md) and
 [`docs/ROADMAP.md`](docs/ROADMAP.md). The decision log lives in
-[`docs/DESIGN.md`](docs/DESIGN.md) (D1–D11) and [`docs/adr/`](docs/adr/).
+[`docs/DESIGN.md`](docs/DESIGN.md) (D1–D11) and [`docs/adr/`](docs/adr/);
+0.4 design inputs in [`docs/discovery/`](docs/discovery/).
 
 ## Two-store model + a miner
 
@@ -51,11 +53,19 @@ tagged. See [`CHANGELOG.md`](CHANGELOG.md) and
 ## Multi-tenancy & provenance
 
 Every request is scoped to a [namespace](ijima-core/src/namespace.rs):
-`Private` (per-operator), `Shared` (team), or `Global`. Cross-principal
-personal isolation is enforced at the API layer. Promotion (personal →
-shared) runs a [redaction filter](ijima-server/src/redaction.rs) at the
-boundary and is gated by the `trust:promote` capability — the one place
-content filtering happens; personal storage is always verbatim.
+`Private` (per-operator), `Shared` (team), or `Global` — the shared walls
+scale to multiple organizations on one daemon (each company its own wall,
+membership-gated, with crossover walls where companies build on each
+other). Cross-principal personal isolation is enforced at the API layer.
+Promotion (personal → shared) runs a [redaction
+filter](ijima-server/src/redaction.rs) at the boundary and is gated by the
+`trust:promote` capability — the one place content filtering happens;
+personal storage is always verbatim.
+
+The pi extension scopes **declaratively**: a repo commits
+`.pi/ijima.json` (`{"namespace": "…"}`) and every session in it lands in
+that wall — an org's repo cloned anywhere joins its wall on first launch
+(precedence: env → project file → default).
 
 Every `Memory` carries **provenance**: origin instance, authority scope,
 source tier (`Explicit` / `AutoCapture` / `Mined` / `Doctrine`), harness,
@@ -118,6 +128,7 @@ curl http://127.0.0.1:7373/mining/queue -H "authorization: Bearer <review-token>
 | [`ijima-server`](ijima-server) | HTTP daemon + SurrealDB store + Schubert auth + candle embedder + mining orchestration. The `ijima` binary. |
 | [`ijima-miner`](ijima-miner) | Session-context extraction engine: rules tier (Decision + Reference) + Proserpina LLM tier (Fact + Pattern). |
 | [`ijima-client`](ijima-client) | Typed async HTTP client — the harness adapter crate. |
+| [`ijima-pi`](ijima-pi) / [npm](https://www.npmjs.com/package/@industrialalgebra/ijima-pi) | The pi extension (wasm core + thin shim): memory tools, wake-up priming, auto-capture, declarative `.pi/ijima.json` namespaces. |
 
 ## Architecture
 
@@ -150,13 +161,16 @@ curl http://127.0.0.1:7373/mining/queue -H "authorization: Bearer <review-token>
 ## Security
 
 Ijima's access model is [Schubert](https://github.com/Industrial-Algebra/Schubert)
-capability algebra on the Grassmannian **Gr(4,8)**: proof-carrying tokens,
-one capability each, with codimension as both authorization-intersection
-weight and rate-limit capacity. Namespaces enforce isolation; promotion is
-the single redaction boundary; trust-tier transitions (`trust:promote` /
-`endorse` / `override`) are themselves capability-gated. See
-[`docs/DESIGN.md`](docs/DESIGN.md) (D2, D4, D5) and the
-[provenance-tier ADR](docs/adr/provenance-tier-model.md).
+capability algebra on the Grassmannian **Gr(4,8)**: proof-carrying
+multi-capability grant tokens (Schubert 0.5 — expiry, policy-constrained
+issuance, revocation reconciliation), with codimension as both
+authorization-intersection weight and rate-limit capacity. Unattended
+ingest runs on the narrow `doctrine:write` capability — explicitly
+targeted non-private walls only. Namespaces enforce isolation; promotion
+is the single redaction boundary; trust-tier transitions
+(`trust:promote` / `endorse` / `override`) are themselves
+capability-gated. See [`docs/DESIGN.md`](docs/DESIGN.md) (D2, D4, D5) and
+the [provenance-tier ADR](docs/adr/provenance-tier-model.md).
 
 ## License
 
