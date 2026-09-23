@@ -51,9 +51,12 @@ pub struct Memory {
     /// conflict resolution.
     #[cfg_attr(feature = "serde", serde(default))]
     pub authority: AuthorityScope,
-    /// Importance score (0.0–1.0). Used for wake-up ranking
-    /// (top-N by importance × recency). Defaults to 0.5, matching
-    /// pi-mempalace.
+    /// Importance score (0.0–1.0). Wake-up ranks lexicographically:
+    /// `importance DESC, created_at DESC` — recency breaks ties within
+    /// equal importance only; it never closes an importance gap. (The
+    /// former "importance × recency" claim here was drifted prose — see
+    /// RABBIT_HOLE_2026-09-22_Ijima; ranking semantics are a 0.4 design
+    /// question.) Defaults to 0.5, matching pi-mempalace.
     #[cfg_attr(feature = "serde", serde(default = "default_importance"))]
     pub importance: f32,
     /// Creation timestamp. v0: Unix epoch seconds as a string (monotonic
