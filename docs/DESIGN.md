@@ -454,6 +454,51 @@ research question, not a design decision, and it is correctly deferred.
 
 ---
 
+
+## D12. The trust machinery: evidence grades, supersede, stable doctrine identities (0.4.0)
+
+**Date:** 2026-10-09 · **Status:** decided and shipped · **Inputs:**
+`docs/discovery/context-poisoning-protection.md` (directions A/B/D),
+`docs/discovery/dream-skills.md`, `RABBIT_HOLE_2026-09-22_Ijima.md`
+(§1–§3), operator scoping 2026-09-22, review rounds 1–7 (PR #131).
+
+1. **Evidence grades are a second axis, not a tier.** Provenance
+   answers *who wrote it*; the grade answers *how they know it*. The
+   grade crosses tier lines (an explicit save can be an
+   interpretation). Default `Interpreted`: ungraded and legacy rows
+   are the weaker claim — attributed claims never masquerade as
+   observed fact. `Observed` requires ≥1 citation (enforced 400);
+   auto-capture is `Observed` + Session citation by construction.
+2. **Corrections displace structurally.** A `supersedes` link excludes
+   its target from all ranked/retrieval paths regardless of tier
+   arithmetic, ending the lexicographic enthronement the 09-22 dive
+   found (a wrong 0.8 save outranked every ≤0.7 correction forever;
+   corrections worked only as manual-save choreography). Targets stay
+   recallable — fossils, not deletions. Chains go through successors;
+   the transition is atomic and serialized; the graph is acyclic by
+   construction (7-round adversarial review converged here).
+3. **Doctrine revisions are stable body identities.** A returning body
+   restores the number it first went live with; a new body takes
+   max-ever + 1; no number ever identifies two bodies. Rollback
+   rewrites from archives; active flags are truthful by construction
+   (archived body matches live). The whole ingest transition —
+   authoritative live-dedup, archive, allocation, replacement, active
+   recompute — is one locked backend method; losers retire via
+   supersede links, never deletion.
+4. **Wake-up stratifies rather than decays.** Operator decision
+   2026-09-22: supersede-exclusion only for 0.4 — no decay (it would
+   punish true doctrine identically with stale error), no derived rank
+   yet. Composition: the 8 freshest non-superseded rows admitted first
+   (the guarantee), lexicographic fill to 20. Decay-vs-derived and the
+   retrieval-dynamics feedback question are the 0.5 fork; the
+   retrieval ledger it needs ships as 0.4.1.
+
+**Consequences:** the correction ritual is no longer load-bearing on
+human-grade saves; the poisoning defense has ingest-side validation
+(A-slice, advisory) and versioning/rollback (B) — serve-time stance
+budgets (C) remain gated on the doctrine-authority question. The
+dreamer (0.5) consumes the citation machinery as its substrate.
+
 ## Decision Index
 
 | ID | Topic | Resolves | Status |

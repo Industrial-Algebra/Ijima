@@ -8,6 +8,7 @@
 - [The Two-Store Model](./concepts/two-store-model.md)
 - [Namespaces & Multi-Tenancy](./concepts/multi-tenancy.md)
 - [Provenance & Trust Tiers](./concepts/provenance.md)
+- [Corrections: Supersede](./concepts/corrections.md)
 - [Capabilities & GrantTokens](./concepts/capabilities.md)
 - [Sessions & the Miner](./concepts/mining.md)
 
