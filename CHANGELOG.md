@@ -4,6 +4,22 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] — 2026-10-09 — legacy-row hotfix
+
+- **Wake-up/list/search no longer 500 on walls holding pre-0.4 rows.**
+  SurrealQL projections materialize every selected column for every
+  matched row; a record written before the field existed surfaces as
+  `Value::None`, which `#[serde(default)]` does not absorb (only true
+  absence). The 0.4.0 projection fix therefore broke every ranked read
+  on mixed walls — caught by the post-switch soak probe within minutes
+  of the production switch. Fix: `null_as_default` deserialization on
+  the record's two non-Option 0.4 fields (`evidence`, `citations`);
+  projected NONE reads as "field did not exist" (the legacy-row
+  default), while explicit database NULL still fails loudly and
+  deliberately. Regression tests at both levels, including a
+  raw-inserted pre-0.4-shaped row walked through the exact failing
+  paths (PR #134; expedited review round, converged, zero P1/P2).
+
 ## [0.4.0] — 2026-10-09 — "The Trust Machinery"
 
 The 0.4 arc, scoped by operator decision (2026-09-22) from the 09-22
