@@ -74,6 +74,13 @@ pub struct SurrealStore {
     /// is single-process; cross-process serialization is federation's
     /// problem, not 0.4's.
     doctrine_lock: tokio::sync::Mutex<()>,
+    /// Serializes the complete supersede transition (insert + target
+    /// validation + claim) within this process (review round 4, R4-1):
+    /// mutually-referencing concurrent saves must see the same graph a
+    /// serial execution would — where both targets are absent and both
+    /// saves are rejected — instead of exposing each uncommitted
+    /// successor as the other's claimable target (correction cycle).
+    supersede_lock: tokio::sync::Mutex<()>,
 }
 
 impl SurrealStore {
@@ -149,6 +156,7 @@ impl SurrealStore {
             })?;
         Ok(Self {
             doctrine_lock: tokio::sync::Mutex::new(()),
+            supersede_lock: tokio::sync::Mutex::new(()),
             db,
             embedder,
         })
@@ -832,6 +840,17 @@ impl Store for SurrealStore {
         // target (NotFound — recall is ns-scoped), already-superseded
         // target (Conflict — chains go through the successor),
         // self-supersede (Conflict).
+        //
+        // R4-1: the COMPLETE transition runs under the supersede lock —
+        // a mutually-referencing pair of concurrent saves then sees the
+        // serial outcome (both targets absent, both rejected) instead of
+        // claiming each other into a correction cycle. Non-supersede
+        // saves take no lock.
+        let _supersede_guard = if memory.supersedes.is_some() {
+            Some(self.supersede_lock.lock().await)
+        } else {
+            None
+        };
         let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
             .db
             .create((MEMORIES_TABLE, memory_key(ns, &memory.id)))
@@ -1261,53 +1280,6 @@ impl Store for SurrealStore {
             .collect())
     }
 
-    async fn prepare_doctrine_ingest(
-        &self,
-        ns: &NamespaceId,
-        id: &MemoryId,
-        new_content: &str,
-    ) -> Result<u32> {
-        use sha2::{Digest, Sha256};
-        let _guard = self.doctrine_lock.lock().await;
-        let mut result = self
-            .db
-            .query(format!(
-                "SELECT version, content_hash FROM {DOCTRINE_VERSIONS_TABLE}
-                 WHERE namespace = $ns AND doc_id = $doc"
-            ))
-            .bind(("ns", ns.as_str().to_string()))
-            .bind(("doc", id.0.clone()))
-            .await
-            .map_err(store_err)?;
-        #[derive(serde::Serialize, Deserialize)]
-        struct VersionRow {
-            version: u32,
-            content_hash: String,
-        }
-        let rows = take_vec::<VersionRow>(&mut result)?;
-        let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
-
-        let live = self.recall_memory(ns, id).await?;
-        // Unchanged content: no transition, keep the live revision.
-        if let Some(live) = &live
-            && live.content == new_content
-        {
-            return Ok(live.revision.unwrap_or(1));
-        }
-
-        // Archive the OUTGOING body under the identity it went live with.
-        self.archive_outgoing(ns, id, &live).await?;
-
-        // Allocate the incoming body's revision. Stable identity
-        // (R3-1): a body this doc has already carried RESTORES its
-        // original number; a genuinely new body takes max-ever + 1.
-        let new_hash = hex(&Sha256::digest(new_content.as_bytes()));
-        if let Some(prior) = rows.iter().find(|r| r.content_hash == new_hash) {
-            return Ok(prior.version);
-        }
-        let live_rev = live.as_ref().and_then(|m| m.revision).unwrap_or(0);
-        Ok(max_version.max(live_rev) + 1)
-    }
     async fn list_doctrine_versions(
         &self,
         ns: &NamespaceId,
@@ -1374,6 +1346,61 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         Ok(())
+    }
+
+    async fn commit_doctrine_ingest(
+        &self,
+        ns: &NamespaceId,
+        mut memory: Memory,
+    ) -> Result<(MemoryId, u32)> {
+        use sha2::{Digest, Sha256};
+        let _guard = self.doctrine_lock.lock().await;
+
+        // --- allocation half (was prepare_doctrine_ingest; same guard
+        // as the commit half now — R4-2's distinct-revisions fix) ---
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT version, content_hash FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", memory.id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct VersionRow {
+            version: u32,
+            content_hash: String,
+        }
+        let rows = take_vec::<VersionRow>(&mut result)?;
+        let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
+
+        let live = self.recall_memory(ns, &memory.id).await?;
+        // Archive the outgoing body under the identity it went live with.
+        self.archive_outgoing(ns, &memory.id, &live).await?;
+
+        // Stable identity: a returning body restores its original number;
+        // a new body takes max-ever + 1.
+        let new_hash = hex(&Sha256::digest(memory.content.as_bytes()));
+        let revision = if let Some(prior) = rows.iter().find(|r| r.content_hash == new_hash) {
+            prior.version
+        } else {
+            let live_rev = live.as_ref().and_then(|m| m.revision).unwrap_or(0);
+            max_version.max(live_rev) + 1
+        };
+        memory.revision = Some(revision);
+
+        // --- commit half ---
+        let _ = self.delete_memory(ns, &memory.id).await;
+        let id = self.store_memory(ns, memory).await?;
+        let live = self
+            .recall_memory(ns, &id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        let live_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        self.set_active_flags(ns, &id, &live_hash).await?;
+        Ok((id, revision))
     }
 
     async fn activate_doctrine_version(

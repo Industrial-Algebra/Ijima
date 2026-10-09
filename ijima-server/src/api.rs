@@ -883,22 +883,13 @@ async fn ingest_doctrine(
             warnings: Vec::new(),
         }));
     }
-    // The single locked ingest transition (review round 3): archives the
-    // outgoing body and allocates the incoming revision — stable body
-    // identities, no archive/create races with rollback.
-    let revision = store
-        .prepare_doctrine_ingest(&ns, &MemoryId(req.id.clone()), &req.content)
-        .await
-        .map_err(internal)?;
+    // Revision is allocated inside the locked commit transition below
+    // (stable body identities; R4-2: allocation sees the committed row).
     let warnings = crate::doctrine::stance_warnings(&req.content, prior_body.as_deref());
-    // Re-store the live row. `store_memory` dedups + creates, so any stale
-    // row is removed first — the version archive already preserved it.
-    if existing.is_some() {
-        store
-            .delete_memory(&ns, &MemoryId(req.id.clone()))
-            .await
-            .map_err(internal)?;
-    }
+    // The live-row replacement is the backend's locked commit half
+    // (review round 4, R4-2): delete + store + active-recompute as ONE
+    // transition, so concurrent same-id ingests serialize instead of
+    // deleting each other's rows mid-flight.
     let memory = Memory {
         id: MemoryId(req.id.clone()),
         content: req.content.clone(),
@@ -921,21 +912,18 @@ async fn ingest_doctrine(
         supersedes: None,
         superseded_by: None,
         superseded_at_unix: None,
-        revision: Some(revision),
+        revision: None, // allocated by commit_doctrine_ingest
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default(),
     };
-    store.store_memory(&ns, memory).await.map_err(internal)?;
-    // Truthful active flags: exactly the archived version matching the
-    // live body, if any (review round 1, P1-3).
-    store
-        .mark_doctrine_active(&ns, &MemoryId(req.id.clone()), &req.content)
+    let (id, revision) = store
+        .commit_doctrine_ingest(&ns, memory)
         .await
         .map_err(internal)?;
     Ok(Json(DoctrineIngestResponse {
-        id: req.id,
+        id: id.0,
         revision,
         warnings,
     }))
@@ -5771,5 +5759,160 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+    /// R4-1: mutually-superseding concurrent saves must not form a
+    /// correction cycle — serial execution rejects both (absent targets);
+    /// the locked transition preserves that outcome.
+    #[tokio::test]
+    async fn mutual_supersedes_form_no_cycle() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+
+        let mut a = full_mem("mutual-a", "content A", "0");
+        a["supersedes"] = "mutual-b".into();
+        let mut b = full_mem("mutual-b", "content B", "1");
+        b["supersedes"] = "mutual-a".into();
+        let (ra, rb) = tokio::join!(
+            app.clone().oneshot(post_json("/memories", &write, &a)),
+            app.clone().oneshot(post_json("/memories", &write, &b)),
+        );
+        let sa = ra.expect("a req").status();
+        let sb = rb.expect("b req").status();
+        let oks = [sa, sb].iter().filter(|s| **s == StatusCode::OK).count();
+        assert!(
+            oks <= 1,
+            "mutual supersedes cannot both succeed: {sa} / {sb}"
+        );
+
+        // Whatever landed: no cycle. If both rows exist, at most one is
+        // superseded; if neither landed (both rejected), fine too.
+        for id in ["mutual-a", "mutual-b"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/memories/{id}"))
+                        .header("authorization", write.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if res.status() == StatusCode::OK {
+                let row: Memory = serde_json::from_slice(
+                    &axum::body::to_bytes(res.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if let Some(by) = &row.superseded_by {
+                    assert_ne!(by, &row.id.0, "no self-reference: {row:?}");
+                }
+            }
+        }
+        // The direct cycle check: not (A.superseded_by == B AND
+        // B.superseded_by == A).
+        let app2 = app.clone();
+        let write2 = write.clone();
+        let get = |id: String| {
+            let app = app2.clone();
+            let write = write2.clone();
+            async move {
+                let res = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/memories/{id}"))
+                            .header("authorization", write)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if res.status() == StatusCode::OK {
+                    serde_json::from_slice::<Memory>(
+                        &axum::body::to_bytes(res.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .ok()
+                } else {
+                    None
+                }
+            }
+        };
+        let (row_a, row_b) = tokio::join!(get("mutual-a".into()), get("mutual-b".into()));
+        if let (Some(ra), Some(rb)) = (&row_a, &row_b) {
+            let cycle = ra.superseded_by.as_deref() == Some(rb.id.0.as_str())
+                && rb.superseded_by.as_deref() == Some(ra.id.0.as_str());
+            assert!(!cycle, "correction cycle: {ra:?} / {rb:?}");
+        }
+    }
+
+    /// R4-2: concurrent same-id doctrine ingests serialize — both succeed
+    /// with distinct stable revisions, live is one, actives truthful.
+    #[tokio::test]
+    async fn concurrent_doctrine_ingests_serialize() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "doc-r4", "seed body").await;
+
+        let req = |content: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/doctrine?namespace=ns_doctrine")
+                        .header("authorization", admin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": "doc-r4", "content": content,
+                                "project": "ijima", "topic": "arch"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (rb, rc) = tokio::join!(req("body B0"), req("body C0"));
+        assert_eq!(rb.status(), StatusCode::OK, "B serialized, not 404");
+        assert_eq!(rc.status(), StatusCode::OK, "C serialized, not 404");
+
+        let revs = [
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(rb.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()["revision"]
+                .as_u64()
+                .unwrap(),
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(rc.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()["revision"]
+                .as_u64()
+                .unwrap(),
+        ];
+        revs.iter()
+            .for_each(|r| assert!(*r >= 2 && *r <= 3, "revs in {{2,3}}: {revs:?}"));
+        assert_ne!(revs[0], revs[1], "distinct stable revisions: {revs:?}");
+
+        let live = recall_doctrine(&app, &admin, "doc-r4").await;
+        assert!(
+            live.content == "body B0" || live.content == "body C0",
+            "live is the last serialized writer: {live:?}"
+        );
+        let versions = list_versions(&app, &admin, "doc-r4").await;
+        let actives = versions.iter().filter(|v| v.active).count();
+        assert!(actives <= 1, "at most one active: {versions:?}");
     }
 }

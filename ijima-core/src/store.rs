@@ -182,24 +182,22 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SearchHit>>;
 
-    /// The single doctrine-ingest transition (review round 3, R3-1/R3-2):
-    /// under the doctrine lock — archives the OUTGOING body if the content
-    /// changes, then allocates the incoming body's revision. Revision
-    /// numbers are STABLE BODY IDENTITIES: a returning body restores the
-    /// number it first went live with; a genuinely new body takes
-    /// max(ever-assigned) + 1. No number ever identifies two different
-    /// bodies. Returns the revision the incoming content should carry.
-    /// No-op (returns the live revision) when the content is unchanged.
-    async fn prepare_doctrine_ingest(
+    /// The COMPLETE doctrine-ingest transition (review rounds 3-4):
+    /// under the doctrine lock — archives the outgoing body, allocates
+    /// the incoming revision (STABLE BODY IDENTITIES: a returning body
+    /// restores the number it first went live with; a new body takes
+    /// max-ever + 1), replaces the live row, and recomputes active
+    /// flags. One lock acquisition for the whole transition so
+    /// concurrent same-id ingests serialize with distinct revisions
+    /// (R4-2). Returns the stored id and the revision it carries.
+    async fn commit_doctrine_ingest(
         &self,
         ns: &NamespaceId,
-        id: &MemoryId,
-        new_content: &str,
-    ) -> Result<u32> {
-        let _ = (ns, id, new_content);
-        Err(IjimaError::unsupported(
-            "doctrine versioning requires the SurrealDB backend",
-        ))
+        memory: Memory,
+    ) -> Result<(MemoryId, u32)> {
+        let _ = self.delete_memory(ns, &memory.id).await;
+        let id = self.store_memory(ns, memory).await?;
+        Ok((id, 1))
     }
 
     /// List archived versions of a doctrine doc, oldest first.
