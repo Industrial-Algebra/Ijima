@@ -846,43 +846,6 @@ async fn ingest_doctrine(
     // doctrine semantics say one row suffices — return the existing id
     // instead of failing. Re-ingesting identical content is a no-op
     // (same id, same revision, no new archive).
-    if let Some(existing_id) = store
-        .check_duplicate_live(&ns, &req.content)
-        .await
-        .map_err(internal)?
-    {
-        // Canonical revision comes from the ROW THAT HOLDS the content
-        // (review round 1, P1-4) — not from the incoming id's prior row.
-        let canonical = store
-            .recall_memory(&ns, &existing_id)
-            .await
-            .map_err(internal)?;
-        let revision = canonical.as_ref().and_then(|m| m.revision).unwrap_or(1);
-        // A stale row under the INCOMING id holding other content is
-        // retired via the supersede link: identical content now lives at
-        // the canonical id, and the stale duplicate must drop out of
-        // wake-up/search/browse.
-        if existing_id.0 != req.id {
-            let stale = store
-                .recall_memory(&ns, &MemoryId(req.id.clone()))
-                .await
-                .map_err(internal)?;
-            if let Some(stale_row) = stale
-                && stale_row.superseded_by.is_none()
-                && stale_row.content != req.content
-            {
-                store
-                    .mark_superseded(&ns, &MemoryId(req.id.clone()), &existing_id)
-                    .await
-                    .map_err(internal)?;
-            }
-        }
-        return Ok(Json(DoctrineIngestResponse {
-            id: existing_id.0,
-            revision,
-            warnings: Vec::new(),
-        }));
-    }
     // Revision is allocated inside the locked commit transition below
     // (stable body identities; R4-2: allocation sees the committed row).
     let warnings = crate::doctrine::stance_warnings(&req.content, prior_body.as_deref());
@@ -5914,5 +5877,205 @@ mod tests {
         let versions = list_versions(&app, &admin, "doc-r4").await;
         let actives = versions.iter().filter(|v| v.active).count();
         assert!(actives <= 1, "at most one active: {versions:?}");
+    }
+    /// R5-1: concurrent cross-id dedup must not create a retirement
+    /// cycle — the canonical lookup and retirement run inside the locked
+    /// transition now.
+    #[tokio::test]
+    async fn concurrent_cross_id_dedup_forms_no_cycle() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "cx-a", "A").await;
+        post_doctrine(&app, &admin, uri, "cx-b", "B").await;
+
+        let req = |id: &'static str, content: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/doctrine?namespace=ns_doctrine")
+                        .header("authorization", admin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": id, "content": content,
+                                "project": "ijima", "topic": "arch"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (ra, rb) = tokio::join!(req("cx-a", "B"), req("cx-b", "A"));
+        assert_eq!(ra.status(), StatusCode::OK);
+        assert_eq!(rb.status(), StatusCode::OK);
+
+        let row_a = recall_doctrine(&app, &admin, "cx-a").await;
+        let row_b = recall_doctrine(&app, &admin, "cx-b").await;
+        let cycle = row_a.superseded_by.as_deref() == Some("cx-b")
+            && row_b.superseded_by.as_deref() == Some("cx-a");
+        assert!(!cycle, "retirement cycle: {row_a:?} / {row_b:?}");
+        // At most one of the two originals ended up retired.
+        let retired = [row_a.superseded_by.is_some(), row_b.superseded_by.is_some()]
+            .iter()
+            .filter(|r| **r)
+            .count();
+        assert!(
+            retired <= 1,
+            "at most one retirement: {row_a:?} / {row_b:?}"
+        );
+    }
+
+    /// R5-2: identical concurrent ingests share the revision identity —
+    /// and that identity stays rollback-addressable.
+    #[tokio::test]
+    async fn concurrent_identical_ingests_share_identity() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "ident", "seed").await;
+
+        let req = |content: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                let res = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/doctrine?namespace=ns_doctrine")
+                            .header("authorization", admin)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "id": "ident", "content": content,
+                                    "project": "ijima", "topic": "arch"
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                serde_json::from_slice::<serde_json::Value>(
+                    &axum::body::to_bytes(res.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        let (r1, r2) = tokio::join!(req("body B"), req("body B"));
+        assert_eq!(
+            r1["revision"], r2["revision"],
+            "shared identity: {r1} / {r2}"
+        );
+        assert_eq!(r1["revision"].as_u64(), Some(2));
+
+        // Identity stays rollback-addressable after the next change.
+        post_doctrine(&app, &admin, uri, "ident", "body C").await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback")
+                    .header("authorization", admin.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "ident", "to": 2}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "rollback to shared identity");
+        let live = recall_doctrine(&app, &admin, "ident").await;
+        assert_eq!(live.content, "body B");
+        assert_eq!(live.revision, Some(2));
+    }
+
+    /// R5-3: a dedup-losing concurrent replacement must not destroy the
+    /// losing id's prior row — retirement, never deletion.
+    #[tokio::test]
+    async fn concurrent_identical_replacement_keeps_rows() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "rep-a", "old-a").await;
+        post_doctrine(&app, &admin, uri, "rep-b", "old-b").await;
+
+        let req = |id: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/doctrine?namespace=ns_doctrine")
+                        .header("authorization", admin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": id, "content": "shared new body",
+                                "project": "ijima", "topic": "arch"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (ra, rb) = tokio::join!(req("rep-a"), req("rep-b"));
+        for r in [&ra, &rb] {
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "no destructive 409: {}",
+                r.status()
+            );
+        }
+
+        // Both ids still recall (one canonical-holding or retired —
+        // neither deleted).
+        for id in ["rep-a", "rep-b"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/memories/{id}?namespace=ns_doctrine"))
+                        .header("authorization", admin.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "{id} must survive: {}",
+                res.status()
+            );
+        }
+        // Exactly one row holds the shared content live.
+        let a_row = recall_doctrine(&app, &admin, "rep-a").await;
+        let b_row = recall_doctrine(&app, &admin, "rep-b").await;
+        let live_count = [
+            a_row.content == "shared new body" && a_row.superseded_by.is_none(),
+            b_row.content == "shared new body" && b_row.superseded_by.is_none(),
+        ]
+        .iter()
+        .filter(|c| **c)
+        .count();
+        assert_eq!(live_count, 1, "one canonical: {a_row:?} / {b_row:?}");
     }
 }

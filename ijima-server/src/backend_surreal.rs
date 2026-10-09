@@ -164,17 +164,18 @@ impl SurrealStore {
 
     /// Archive a doc's OUTGOING body under the identity it went live
     /// with (its live revision — or max+1 when it never carried one).
-    /// LOCK-FREE: callers hold the doctrine lock (prepare, activate).
-    /// Upsert semantics: a racing writer cannot collide on the create;
-    /// the hash check is an optimization, not the guard.
+    /// Returns Some(version) for the archived/matched outgoing body, None
+    /// when there is no live row. LOCK-FREE: callers hold the doctrine
+    /// lock. Upsert semantics: a racing writer cannot collide on the
+    /// create; the hash check is an optimization, not the guard.
     async fn archive_outgoing(
         &self,
         ns: &NamespaceId,
         id: &MemoryId,
         live: &Option<Memory>,
-    ) -> Result<()> {
+    ) -> Result<Option<u32>> {
         use sha2::{Digest, Sha256};
-        let Some(live) = live else { return Ok(()) };
+        let Some(live) = live else { return Ok(None) };
         let mut result = self
             .db
             .query(format!(
@@ -192,8 +193,8 @@ impl SurrealStore {
         }
         let rows = take_vec::<VersionRow>(&mut result)?;
         let out_hash = hex(&Sha256::digest(live.content.as_bytes()));
-        if rows.iter().any(|r| r.content_hash == out_hash) {
-            return Ok(());
+        if let Some(prior) = rows.iter().find(|r| r.content_hash == out_hash) {
+            return Ok(Some(prior.version));
         }
         let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
         let version = live.revision.unwrap_or(max_version + 1);
@@ -219,7 +220,7 @@ impl SurrealStore {
             .content(surrealdb::types::SerdeWrapper(wire))
             .await
             .map_err(store_err)?;
-        Ok(())
+        Ok(Some(version))
     }
 
     /// Active-flag write WITHOUT taking the doctrine lock — callers hold
@@ -1356,8 +1357,38 @@ impl Store for SurrealStore {
         use sha2::{Digest, Sha256};
         let _guard = self.doctrine_lock.lock().await;
 
-        // --- allocation half (was prepare_doctrine_ingest; same guard
-        // as the commit half now — R4-2's distinct-revisions fix) ---
+        // --- authoritative dedup (review round 5: R5-1, R5-3) ---
+        // Unchanged content at this id: no-op, keep the live revision.
+        let live = self.recall_memory(ns, &memory.id).await?;
+        if let Some(live) = &live
+            && live.content == memory.content
+        {
+            return Ok((memory.id.clone(), live.revision.unwrap_or(1)));
+        }
+        // Content already LIVE under another id: that row is canonical —
+        // retire this id's stale row (if any, and different) via the
+        // supersede link and report the canonical identity. No deletion
+        // happens on this path, so a raced reject cannot destroy the
+        // prior document (R5-3).
+        if let Some(canonical_id) = self.check_duplicate_live(ns, &memory.content).await?
+            && canonical_id != memory.id
+        {
+            let canonical = self
+                .recall_memory(ns, &canonical_id)
+                .await?
+                .ok_or_else(|| {
+                    IjimaError::not_found(format!("doctrine doc {} not found", canonical_id.0))
+                })?;
+            if let Some(mine) = &live
+                && mine.superseded_by.is_none()
+                && mine.content != memory.content
+            {
+                self.mark_superseded(ns, &memory.id, &canonical_id).await?;
+            }
+            return Ok((canonical_id, canonical.revision.unwrap_or(1)));
+        }
+
+        // --- allocation half ---
         let mut result = self
             .db
             .query(format!(
@@ -1376,18 +1407,30 @@ impl Store for SurrealStore {
         let rows = take_vec::<VersionRow>(&mut result)?;
         let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
 
-        let live = self.recall_memory(ns, &memory.id).await?;
-        // Archive the outgoing body under the identity it went live with.
-        self.archive_outgoing(ns, &memory.id, &live).await?;
+        // Archive the outgoing body; its identity counts toward the
+        // returning-body check below (R5-2: identical concurrent ingests
+        // must reuse the identity, not allocate past a stale snapshot).
+        let out_version = self.archive_outgoing(ns, &memory.id, &live).await?;
+        let out_hash = live
+            .as_ref()
+            .map(|l| hex(&Sha256::digest(l.content.as_bytes())));
+        let new_hash = hex(&Sha256::digest(memory.content.as_bytes()));
 
         // Stable identity: a returning body restores its original number;
         // a new body takes max-ever + 1.
-        let new_hash = hex(&Sha256::digest(memory.content.as_bytes()));
-        let revision = if let Some(prior) = rows.iter().find(|r| r.content_hash == new_hash) {
+        let revision = if out_hash.as_deref() == Some(new_hash.as_str()) {
+            // The outgoing body IS the incoming body re-asserted at this
+            // id (identity-preserving replace): keep its identity.
+            out_version.unwrap_or(memory.revision.unwrap_or(max_version + 1))
+        } else if let Some(prior) = rows.iter().find(|r| r.content_hash == new_hash) {
             prior.version
         } else {
             let live_rev = live.as_ref().and_then(|m| m.revision).unwrap_or(0);
-            max_version.max(live_rev) + 1
+            max_version.max(live_rev).max(
+                // an archived outgoing body this call just created can
+                // raise the ceiling for genuinely-new content
+                out_version.unwrap_or(0),
+            ) + 1
         };
         memory.revision = Some(revision);
 
@@ -1402,7 +1445,6 @@ impl Store for SurrealStore {
         self.set_active_flags(ns, &id, &live_hash).await?;
         Ok((id, revision))
     }
-
     async fn activate_doctrine_version(
         &self,
         ns: &NamespaceId,
