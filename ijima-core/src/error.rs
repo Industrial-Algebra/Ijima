@@ -61,6 +61,14 @@ pub enum IjimaError {
         /// Transport failure description.
         detail: String,
     },
+
+    /// The operation requires a backend that supports it (e.g. doctrine
+    /// versioning requires the SurrealDB backend).
+    #[error("unsupported: {detail}")]
+    Unsupported {
+        /// Why the operation is unsupported.
+        detail: String,
+    },
 }
 
 impl IjimaError {
@@ -81,6 +89,13 @@ impl IjimaError {
     /// Construct an [`InvalidInput`] error with the given detail string.
     pub fn invalid_input(detail: impl Into<String>) -> Self {
         Self::InvalidInput {
+            detail: detail.into(),
+        }
+    }
+
+    /// Construct an [`Unsupported`] error with the given detail string.
+    pub fn unsupported(detail: impl Into<String>) -> Self {
+        Self::Unsupported {
             detail: detail.into(),
         }
     }

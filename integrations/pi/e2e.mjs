@@ -6,7 +6,7 @@ const mod = await import("./index.js");
 const events = new Map();
 const tools = [];
 const pi = {
-  registerTool: (t) => tools.push(t.name),
+  registerTool: (t) => tools.push(t),
   on: (name, handler) => events.set(name, handler),
 };
 mod.default(pi);
@@ -62,3 +62,76 @@ console.log(
   injected.includes("E2E probe"),
 );
 console.log("prompt length:", injected.length);
+
+// ---------------------------------------------------------------------------
+// v0.4.0 U5: evidence + supersede round-trips against a live daemon.
+// Degrade gracefully when IJIMA_URL is unset (skip, never fail).
+// ---------------------------------------------------------------------------
+if (!process.env.IJIMA_URL) {
+  console.log(
+    "evidence/supersede round-trips: skipped (IJIMA_URL unset)",
+  );
+} else {
+  const base = mod.resolveIjimaUrl();
+  const token = mod.resolveIjimaToken();
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const stamp = Date.now();
+  const contentA = `E2E evidence probe A ${stamp}`;
+  const contentB = `E2E evidence probe B ${stamp}`;
+  const saveTool = tools.find((t) => t.name === "memory_save");
+
+  // 4a. Observed + citation → 200 (id comes back on success).
+  const resA = await saveTool.execute("e2e", {
+    content: contentA,
+    project: "general",
+    topic: "e2e",
+    evidence: "Observed",
+    citations: [{ kind: "File", locator: "e2e" }],
+  });
+  const aText = resA?.content?.[0]?.text ?? "";
+  const aId = /Saved memory: (\S+)/.exec(aText)?.[1];
+  console.log("save A observed+citation 200:", Boolean(aId));
+
+  // 4b. B supersedes A → 200.
+  const resB = await saveTool.execute("e2e", {
+    content: contentB,
+    project: "general",
+    topic: "e2e",
+    supersedes: aId,
+  });
+  const bText = resB?.content?.[0]?.text ?? "";
+  const bId = /Saved memory: (\S+)/.exec(bText)?.[1];
+  console.log("save B supersedes A 200:", Boolean(bId));
+
+  // 4c. Recall A shows superseded_by == B.id.
+  const recallRes = await fetch(
+    `${base}${mod.withHome(`/memories/${aId}`)}`,
+    { headers },
+  );
+  const recalled = await recallRes.json();
+  console.log(
+    "recall A superseded_by == B.id:",
+    recalled.superseded_by === bId,
+  );
+
+  // 4d. Wake-up omits the superseded A.
+  const wakeRes = await fetch(`${base}${mod.withHome("/wakeup")}`, {
+    headers,
+  });
+  const wakeText = await wakeRes.text();
+  console.log(
+    "wake-up omits superseded A:",
+    !wakeText.includes(aId) && !wakeText.includes(contentA),
+  );
+
+  // 5. Observed without citations → non-2xx (400).
+  const resBad = await saveTool.execute("e2e", {
+    content: `E2E observed-no-citation ${stamp}`,
+    evidence: "Observed",
+  });
+  const badText = resBad?.content?.[0]?.text ?? "";
+  console.log(
+    "observed without citations rejected (400):",
+    badText.includes("(400)"),
+  );
+}

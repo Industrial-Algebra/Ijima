@@ -14,7 +14,7 @@
 //! | Method | Path | Capability | Store method |
 //! |---|---|---|---|
 //! | GET | `/health` | (none) | — |
-//! | POST | `/memories` | `memory:write` | `store_memory` |
+//! | POST | `/memories` | `memory:write` | `store_memory` (supersedes link) |
 //! | GET | `/memories/:id` | `memory:read` | `recall_memory` |
 //! | DELETE | `/memories/:id` | `memory:write` | `delete_memory` |
 //! | POST | `/memories/search` | `memory:read` | `search_memories` |
@@ -42,12 +42,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "mining")]
 use ijima_core::capabilities::MINING_TRIGGER;
 use ijima_core::{
-    AcceptedExtraction, DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId,
-    NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Room,
-    SearchHit, Session, SessionId, SessionTurn, Store, TokenRevocation, TunnelTraversal,
+    AcceptedExtraction, DiaryEntry, DoctrineVersion, Embedder, EntityId, KnowledgeGraph, Memory,
+    MemoryId, NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction,
+    RepoDirectory, Room, SearchHit, Session, SessionId, SessionTurn, Store, TokenRevocation,
+    TunnelTraversal,
     capabilities::{
-        ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST,
-        TRUST_PROMOTE,
+        ADMIN, DOCTRINE_WRITE, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW,
+        SESSION_INGEST, TRUST_PROMOTE,
     },
     harness::Harness,
     memory::MemorySource,
@@ -99,6 +100,8 @@ pub fn app(
         .route("/namespaces/revoke", post(revoke_ns_membership))
         .route("/namespaces/members", get(list_ns_members))
         .route("/doctrine", post(ingest_doctrine))
+        .route("/doctrine/versions", get(list_doctrine_versions))
+        .route("/doctrine/rollback", post(rollback_doctrine))
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
         .route("/kg/entities/{id}", get(query_entity))
@@ -177,6 +180,7 @@ impl IntoResponse for ApiError {
 fn internal(e: ijima_core::IjimaError) -> ApiError {
     match e {
         ijima_core::IjimaError::Duplicate { detail } => ApiError::Conflict(detail),
+        ijima_core::IjimaError::NotFound { .. } => ApiError::NotFound,
         other => ApiError::Internal(other.to_string()),
     }
 }
@@ -438,6 +442,14 @@ async fn store_memory(
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default();
     }
+    // Auto-capture witnessed the session — stamp Observed + Session citation.
+    if memory.source == MemorySource::AutoCapture {
+        crate::extractor::stamp_auto_capture_evidence(&mut memory);
+    }
+    // Direction D: observed claims cite or they do not ship.
+    if let Err(msg) = memory.validate_evidence() {
+        return Err(ApiError::BadRequest(msg));
+    }
     let id = store.store_memory(&ns, memory).await.map_err(internal)?;
     Ok(Json(IdResponse { id: id.0 }))
 }
@@ -454,8 +466,9 @@ struct CheckDuplicateResponse {
 }
 
 /// Pre-check for content-hash dedup (`POST /memories/check`). Returns
-/// the existing memory id if identical content is already stored in the
-/// caller's (effective) namespace.
+/// the existing memory id if identical content is already stored LIVE
+/// (un-superseded) in the caller's (effective) namespace — retired
+/// rows' content does not block a save.
 async fn check_duplicate(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
@@ -466,8 +479,12 @@ async fn check_duplicate(
         return Err(ApiError::Forbidden);
     }
     let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+    // Live rows only (review round 3, R3-3): the endpoint is a save
+    // preflight — a RETIRED row's content no longer blocks a fresh save,
+    // and reporting it as the duplicate made the shipped importer skip
+    // valid saves.
     let dup = store
-        .check_duplicate(&ns, &req.content)
+        .check_duplicate_live(&ns, &req.content)
         .await
         .map_err(internal)?;
     Ok(Json(CheckDuplicateResponse {
@@ -673,6 +690,15 @@ async fn promote_memory(
         origin: memory.origin.clone(),
         authority: memory.authority.clone(),
         importance: memory.importance,
+        // Promotion copies curated content, not just text — the evidence
+        // grade and its citations travel with it (a promoted observation
+        // stays observed; verify-pass fix).
+        evidence: memory.evidence,
+        citations: memory.citations.clone(),
+        supersedes: None,
+        superseded_by: None,
+        superseded_at_unix: None,
+        revision: memory.revision,
         created_at: memory.created_at.clone(),
     };
     let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
@@ -725,16 +751,64 @@ struct DoctrineRequest {
     topic: String,
 }
 
+/// Ingest response (v0.4.0 U3): the stored id, its doctrine revision, and
+/// any advisory stance-scan warnings for the PR reviewer.
+#[derive(Serialize)]
+struct DoctrineIngestResponse {
+    id: String,
+    revision: u32,
+    warnings: Vec<String>,
+}
+
+/// Query for a doctrine version read/rollback: optional namespace override
+/// plus the doc id.
+#[derive(Deserialize)]
+struct DoctrineDocQuery {
+    #[serde(default)]
+    namespace: Option<String>,
+    id: String,
+}
+
+/// Body for a doctrine rollback.
+#[derive(Deserialize)]
+struct DoctrineRollbackRequest {
+    id: String,
+    to: u32,
+}
+
+/// Resolves the namespace for a doctrine version read: the global wall
+/// (default, or explicit `ns_doctrine`) needs ADMIN or DOCTRINE_WRITE;
+/// any other wall needs MEMORY_READ and the usual `resolve_ns` rules.
+async fn resolve_doctrine_read_ns(
+    principal: &AuthPrincipal,
+    store: &dyn Store,
+    requested: Option<&str>,
+) -> Result<NamespaceId, ApiError> {
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    if requested.is_none_or(|r| r == default_ns) {
+        if !principal.0.may(ADMIN) && !principal.0.may(DOCTRINE_WRITE) {
+            return Err(ApiError::Forbidden);
+        }
+        Ok(NamespaceId::new(default_ns))
+    } else {
+        if !principal.0.may(MEMORY_READ) {
+            return Err(ApiError::Forbidden);
+        }
+        resolve_ns(principal, store, requested).await
+    }
+}
+
 /// Ingests a curated doctrine entry into the global `ns_doctrine`
 /// namespace. Admin-gated — doctrine is PR-reviewed in Git and never
-/// written by agents. Idempotent (delete-then-store) so re-ingests
-/// upsert cleanly. No redaction (doctrine is pre-reviewed).
+/// written by agents. Idempotent: re-ingesting identical content is a
+/// no-op; changed content archives the prior body as a version and bumps
+/// `revision`. No redaction (doctrine is pre-reviewed).
 async fn ingest_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
-) -> Result<Json<IdResponse>, ApiError> {
+) -> Result<Json<DoctrineIngestResponse>, ApiError> {
     if !principal.0.may(ijima_core::capabilities::ADMIN)
         && !principal.0.may(ijima_core::capabilities::DOCTRINE_WRITE)
     {
@@ -760,27 +834,28 @@ async fn ingest_doctrine(
     } else {
         return Err(ApiError::Forbidden);
     };
-    // Idempotent upsert: remove any existing entry, then store.
-    store
-        .delete_memory(&ns, &MemoryId(req.id.clone()))
+    // The existing row (if any) supplies the prior body for the stance
+    // scan and decides whether this ingest archives a version.
+    let existing = store
+        .recall_memory(&ns, &MemoryId(req.id.clone()))
         .await
         .map_err(internal)?;
+    let prior_body = existing.as_ref().map(|m| m.content.clone());
     // Content dedup is upsert-compatible here: if the exact content
-    // already lives in this namespace under another id (byte-identical
-    // corpus files), doctrine semantics say one row suffices — return
-    // the existing id instead of failing. Without this, re-ingesting a
-    // corpus containing duplicates 409s forever on the second file
-    // (found in the v0.3.0 U3 rehearsal).
-    if let Some(existing) = store
-        .check_duplicate(&ns, &req.content)
-        .await
-        .map_err(internal)?
-    {
-        return Ok(Json(IdResponse { id: existing.0 }));
-    }
+    // already lives in this namespace (byte-identical corpus files),
+    // doctrine semantics say one row suffices — return the existing id
+    // instead of failing. Re-ingesting identical content is a no-op
+    // (same id, same revision, no new archive).
+    // Revision is allocated inside the locked commit transition below
+    // (stable body identities; R4-2: allocation sees the committed row).
+    let warnings = crate::doctrine::stance_warnings(&req.content, prior_body.as_deref());
+    // The live-row replacement is the backend's locked commit half
+    // (review round 4, R4-2): delete + store + active-recompute as ONE
+    // transition, so concurrent same-id ingests serialize instead of
+    // deleting each other's rows mid-flight.
     let memory = Memory {
         id: MemoryId(req.id.clone()),
-        content: req.content,
+        content: req.content.clone(),
         project: req.project,
         topic: req.topic,
         source: ijima_core::memory::MemorySource::Doctrine,
@@ -790,19 +865,79 @@ async fn ingest_doctrine(
         origin: ijima_core::InstanceId::local(),
         authority: ijima_core::AuthorityScope::local(),
         importance: 1.0,
+        // Doctrine bodies are Git-reviewed artifacts: observed, with the
+        // doc id as the citation locator.
+        evidence: ijima_core::memory::EvidenceGrade::Observed,
+        citations: vec![ijima_core::memory::Citation {
+            kind: ijima_core::memory::CitationKind::Report,
+            locator: req.id.clone(),
+        }],
+        supersedes: None,
+        superseded_by: None,
+        superseded_at_unix: None,
+        revision: None, // allocated by commit_doctrine_ingest
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default(),
     };
-    store.store_memory(&ns, memory).await.map_err(internal)?;
-    Ok(Json(IdResponse { id: req.id }))
+    let (id, revision) = store
+        .commit_doctrine_ingest(&ns, memory)
+        .await
+        .map_err(internal)?;
+    Ok(Json(DoctrineIngestResponse {
+        id: id.0,
+        revision,
+        warnings,
+    }))
+}
+
+/// Lists the archived versions of a doctrine doc, oldest first.
+async fn list_doctrine_versions(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<DoctrineDocQuery>,
+) -> Result<Json<Vec<DoctrineVersion>>, ApiError> {
+    let ns = resolve_doctrine_read_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+    let versions = store
+        .list_doctrine_versions(&ns, &MemoryId(q.id))
+        .await
+        .map_err(internal)?;
+    Ok(Json(versions))
+}
+
+/// Rolls a doctrine doc back to an archived version. Admin-only —
+/// reverting the shared baseline is the operator's call.
+async fn rollback_doctrine(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<NsQuery>,
+    Json(req): Json<DoctrineRollbackRequest>,
+) -> Result<Json<IdResponse>, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    // Same `?namespace=` rules as ingest: default is the global wall;
+    // an explicit wall goes through `resolve_ns` (never private).
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let ns = match q.namespace.as_deref() {
+        None => NamespaceId::new(default_ns),
+        Some(requested) => resolve_ns(&principal, store.as_ref(), Some(requested)).await?,
+    };
+    let id = store
+        .activate_doctrine_version(&ns, &MemoryId(req.id), req.to)
+        .await
+        .map_err(internal)?;
+    Ok(Json(IdResponse { id: id.0 }))
 }
 
 // ---------- wake-up composition (D9 §4) ----------
 
 /// How many personal essentials to include in a wake-up response.
 const WAKEUP_PERSONAL_LIMIT: usize = 20;
+/// The recency stratum: freshest rows regardless of importance,
+/// admitted ahead of the lexicographic fill (review round 1).
+const WAKEUP_RECENT_STRATUM: usize = 8;
 /// How many doctrine entries to include.
 const WAKEUP_DOCTRINE_LIMIT: usize = 50;
 
@@ -810,7 +945,8 @@ const WAKEUP_DOCTRINE_LIMIT: usize = 50;
 struct WakeupResponse {
     /// L0: the authenticated principal's identity.
     identity: serde_json::Value,
-    /// L1a: the caller's personal essentials (top-N by importance + recency).
+    /// L1a: lexicographic top stratum + recency stratum (stratified v0.4.0
+    /// — see RABBIT_HOLE_2026-09-22_Ijima §1).
     personal_essentials: Vec<Memory>,
     /// L1b: the shared team doctrine baseline (identical across the team).
     doctrine: Vec<Memory>,
@@ -834,14 +970,35 @@ async fn wakeup(
     let essentials_ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
 
-    let (personal_essentials, doctrine) = tokio::join!(
+    let (top, recent, doctrine) = tokio::join!(
         store.list_memories(&essentials_ns, WAKEUP_PERSONAL_LIMIT),
+        store.recent_memories(&essentials_ns, WAKEUP_RECENT_STRATUM),
         store.list_memories(&doctrine_ns, WAKEUP_DOCTRINE_LIMIT),
     );
+    // Stratified composition (v0.4.0 starvation fix, review round 1):
+    // the recency stratum is admitted FIRST — its guarantee (freshest
+    // rows reach wake-up even when the lexicographic top is saturated)
+    // is the point of the design — then the lexicographic order fills
+    // the remaining budget. An underfull wall (fewer rows than the
+    // limit) therefore returns every eligible row; a saturated wall
+    // returns 8 freshest + 12 highest-importance. Dedup by id.
+    let mut seen = std::collections::HashSet::new();
+    let mut personal_essentials = Vec::with_capacity(WAKEUP_PERSONAL_LIMIT);
+    for m in recent.map_err(internal)? {
+        if seen.insert(m.id.0.clone()) {
+            personal_essentials.push(m);
+        }
+    }
+    for m in top.map_err(internal)? {
+        if seen.insert(m.id.0.clone()) {
+            personal_essentials.push(m);
+        }
+    }
+    personal_essentials.truncate(WAKEUP_PERSONAL_LIMIT);
 
     Ok(Json(WakeupResponse {
         identity: serde_json::json!({ "principal": principal.0.principal.as_str() }),
-        personal_essentials: personal_essentials.map_err(internal)?,
+        personal_essentials,
         doctrine: doctrine.map_err(internal)?,
     }))
 }
@@ -2817,6 +2974,277 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
+    // ---------- doctrine versioning (v0.4.0 U3) ----------
+
+    /// POSTs a doctrine body via the admin endpoint; asserts 200 and
+    /// returns the parsed ingest response.
+    /// Review-round-1 helper: a full PascalCase Memory body.
+    fn full_mem(id: &str, content: &str, created_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "content": content,
+            "project": "ijima",
+            "topic": "general",
+            "source": "Explicit",
+            "harness": "Pi",
+            "session_id": "sess_r1",
+            "importance": 0.7,
+            "created_at": created_at,
+        })
+    }
+
+    /// Review-round-1 helper: POST a JSON body with a bearer token.
+    fn post_json(uri: &str, token: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", token.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Review-round-1 helper: recall a memory in the caller's namespace.
+    async fn get_mem(app: &Router, token: &str, id: &str) -> Memory {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/memories/{id}"))
+                    .header("authorization", token.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn post_doctrine(
+        app: &Router,
+        token: &str,
+        uri: &str,
+        id: &str,
+        content: &str,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "id": id,
+            "content": content,
+            "project": "ijima",
+            "topic": "arch",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "ingest failed: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// GETs the archived versions of a doctrine doc (global wall).
+    async fn list_versions(
+        app: &Router,
+        token: &str,
+        id: &str,
+    ) -> Vec<ijima_core::DoctrineVersion> {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/doctrine/versions?namespace=ns_doctrine&id={id}"))
+                    .header("authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn recall_doctrine(app: &Router, token: &str, id: &str) -> Memory {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/memories/{id}?namespace=ns_doctrine"))
+                    .header("authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_versions_on_change() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        let r1 = post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        assert_eq!(r1["id"], "doc-x");
+        assert_eq!(r1["revision"].as_u64(), Some(1));
+
+        let r2 = post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+        assert_eq!(r2["revision"].as_u64(), Some(2));
+
+        let mem = recall_doctrine(&app, &admin, "doc-x").await;
+        assert_eq!(mem.content, "body B");
+        assert_eq!(mem.revision, Some(2));
+
+        let versions = list_versions(&app, &admin, "doc-x").await;
+        assert_eq!(versions.len(), 1, "one archived version: {versions:?}");
+        assert_eq!(versions[0].version, 1);
+        assert_eq!(versions[0].content, "body A");
+        assert!(!versions[0].active);
+    }
+
+    #[tokio::test]
+    async fn doctrine_reingest_identical_is_noop() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+
+        let again = post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+        assert_eq!(again["id"], "doc-x");
+        assert_eq!(again["revision"].as_u64(), Some(2));
+        assert_eq!(
+            list_versions(&app, &admin, "doc-x").await.len(),
+            1,
+            "identical re-ingest must not archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctrine_rollback_restores_body() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback?namespace=ns_doctrine&id=doc-x")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "doc-x", "to": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mem = recall_doctrine(&app, &admin, "doc-x").await;
+        assert_eq!(mem.content, "body A");
+        assert_eq!(mem.revision, Some(1));
+
+        let versions = list_versions(&app, &admin, "doc-x").await;
+        let active: Vec<_> = versions.iter().filter(|v| v.active).collect();
+        assert_eq!(active.len(), 1, "exactly one active version: {versions:?}");
+        assert_eq!(active[0].version, 1);
+        assert_eq!(active[0].content, "body A");
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_response_carries_warnings() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        // Stance-dense pathological body: the incident's poisoning shape.
+        let dense = "you must obey. ".repeat(200);
+        let resp = post_doctrine(
+            &app,
+            &admin,
+            "/doctrine?namespace=ns_doctrine",
+            "doc-dense",
+            &dense,
+        )
+        .await;
+        let warnings = resp["warnings"].as_array().expect("warnings array");
+        assert!(!warnings.is_empty(), "expected stance warnings: {resp}");
+    }
+
+    #[tokio::test]
+    async fn wakeup_doctrine_entries_carry_revision() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let wakeup: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let doctrine = wakeup["doctrine"].as_array().expect("doctrine array");
+        let doc = doctrine
+            .iter()
+            .find(|m| m["id"] == "doc-x")
+            .expect("doc-x appears in wake-up doctrine");
+        assert_eq!(doc["revision"].as_u64(), Some(2));
+    }
+
     #[tokio::test]
     async fn wakeup_honors_namespace_param() {
         // Agent homes (0.2.5): a member's wakeup with ?namespace= reads
@@ -2956,6 +3384,12 @@ mod tests {
                             origin: ijima_core::InstanceId::local(),
                             authority: ijima_core::AuthorityScope::local(),
                             importance: 0.5,
+                            evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                            citations: Vec::new(),
+                            supersedes: None,
+                            superseded_by: None,
+                            superseded_at_unix: None,
+                            revision: None,
                             created_at: "0".into(),
                         },
                     )
@@ -3107,6 +3541,261 @@ mod tests {
         assert_eq!(body["doctrine"][0]["source"], "Doctrine");
     }
 
+    /// Like [`app_with_store`] but also hands back the store handle so a
+    /// test can seed rows with precise `importance`/`created_at` values.
+    async fn app_with_store_handle() -> (Router, Arc<IjimaAuth>, Arc<dyn Store>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app(
+            auth.clone(),
+            store.clone(),
+            kg,
+            None,
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+        );
+        (app, auth, store)
+    }
+
+    /// A minimal explicitly-saved memory for stratified wake-up seeds.
+    fn seed_mem(id: &str, importance: f32, created_at: &str) -> Memory {
+        Memory {
+            id: MemoryId(id.into()),
+            content: format!("stratified wake-up seed {id}"),
+            project: "ijima".into(),
+            topic: "test".into(),
+            source: MemorySource::Explicit,
+            harness: Harness::Pi,
+            session_id: None,
+            origin: ijima_core::InstanceId::local(),
+            authority: ijima_core::AuthorityScope::local(),
+            importance,
+            evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Drives `GET /wakeup` and returns the parsed response body.
+    async fn wakeup_body(app: Router, read: &str) -> serde_json::Value {
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The ordered ids in a wake-up `personal_essentials` array.
+    fn essential_ids(body: &serde_json::Value) -> Vec<String> {
+        body["personal_essentials"]
+            .as_array()
+            .expect("personal_essentials array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn wakeup_composes_both_strata() {
+        // 15 high-importance rows (old) + 5 fresh 0.5 rows. The top
+        // stratum (12) takes the 12 highest-importance rows; the recency
+        // stratum (8) brings in the 5 fresh rows plus 3 high-importance
+        // rows that fall below the top-12 cut. Result: exactly 20, and
+        // every fresh id is present.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        // 12 rows at 0.9 — the lexicographic top 12.
+        for i in 0..12 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(&format!("mem_top_{i:02}"), 0.9, &format!("{:04}", 1000 + i)),
+                )
+                .await
+                .expect("seed top");
+        }
+        // 3 rows at 0.8, newer than the top 12 — below the top-12 cut but
+        // inside the 8-freshest recency stratum.
+        let mut fresh_high = Vec::new();
+        for i in 0..3 {
+            let id = format!("mem_mid_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.8, &format!("{:04}", 2000 + i)))
+                .await
+                .expect("seed mid");
+            fresh_high.push(id);
+        }
+        // 5 rows at 0.5 with the newest timestamps — the starvation case.
+        let mut fresh_low = Vec::new();
+        for i in 0..5 {
+            let id = format!("mem_fresh_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.5, &format!("{:04}", 3000 + i)))
+                .await
+                .expect("seed fresh");
+            fresh_low.push(id);
+        }
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        assert_eq!(ids.len(), 20, "composed strata fill the budget: {ids:?}");
+        for id in &fresh_low {
+            assert!(ids.contains(id), "fresh 0.5 row {id} must reach wake-up");
+        }
+        for id in &fresh_high {
+            assert!(
+                ids.contains(id),
+                "mid row {id} must reach wake-up via recency"
+            );
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no duplicate ids: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn wakeup_recency_stratum_dedups() {
+        // 12 high-importance rows whose 3 newest also top the created_at
+        // ordering, so those 3 appear in both strata; 5 mid-age 0.5 rows
+        // fill the rest of the recency stratum. Dedup yields the union
+        // once each — no id twice.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        // 9 older high rows.
+        for i in 0..9 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(
+                        &format!("mem_high_old_{i:02}"),
+                        0.9,
+                        &format!("{:04}", 1000 + i),
+                    ),
+                )
+                .await
+                .expect("seed old high");
+        }
+        // 5 low rows in the middle of the age range.
+        let mut low = Vec::new();
+        for i in 0..5 {
+            let id = format!("mem_low_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.5, &format!("{:04}", 2000 + i)))
+                .await
+                .expect("seed low");
+            low.push(id);
+        }
+        // 3 newest rows, high importance — they appear in both strata.
+        let mut high_new = Vec::new();
+        for i in 0..3 {
+            let id = format!("mem_high_new_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.9, &format!("{:04}", 3000 + i)))
+                .await
+                .expect("seed new high");
+            high_new.push(id);
+        }
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no id twice: {ids:?}");
+        // Top stratum (12) = all 12 high rows. Recency stratum (8) = the 3
+        // newest high rows (already seen) + the 5 low rows.
+        assert_eq!(ids.len(), 17, "deduped union of the two strata: {ids:?}");
+        for id in &high_new {
+            assert!(
+                ids.contains(id),
+                "overlapping row {id} appears once, in the top"
+            );
+        }
+        for id in &low {
+            assert!(ids.contains(id), "recency-only row {id} must be present");
+        }
+    }
+
+    #[tokio::test]
+    async fn wakeup_recency_stratum_excludes_superseded() {
+        // A superseded memory carrying the newest timestamp must never
+        // enter wake-up — neither stratum admits superseded rows.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        store
+            .store_memory(&ns, seed_mem("mem_live", 0.9, "1000"))
+            .await
+            .expect("seed live");
+        store
+            .store_memory(&ns, seed_mem("mem_doomed", 0.9, "2000"))
+            .await
+            .expect("seed target");
+        let mut successor = seed_mem("mem_successor", 0.9, "3000");
+        successor.supersedes = Some("mem_doomed".into());
+        store
+            .store_memory(&ns, successor)
+            .await
+            .expect("seed successor");
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        assert!(
+            !ids.contains(&"mem_doomed".to_string()),
+            "superseded freshest row must be excluded: {ids:?}"
+        );
+        assert!(ids.contains(&"mem_successor".to_string()));
+    }
+
+    #[tokio::test]
+    async fn wakeup_underfull_wall_unchanged_behavior() {
+        // A wall with only 5 memories: both strata overlap fully, so the
+        // response is those 5 — no starvation, no invented slots.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        let mut seeded = Vec::new();
+        for i in 0..5 {
+            let id = format!("mem_small_{i}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.5, &format!("{:04}", 1000 + i)))
+                .await
+                .expect("seed small wall");
+            seeded.push(id);
+        }
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        assert_eq!(ids.len(), 5, "underfull wall returns every row: {ids:?}");
+        for id in &seeded {
+            assert!(ids.contains(id), "row {id} must be present");
+        }
+    }
+
     #[cfg(feature = "rate-limit")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn import_memories_backs_off_through_rate_limit() {
@@ -3155,6 +3844,12 @@ mod tests {
                 origin: ijima_core::InstanceId::local(),
                 authority: ijima_core::AuthorityScope::local(),
                 importance: 0.5,
+                evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                citations: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                superseded_at_unix: None,
+                revision: None,
                 created_at: "0".into(),
             })
             .collect();
@@ -3804,6 +4499,12 @@ mod tests {
                 origin: ijima_core::InstanceId::local(),
                 authority: ijima_core::AuthorityScope::local(),
                 importance: 0.5,
+                evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                citations: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                superseded_at_unix: None,
+                revision: None,
                 created_at: "0".into(),
             },
             similarity: sim,
@@ -4049,6 +4750,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn store_memory_rejects_observed_without_citations() {
+        let (app, auth) = app_with_store().await;
+        let body = |citations: serde_json::Value| {
+            serde_json::json!({
+                "id": "mem_obs",
+                "content": "observed but uncited",
+                "project": "ijima",
+                "topic": "evidence",
+                "source": "Explicit",
+                "harness": "Pi",
+                "session_id": "sess_1",
+                "importance": 0.5,
+                "created_at": "0",
+                "evidence": "Observed",
+                "citations": citations,
+            })
+            .to_string()
+        };
+
+        // Observed with no citation → 400 naming the missing citation.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body(serde_json::json!([]))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("cites nothing"), "body: {text}");
+
+        // Same body with one citation → 200.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body(
+                        serde_json::json!([{ "kind": "Commit", "locator": "abc123" }]),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -4478,5 +5241,872 @@ mod tests {
             serde_json::from_value(body).expect("deserializes as TokenRevocation");
         auth.hydrate_revocations(&listed);
         assert!(auth.is_revoked(&victim));
+    }
+    // ---------- review round 1 regression tests (PR #131) ----------
+
+    /// P1-1: a supersede save whose insert fails must leave the graph
+    /// uncorrupted — no row ends up excluded by a link to a save that
+    /// never landed.
+    #[tokio::test]
+    async fn failed_supersede_leaves_no_corruption() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+        let uri = "/memories";
+
+        let a = full_mem("mem_r1a", "original claim", "0");
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &a))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut b = full_mem("mem_r1b", "correction", "1");
+        b["supersedes"] = "mem_r1a".into();
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &b))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Reuse A's record id with new content, superseding B: the insert
+        // fails (key exists) and B must NOT be linked to the failed save.
+        let mut c = full_mem("mem_r1a", "conflicting reuse", "2");
+        c["supersedes"] = "mem_r1b".into();
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &c))
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::OK, "reused id must fail");
+
+        // B is visible (not superseded); A is superseded by B only.
+        let b_row: Memory = get_mem(&app, &write, "mem_r1b").await;
+        assert!(
+            b_row.superseded_by.is_none(),
+            "B unlinked: {:?}",
+            b_row.superseded_by
+        );
+        let a_row: Memory = get_mem(&app, &write, "mem_r1a").await;
+        assert_eq!(a_row.superseded_by.as_deref(), Some("mem_r1b"));
+
+        // Missing-target supersede: the just-inserted successor is
+        // compensated away (recall 404s).
+        let mut d = full_mem("mem_r1d", "dangling", "3");
+        d["supersedes"] = "mem_ghost".into();
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &d))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_r1d")
+                    .header("authorization", write.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "compensated away");
+    }
+
+    /// P1-2: read paths (list/search/wake-up) preserve the stored
+    /// evidence grade and citations — projections must carry them.
+    #[tokio::test]
+    async fn read_paths_preserve_evidence() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+        let mut m = seed_mem("mem_ev", 0.9, "5000");
+        m.evidence = ijima_core::memory::EvidenceGrade::Observed;
+        m.citations = vec![ijima_core::memory::Citation {
+            kind: ijima_core::memory::CitationKind::Session,
+            locator: "sess_ev".into(),
+        }];
+        store.store_memory(&ns, m).await.expect("seed");
+
+        let listed = store.list_memories(&ns, 10).await.expect("list");
+        let row = listed.iter().find(|m| m.id.0 == "mem_ev").expect("listed");
+        assert_eq!(row.evidence, ijima_core::memory::EvidenceGrade::Observed);
+        assert_eq!(row.citations.len(), 1);
+        assert_eq!(row.citations[0].locator, "sess_ev");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let found = body["personal_essentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "mem_ev" && m["evidence"] == "Observed");
+        assert!(found, "wake-up carries the grade: {}", body);
+    }
+
+    /// P1-3: rollback then re-ingest keeps version identities stable — no
+    /// duplicate archive of an already-archived body, at most one active.
+    #[tokio::test]
+    async fn rollback_then_ingest_keeps_version_identity() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-r1", "v1").await;
+        post_doctrine(&app, &admin, uri, "doc-r1", "v2").await;
+        // Roll back to v1, then ingest v3.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback")
+                    .header("authorization", admin.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "doc-r1", "to": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "P2-5: body id, no query id");
+        post_doctrine(&app, &admin, uri, "doc-r1", "v3").await;
+
+        let versions = list_versions(&app, &admin, "doc-r1").await;
+        let hashes: std::collections::HashSet<_> =
+            versions.iter().map(|v| v.content_hash.clone()).collect();
+        assert_eq!(
+            hashes.len(),
+            versions.len(),
+            "no duplicate bodies: {versions:?}"
+        );
+        assert_eq!(versions.len(), 2, "v1 and v2 archived: {versions:?}");
+        let actives = versions.iter().filter(|v| v.active).count();
+        assert!(actives <= 1, "at most one active: {versions:?}");
+        let live = recall_doctrine(&app, &admin, "doc-r1").await;
+        assert_eq!(live.content, "v3");
+        // R2-1: C is the doc's THIRD distinct body — revision 3, not 2
+        // (archive identity must not be conflated with the counter).
+        assert_eq!(live.revision, Some(3), "third body, third revision");
+    }
+
+    /// P1-4: cross-id byte-identical ingest reports the CANONICAL id and
+    /// revision, and retires the stale duplicate via the supersede link.
+    #[tokio::test]
+    async fn cross_id_dedup_reports_canonical_and_retires_stale() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-can", "canonical body").await;
+        post_doctrine(&app, &admin, uri, "doc-can", "canonical body v2").await;
+        post_doctrine(&app, &admin, uri, "doc-stale", "obsolete body").await;
+
+        // Re-ingest under the STALE id with the canonical current content.
+        let r = post_doctrine(&app, &admin, uri, "doc-stale", "canonical body v2").await;
+        assert_eq!(r["id"], "doc-can", "canonical id reported: {r}");
+        assert_eq!(r["revision"].as_u64(), Some(2), "canonical revision: {r}");
+
+        let stale = recall_doctrine(&app, &admin, "doc-stale").await;
+        assert_eq!(
+            stale.superseded_by.as_deref(),
+            Some("doc-can"),
+            "stale row retired"
+        );
+    }
+
+    /// P2-6: an underfull wall returns every eligible row — importance
+    /// aligned WITH recency must not drop tail rows below the strata cut.
+    #[tokio::test]
+    async fn underfull_wall_returns_all_eligible() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+        // 15 rows: newest = highest importance (fully overlapping strata).
+        for i in 0..15 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(
+                        &format!("mem_u_{i:02}"),
+                        0.9 - (i as f32 * 0.02),
+                        &format!("{:04}", 3000 - i),
+                    ),
+                )
+                .await
+                .expect("seed");
+        }
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["personal_essentials"].as_array().map(Vec::len),
+            Some(15),
+            "all eligible rows return: {}",
+            body
+        );
+    }
+    /// R2-4: re-ingesting a RETIRED body must not resolve the dedup to
+    /// the retired holder — that formed canonical↔stale supersede cycles
+    /// that hid both rows.
+    #[tokio::test]
+    async fn reingesting_retired_body_forms_no_cycle() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-cyc-a", "body X").await;
+        post_doctrine(&app, &admin, uri, "doc-cyc-b", "body Y").await;
+        // Retire A: its id now re-ingests B's current content → canonical.
+        let r = post_doctrine(&app, &admin, uri, "doc-cyc-a", "body Y").await;
+        assert_eq!(r["id"], "doc-cyc-b");
+        let retired = recall_doctrine(&app, &admin, "doc-cyc-a").await;
+        assert_eq!(retired.superseded_by.as_deref(), Some("doc-cyc-b"));
+
+        // The cycle attempt: re-ingest the RETIRED body (X) under B.
+        // The retired holder (A) must not be canonical — a fresh body
+        // lands under B instead, and neither row points at the other.
+        let r = post_doctrine(&app, &admin, uri, "doc-cyc-b", "body X").await;
+        assert_eq!(r["id"], "doc-cyc-b", "no retired canonical: {r}");
+        let b_row = recall_doctrine(&app, &admin, "doc-cyc-b").await;
+        assert!(b_row.superseded_by.is_none(), "B not superseded: {b_row:?}");
+        assert_eq!(b_row.content, "body X");
+        let a_row = recall_doctrine(&app, &admin, "doc-cyc-a").await;
+        assert_eq!(
+            a_row.superseded_by.as_deref(),
+            Some("doc-cyc-b"),
+            "A still retired, no cycle"
+        );
+    }
+
+    /// R2-2: concurrent successors of one target — exactly one claim
+    /// wins; the loser is rejected and compensated away.
+    #[tokio::test]
+    async fn concurrent_supersedes_exactly_one_claim_wins() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+        let a = full_mem("mem_cc_a", "target claim", "0");
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &a))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut b = full_mem("mem_cc_b", "successor one", "1");
+        b["supersedes"] = "mem_cc_a".into();
+        let mut c = full_mem("mem_cc_c", "successor two", "2");
+        c["supersedes"] = "mem_cc_a".into();
+        let (rb, rc) = tokio::join!(
+            app.clone().oneshot(post_json("/memories", &write, &b)),
+            app.clone().oneshot(post_json("/memories", &write, &c)),
+        );
+        let statuses = [
+            rb.expect("b request").status(),
+            rc.expect("c request").status(),
+        ];
+        let oks = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        assert_eq!(oks, 1, "exactly one successor wins: {statuses:?}");
+
+        let target: Memory = get_mem(&app, &write, "mem_cc_a").await;
+        let winner = if statuses[0] == StatusCode::OK {
+            "mem_cc_b"
+        } else {
+            "mem_cc_c"
+        };
+        assert_eq!(target.superseded_by.as_deref(), Some(winner));
+        // The loser stored nothing (compensated).
+        let loser = if statuses[0] == StatusCode::OK {
+            "mem_cc_c"
+        } else {
+            "mem_cc_b"
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/memories/{loser}"))
+                    .header("authorization", write.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "loser compensated away"
+        );
+    }
+    /// R3-1: revision numbers are stable body identities — no number
+    /// ever identifies two different bodies (A→B→A→C→D ⇒ 1,2,1,3,4).
+    #[tokio::test]
+    async fn revision_identities_are_stable() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        let seq = [
+            ("body A", 1u64),
+            ("body B", 2),
+            ("body A", 1), // returning body restores its identity
+            ("body C", 3),
+            ("body D", 4),
+        ];
+        for (body, expect_rev) in seq {
+            let r = post_doctrine(&app, &admin, uri, "doc-ident", body).await;
+            assert_eq!(
+                r["revision"].as_u64(),
+                Some(expect_rev),
+                "body {body:?} must be revision {expect_rev}: {r}"
+            );
+        }
+        // Archive identities stay 1:1 with bodies.
+        let versions = list_versions(&app, &admin, "doc-ident").await;
+        let mut seen: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        for v in &versions {
+            let prev = seen.insert(v.version, v.content_hash.clone());
+            assert!(
+                prev.is_none() || prev.as_deref() == Some(v.content_hash.as_str()),
+                "version {} identifies two bodies: {versions:?}",
+                v.version
+            );
+        }
+    }
+
+    /// R3-2: rollback racing an ingest of the same doc — both succeed,
+    /// no archive-creation collision, final state self-consistent.
+    #[tokio::test]
+    async fn rollback_ingest_race_no_collision() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "doc-race", "r1").await;
+        post_doctrine(&app, &admin, uri, "doc-race", "r2").await;
+
+        let rollback = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/doctrine/rollback")
+                .header("authorization", admin.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"id": "doc-race", "to": 1}).to_string(),
+                ))
+                .unwrap(),
+        );
+        let ingest = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", admin.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": "doc-race", "content": "r3", "project": "ijima", "topic": "arch"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        );
+        let (rr, ri) = tokio::join!(rollback, ingest);
+        assert_eq!(rr.expect("rollback req").status(), StatusCode::OK);
+        assert_eq!(
+            ri.expect("ingest req").status(),
+            StatusCode::OK,
+            "ingest must not 500 on an archive collision"
+        );
+
+        // Final state: live is whichever landed last; actives tell the
+        // truth about it; both bodies are recoverable.
+        let live = recall_doctrine(&app, &admin, "doc-race").await;
+        assert!(
+            live.content == "r1" || live.content == "r3",
+            "live is one of the two racers: {live:?}"
+        );
+        let versions = list_versions(&app, &admin, "doc-race").await;
+        let actives = versions.iter().filter(|v| v.active).count();
+        assert!(actives <= 1, "at most one active: {versions:?}");
+        for v in &versions {
+            if v.active {
+                let matches_live = v.content == live.content;
+                assert!(matches_live, "active must match live: {v:?} vs {live:?}");
+            }
+        }
+    }
+
+    /// R3-3: the check endpoint is a save preflight — retired duplicates
+    /// do not block; the same content saves fresh.
+    #[tokio::test]
+    async fn check_endpoint_ignores_retired_duplicates() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+
+        let old = full_mem("mem_ck_old", "old body", "0");
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &old))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut new = full_mem("mem_ck_new", "new body", "1");
+        new["supersedes"] = "mem_ck_old".into();
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &new))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Preflight the retired content: no live duplicate.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/memories/check",
+                &write,
+                &serde_json::json!({"content": "old body"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["duplicate"],
+            serde_json::Value::Null,
+            "retired is not a blocker: {body}"
+        );
+
+        // And the save the preflight promises: succeeds under a fresh id.
+        let fresh = full_mem("mem_ck_fresh", "old body", "2");
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &fresh))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+    /// R4-1: mutually-superseding concurrent saves must not form a
+    /// correction cycle — serial execution rejects both (absent targets);
+    /// the locked transition preserves that outcome.
+    #[tokio::test]
+    async fn mutual_supersedes_form_no_cycle() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+
+        let mut a = full_mem("mutual-a", "content A", "0");
+        a["supersedes"] = "mutual-b".into();
+        let mut b = full_mem("mutual-b", "content B", "1");
+        b["supersedes"] = "mutual-a".into();
+        let (ra, rb) = tokio::join!(
+            app.clone().oneshot(post_json("/memories", &write, &a)),
+            app.clone().oneshot(post_json("/memories", &write, &b)),
+        );
+        let sa = ra.expect("a req").status();
+        let sb = rb.expect("b req").status();
+        let oks = [sa, sb].iter().filter(|s| **s == StatusCode::OK).count();
+        assert!(
+            oks <= 1,
+            "mutual supersedes cannot both succeed: {sa} / {sb}"
+        );
+
+        // Whatever landed: no cycle. If both rows exist, at most one is
+        // superseded; if neither landed (both rejected), fine too.
+        for id in ["mutual-a", "mutual-b"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/memories/{id}"))
+                        .header("authorization", write.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if res.status() == StatusCode::OK {
+                let row: Memory = serde_json::from_slice(
+                    &axum::body::to_bytes(res.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if let Some(by) = &row.superseded_by {
+                    assert_ne!(by, &row.id.0, "no self-reference: {row:?}");
+                }
+            }
+        }
+        // The direct cycle check: not (A.superseded_by == B AND
+        // B.superseded_by == A).
+        let app2 = app.clone();
+        let write2 = write.clone();
+        let get = |id: String| {
+            let app = app2.clone();
+            let write = write2.clone();
+            async move {
+                let res = app
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/memories/{id}"))
+                            .header("authorization", write)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                if res.status() == StatusCode::OK {
+                    serde_json::from_slice::<Memory>(
+                        &axum::body::to_bytes(res.into_body(), usize::MAX)
+                            .await
+                            .unwrap(),
+                    )
+                    .ok()
+                } else {
+                    None
+                }
+            }
+        };
+        let (row_a, row_b) = tokio::join!(get("mutual-a".into()), get("mutual-b".into()));
+        if let (Some(ra), Some(rb)) = (&row_a, &row_b) {
+            let cycle = ra.superseded_by.as_deref() == Some(rb.id.0.as_str())
+                && rb.superseded_by.as_deref() == Some(ra.id.0.as_str());
+            assert!(!cycle, "correction cycle: {ra:?} / {rb:?}");
+        }
+    }
+
+    /// R4-2: concurrent same-id doctrine ingests serialize — both succeed
+    /// with distinct stable revisions, live is one, actives truthful.
+    #[tokio::test]
+    async fn concurrent_doctrine_ingests_serialize() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "doc-r4", "seed body").await;
+
+        let req = |content: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/doctrine?namespace=ns_doctrine")
+                        .header("authorization", admin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": "doc-r4", "content": content,
+                                "project": "ijima", "topic": "arch"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (rb, rc) = tokio::join!(req("body B0"), req("body C0"));
+        assert_eq!(rb.status(), StatusCode::OK, "B serialized, not 404");
+        assert_eq!(rc.status(), StatusCode::OK, "C serialized, not 404");
+
+        let revs = [
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(rb.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()["revision"]
+                .as_u64()
+                .unwrap(),
+            serde_json::from_slice::<serde_json::Value>(
+                &axum::body::to_bytes(rc.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()["revision"]
+                .as_u64()
+                .unwrap(),
+        ];
+        revs.iter()
+            .for_each(|r| assert!(*r >= 2 && *r <= 3, "revs in {{2,3}}: {revs:?}"));
+        assert_ne!(revs[0], revs[1], "distinct stable revisions: {revs:?}");
+
+        let live = recall_doctrine(&app, &admin, "doc-r4").await;
+        assert!(
+            live.content == "body B0" || live.content == "body C0",
+            "live is the last serialized writer: {live:?}"
+        );
+        let versions = list_versions(&app, &admin, "doc-r4").await;
+        let actives = versions.iter().filter(|v| v.active).count();
+        assert!(actives <= 1, "at most one active: {versions:?}");
+    }
+    /// R5-1: concurrent cross-id dedup must not create a retirement
+    /// cycle — the canonical lookup and retirement run inside the locked
+    /// transition now.
+    #[tokio::test]
+    async fn concurrent_cross_id_dedup_forms_no_cycle() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "cx-a", "A").await;
+        post_doctrine(&app, &admin, uri, "cx-b", "B").await;
+
+        let req = |id: &'static str, content: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/doctrine?namespace=ns_doctrine")
+                        .header("authorization", admin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": id, "content": content,
+                                "project": "ijima", "topic": "arch"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (ra, rb) = tokio::join!(req("cx-a", "B"), req("cx-b", "A"));
+        assert_eq!(ra.status(), StatusCode::OK);
+        assert_eq!(rb.status(), StatusCode::OK);
+
+        let row_a = recall_doctrine(&app, &admin, "cx-a").await;
+        let row_b = recall_doctrine(&app, &admin, "cx-b").await;
+        let cycle = row_a.superseded_by.as_deref() == Some("cx-b")
+            && row_b.superseded_by.as_deref() == Some("cx-a");
+        assert!(!cycle, "retirement cycle: {row_a:?} / {row_b:?}");
+        // At most one of the two originals ended up retired.
+        let retired = [row_a.superseded_by.is_some(), row_b.superseded_by.is_some()]
+            .iter()
+            .filter(|r| **r)
+            .count();
+        assert!(
+            retired <= 1,
+            "at most one retirement: {row_a:?} / {row_b:?}"
+        );
+    }
+
+    /// R5-2: identical concurrent ingests share the revision identity —
+    /// and that identity stays rollback-addressable.
+    #[tokio::test]
+    async fn concurrent_identical_ingests_share_identity() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "ident", "seed").await;
+
+        let req = |content: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                let res = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/doctrine?namespace=ns_doctrine")
+                            .header("authorization", admin)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "id": "ident", "content": content,
+                                    "project": "ijima", "topic": "arch"
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(res.status(), StatusCode::OK);
+                serde_json::from_slice::<serde_json::Value>(
+                    &axum::body::to_bytes(res.into_body(), usize::MAX)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        let (r1, r2) = tokio::join!(req("body B"), req("body B"));
+        assert_eq!(
+            r1["revision"], r2["revision"],
+            "shared identity: {r1} / {r2}"
+        );
+        assert_eq!(r1["revision"].as_u64(), Some(2));
+
+        // Identity stays rollback-addressable after the next change.
+        post_doctrine(&app, &admin, uri, "ident", "body C").await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback")
+                    .header("authorization", admin.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "ident", "to": 2}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "rollback to shared identity");
+        let live = recall_doctrine(&app, &admin, "ident").await;
+        assert_eq!(live.content, "body B");
+        assert_eq!(live.revision, Some(2));
+    }
+
+    /// R5-3: a dedup-losing concurrent replacement must not destroy the
+    /// losing id's prior row — retirement, never deletion.
+    #[tokio::test]
+    async fn concurrent_identical_replacement_keeps_rows() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "rep-a", "old-a").await;
+        post_doctrine(&app, &admin, uri, "rep-b", "old-b").await;
+
+        let req = |id: &'static str| {
+            let app = app.clone();
+            let admin = admin.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/doctrine?namespace=ns_doctrine")
+                        .header("authorization", admin)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "id": id, "content": "shared new body",
+                                "project": "ijima", "topic": "arch"
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (ra, rb) = tokio::join!(req("rep-a"), req("rep-b"));
+        for r in [&ra, &rb] {
+            assert_eq!(
+                r.status(),
+                StatusCode::OK,
+                "no destructive 409: {}",
+                r.status()
+            );
+        }
+
+        // Both ids still recall (one canonical-holding or retired —
+        // neither deleted).
+        for id in ["rep-a", "rep-b"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/memories/{id}?namespace=ns_doctrine"))
+                        .header("authorization", admin.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "{id} must survive: {}",
+                res.status()
+            );
+        }
+        // Exactly one row holds the shared content live.
+        let a_row = recall_doctrine(&app, &admin, "rep-a").await;
+        let b_row = recall_doctrine(&app, &admin, "rep-b").await;
+        let live_count = [
+            a_row.content == "shared new body" && a_row.superseded_by.is_none(),
+            b_row.content == "shared new body" && b_row.superseded_by.is_none(),
+        ]
+        .iter()
+        .filter(|c| **c)
+        .count();
+        assert_eq!(live_count, 1, "one canonical: {a_row:?} / {b_row:?}");
+    }
+    /// Round-6 breaker finding: a RETIRED holder does not satisfy an
+    /// ingest of its own content — the row is restored live with its
+    /// stable identity.
+    #[tokio::test]
+    async fn retired_holder_is_restored_not_satisfied() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "rh-a", "A").await;
+        post_doctrine(&app, &admin, uri, "rh-b", "B").await;
+        // Retire b: its id re-ingests a's live content → canonical a.
+        let r = post_doctrine(&app, &admin, uri, "rh-b", "A").await;
+        assert_eq!(r["id"], "rh-a");
+        let retired = recall_doctrine(&app, &admin, "rh-b").await;
+        assert_eq!(retired.superseded_by.as_deref(), Some("rh-a"));
+
+        // Re-assert B under the retired holder: must RESTORE b live at
+        // its stable identity — not no-op on the retired row.
+        let r = post_doctrine(&app, &admin, uri, "rh-b", "B").await;
+        assert_eq!(r["id"], "rh-b", "restored under its own id: {r}");
+        assert_eq!(r["revision"].as_u64(), Some(1), "stable identity restored");
+        let restored = recall_doctrine(&app, &admin, "rh-b").await;
+        assert!(restored.superseded_by.is_none(), "live again: {restored:?}");
+        assert_eq!(restored.content, "B");
+        assert_eq!(restored.revision, Some(1));
+        // a keeps its own live row.
+        let a_row = recall_doctrine(&app, &admin, "rh-a").await;
+        assert!(a_row.superseded_by.is_none());
+        assert_eq!(a_row.content, "A");
     }
 }

@@ -93,6 +93,12 @@ mod tests {
             origin: ijima_core::InstanceId::local(),
             authority: ijima_core::AuthorityScope::local(),
             importance: 0.7,
+            evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
             created_at: "0".into(),
         }
     }

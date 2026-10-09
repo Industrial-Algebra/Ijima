@@ -30,6 +30,32 @@ expensive in the capability algebra (see
 [Capabilities](./capabilities.md)). Raising trust costs more than writing
 at a tier — by construction.
 
+## The evidence axis (0.4)
+
+Provenance answers **who wrote it**; evidence grade answers **how they
+know it**. They are independent axes — the grade crosses tier lines. An
+`Explicit` save by an operator can still be an interpretation, and a
+low-tier `AutoCapture` row can carry a directly observed fact.
+
+| Axis | Question | Values |
+|---|---|---|
+| Provenance tier (`source`) | Who (or what) wrote this? | `Explicit`, `AutoCapture`, `Mined`, `Doctrine` |
+| Evidence grade (`evidence`) | How does the author know it? | `Observed`, `Interpreted` |
+
+- **`Interpreted`** is the default. Inference, judgment, summary, and any
+  ungraded save land here — including every legacy row written before
+  0.4.0 and every save that never set a grade.
+- **`Observed`** means the authoring process directly witnessed the thing
+  itself — a session transcript event, command output, or a git artifact.
+  An observed claim **must cite** (`citations` >= 1): no citation, no
+  observed claim. The server rejects `Observed` without citations at save
+  time (`POST /memories` → `400`).
+
+Citations are typed pointers (`kind` ∈ `Commit`, `Report`, `Session`,
+`File`, `Url`; `locator` opaque) to the artifact that grounds the claim.
+A grade is a claim about knowledge, not a credential — raising the
+provenance tier does not by itself make an entry observed.
+
 ## Imports land unverified
 
 `ijima import` stamps every imported memory `origin = <source>` and drops

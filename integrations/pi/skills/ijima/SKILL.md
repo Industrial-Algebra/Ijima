@@ -71,6 +71,22 @@ probes alone.** That determination requires the admin census
 - Structured facts (`X depends_on Y`, temporal ranges) belong in the
   knowledge graph (`knowledge_add`), not free-text memories.
 
+## Evidence grades and corrections (0.4)
+
+- Every save carries a grade; the default is **Interpreted**. Pass
+  `evidence: "Observed"` **with citations** when the session directly
+  witnessed the fact — command output, a file read, an event that actually
+  happened. The server rejects `Observed` without at least one citation
+  (`400`). An observed claim means "I saw this"; an interpretation means
+  "I conclude this."
+- Corrections: pass `supersedes: <id>` on the correcting save. The target
+  drops out of wake-up, search, and browse **regardless of its importance**
+  — the correction displaces it. Do not re-save a correction as a fresh
+  memory and hope ranking sorts it out; rank never overrides a displacement.
+  Chain by superseding the successor, not the already-superseded original.
+- Doctrine (ns walls seeded from the corpus) is versioned server-side; ingest
+  responses carry stance warnings; rollback is admin-only.
+
 ## Token capabilities
 
 One grant carries all four capabilities the tools need:

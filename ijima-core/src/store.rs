@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
-    RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
+    AcceptedExtraction, DiaryEntry, Embedding, IjimaError, Memory, MemoryId, NamespaceId,
+    QueuedExtraction, RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
     harness::Harness,
     namespace::NamespaceMembership,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
@@ -48,6 +48,25 @@ pub struct NamespaceCount {
     pub namespace: String,
     /// Memories in that namespace.
     pub memories: usize,
+}
+
+/// An archived revision of a doctrine entry (direction B, v0.4.0).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DoctrineVersion {
+    /// The doctrine doc id (memory id in the doctrine namespace).
+    pub doc_id: String,
+    /// 1-based revision number, monotonic per doc.
+    pub version: u32,
+    /// The archived body.
+    pub content: String,
+    /// SHA-256 hex of the body, for cheap diffing.
+    pub content_hash: String,
+    /// Unix seconds when this version was archived.
+    pub archived_at_unix: i64,
+    /// Is this the currently-active version? Exactly one is, after any
+    /// ingest or rollback; transiently none during the write itself.
+    pub active: bool,
 }
 
 /// The storage contract.
@@ -96,6 +115,12 @@ pub trait Store: Send + Sync {
     /// essentials, L1b doctrine baseline).
     async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
 
+    /// Most-recent memories in a namespace (v0.4.0 stratified wake-up):
+    /// `created_at DESC`, superseded excluded, no importance gate — the
+    /// recency stratum guarantees fresh entries reach wake-up even when
+    /// the lexicographic top is saturated by high-importance rows.
+    async fn recent_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
     /// Lists memories in `ns`, optionally filtered to `project`/`topic`.
     /// Powers `GET /memories` (the `memory_recall` browse path — distinct
     /// from [`Self::list_memories`], which is the importance-ranked
@@ -128,6 +153,19 @@ pub trait Store: Send + Sync {
     /// view). Powers `GET /status`.
     async fn store_stats(&self) -> Result<StoreStats>;
 
+    /// Content-hash dedup restricted to LIVE rows (`superseded_by`
+    /// unset) — retired duplicates are never canonical (review round 2,
+    /// R2-4: re-ingesting a retired body must not resolve to its retired
+    /// holder and form a supersede cycle). Default delegates to
+    /// [`Store::check_duplicate`] for non-Surreal implementers.
+    async fn check_duplicate_live(
+        &self,
+        ns: &NamespaceId,
+        content: &str,
+    ) -> Result<Option<MemoryId>> {
+        self.check_duplicate(ns, content).await
+    }
+
     /// Checks whether a memory with identical content already exists in
     /// `ns` (content-hash dedup). Returns the existing [`MemoryId`] if so.
     async fn check_duplicate(&self, ns: &NamespaceId, content: &str) -> Result<Option<MemoryId>>;
@@ -143,6 +181,76 @@ pub trait Store: Send + Sync {
         embedding: &Embedding,
         limit: usize,
     ) -> Result<Vec<SearchHit>>;
+
+    /// The COMPLETE doctrine-ingest transition (review rounds 3-4):
+    /// under the doctrine lock — archives the outgoing body, allocates
+    /// the incoming revision (STABLE BODY IDENTITIES: a returning body
+    /// restores the number it first went live with; a new body takes
+    /// max-ever + 1), replaces the live row, and recomputes active
+    /// flags. One lock acquisition for the whole transition so
+    /// concurrent same-id ingests serialize with distinct revisions
+    /// (R4-2). Returns the stored id and the revision it carries.
+    async fn commit_doctrine_ingest(
+        &self,
+        ns: &NamespaceId,
+        memory: Memory,
+    ) -> Result<(MemoryId, u32)> {
+        let _ = self.delete_memory(ns, &memory.id).await;
+        let id = self.store_memory(ns, memory).await?;
+        Ok((id, 1))
+    }
+
+    /// List archived versions of a doctrine doc, oldest first.
+    async fn list_doctrine_versions(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+    ) -> Result<Vec<DoctrineVersion>> {
+        let _ = (ns, id);
+        Ok(Vec::new())
+    }
+
+    /// Recompute `active` flags for a doctrine doc's archived versions
+    /// against the CURRENT live body (truthful-by-construction: active =
+    /// archived body matches live). Called by ingest after storing.
+    /// Default no-op so non-Surreal implementers compile unchanged.
+    async fn mark_doctrine_active(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        live_content: &str,
+    ) -> Result<()> {
+        let _ = (ns, id, live_content);
+        Ok(())
+    }
+
+    /// Write an inverse supersede link directly (doctrine cross-id dedup
+    /// retires stale duplicates this way). Default no-op.
+    async fn mark_superseded(
+        &self,
+        ns: &NamespaceId,
+        target: &MemoryId,
+        by: &MemoryId,
+    ) -> Result<()> {
+        let _ = (ns, target, by);
+        Ok(())
+    }
+
+    /// Re-activate version `to` of a doctrine doc: rewrite the live
+    /// memory row's content from that version's body, set its `revision`
+    /// to that version's number, and mark that version active (all others
+    /// inactive). Returns the rewritten memory id.
+    async fn activate_doctrine_version(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        to: u32,
+    ) -> Result<MemoryId> {
+        let _ = (ns, id, to);
+        Err(IjimaError::unsupported(
+            "doctrine versioning requires the SurrealDB backend",
+        ))
+    }
 
     // ===== Palace organization (Phase 3.1 + 3.2) =====
 

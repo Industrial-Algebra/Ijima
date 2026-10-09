@@ -28,11 +28,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
-    IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
-    NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room,
-    SearchHit, Session, SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel,
-    TunnelTraversal, embeddings::Embedder, harness::Harness, memory::MemorySource,
+    AcceptedExtraction, AuthorityScope, DiaryEntry, DoctrineVersion, Embedding, Entity, EntityId,
+    EntityRecord, IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId,
+    NamespaceCount, NamespaceId, NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction,
+    RepoDirectory, Result, Room, SearchHit, Session, SessionId, SessionTurn, Store, StoreStats,
+    TokenRevocation, Triple, Tunnel, TunnelTraversal,
+    embeddings::Embedder,
+    harness::Harness,
+    memory::{Citation, EvidenceGrade, MemorySource},
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -55,6 +58,8 @@ const ENTITIES_TABLE: &str = "entities";
 const TRIPLES_TABLE: &str = "triples";
 /// Repo directory (global Context Mapper registry).
 const REPO_TABLE: &str = "repo_directory";
+/// Archived doctrine revisions (direction B, v0.4.0).
+const DOCTRINE_VERSIONS_TABLE: &str = "doctrine_versions";
 
 /// A SurrealDB-backed [`Store`].
 pub struct SurrealStore {
@@ -63,6 +68,19 @@ pub struct SurrealStore {
     /// [`Store::search_memories`] is available. When absent, search
     /// returns [`IjimaError::Store`].
     embedder: Option<Arc<dyn Embedder>>,
+    /// Serializes doctrine mutations (rollback/active-recompute) within
+    /// this process (review round 2, R2-3): concurrent rollbacks must not
+    /// interleave live-rewrite with active-flag recomputation. The daemon
+    /// is single-process; cross-process serialization is federation's
+    /// problem, not 0.4's.
+    doctrine_lock: tokio::sync::Mutex<()>,
+    /// Serializes the complete supersede transition (insert + target
+    /// validation + claim) within this process (review round 4, R4-1):
+    /// mutually-referencing concurrent saves must see the same graph a
+    /// serial execution would — where both targets are absent and both
+    /// saves are rejected — instead of exposing each uncommitted
+    /// successor as the other's claimable target (correction cycle).
+    supersede_lock: tokio::sync::Mutex<()>,
 }
 
 impl SurrealStore {
@@ -136,7 +154,101 @@ impl SurrealStore {
             .map_err(|e| IjimaError::Store {
                 detail: format!("surrealdb define indexes: {e}"),
             })?;
-        Ok(Self { db, embedder })
+        Ok(Self {
+            doctrine_lock: tokio::sync::Mutex::new(()),
+            supersede_lock: tokio::sync::Mutex::new(()),
+            db,
+            embedder,
+        })
+    }
+
+    /// Archive a doc's OUTGOING body under the identity it went live
+    /// with (its live revision — or max+1 when it never carried one).
+    /// Returns Some(version) for the archived/matched outgoing body, None
+    /// when there is no live row. LOCK-FREE: callers hold the doctrine
+    /// lock. Upsert semantics: a racing writer cannot collide on the
+    /// create; the hash check is an optimization, not the guard.
+    async fn archive_outgoing(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        live: &Option<Memory>,
+    ) -> Result<Option<u32>> {
+        use sha2::{Digest, Sha256};
+        let Some(live) = live else { return Ok(None) };
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT version, content_hash FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct VersionRow {
+            version: u32,
+            content_hash: String,
+        }
+        let rows = take_vec::<VersionRow>(&mut result)?;
+        let out_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        if let Some(prior) = rows.iter().find(|r| r.content_hash == out_hash) {
+            return Ok(Some(prior.version));
+        }
+        let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
+        let version = live.revision.unwrap_or(max_version + 1);
+        let archived_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        let record = DoctrineVersion {
+            doc_id: id.0.clone(),
+            version,
+            content: live.content.clone(),
+            content_hash: out_hash,
+            archived_at_unix,
+            active: false,
+        };
+        let wire = DoctrineVersionRecord::from_version(&record, ns);
+        let _: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
+            .db
+            .upsert((
+                DOCTRINE_VERSIONS_TABLE,
+                doctrine_version_key(ns, id, version),
+            ))
+            .content(surrealdb::types::SerdeWrapper(wire))
+            .await
+            .map_err(store_err)?;
+        Ok(Some(version))
+    }
+
+    /// Active-flag write WITHOUT taking the doctrine lock — callers hold
+    /// it. (tokio's Mutex is not reentrant; the round-2 first cut
+    /// deadlocked here.)
+    async fn set_active_flags(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        live_hash: &str,
+    ) -> Result<()> {
+        // `active` is truthful by construction: exactly the archived
+        // version whose body matches the live row — none, when the live
+        // body has never been superseded by a later ingest (review
+        // round 1, P1-3).
+        let _ = self
+            .db
+            .query(format!(
+                "UPDATE {DOCTRINE_VERSIONS_TABLE}
+                 SET active = (content_hash == $hash)
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("hash", live_hash.to_string()))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// The `DEFINE INDEX` statements run at store open. Covers the columns
@@ -160,6 +272,7 @@ impl SurrealStore {
         DEFINE TABLE IF NOT EXISTS token_revocations SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS namespace_members SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS repo_directory  SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS doctrine_versions SCHEMALESS;
         DEFINE INDEX IF NOT EXISTS nmem_ns      ON TABLE namespace_members FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS nmem_ns_princ ON TABLE namespace_members FIELDS namespace, principal;
         DEFINE INDEX IF NOT EXISTS nmem_princ    ON TABLE namespace_members FIELDS principal;
@@ -173,6 +286,7 @@ impl SurrealStore {
         DEFINE INDEX IF NOT EXISTS trip_ns       ON TABLE triples         FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS trip_subj     ON TABLE triples         FIELDS subject;
         DEFINE INDEX IF NOT EXISTS trip_obj      ON TABLE triples         FIELDS object;
+        DEFINE INDEX IF NOT EXISTS dv_ns_doc     ON TABLE doctrine_versions FIELDS namespace, doc_id;
     "#;
 
     /// Fetches all `(project, topic)` cells in `ns` with their memory counts.
@@ -215,9 +329,11 @@ impl SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
-                        origin, authority, importance, created_at
+                        origin, authority, importance, revision, created_at,
+                        evidence, citations, supersedes, superseded_by, superseded_at_unix
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND project = $proj AND topic = $topic
+                   AND superseded_by = NONE
                  ORDER BY importance DESC, created_at DESC LIMIT $lim"
             ))
             .bind(("ns", ns.as_str().to_string()))
@@ -283,6 +399,14 @@ where
     Ok(wrapped.into_iter().map(|w| w.0).collect())
 }
 
+/// Maps `MemoryRecord` query results to domain [`Memory`] rows — the
+/// single row-mapping path shared by [`SurrealStore::list_memories`] and
+/// [`SurrealStore::recent_memories`].
+fn take_memories(result: &mut surrealdb::IndexedResults) -> Result<Vec<Memory>> {
+    let records = take_vec::<MemoryRecord>(result)?;
+    Ok(records.into_iter().map(|r| r.into_memory()).collect())
+}
+
 /// A `SELECT namespace` projection row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NsOnly {
@@ -312,6 +436,31 @@ struct MemoryRecord {
     namespace: String,
     #[serde(default = "default_record_importance")]
     importance: f32,
+    /// Evidence grade (direction D). `#[serde(default)]` so legacy rows
+    /// (persisted before the field existed) deserialize as `Interpreted`.
+    #[serde(default)]
+    evidence: EvidenceGrade,
+    /// Citations grounding an `Observed` grade. `#[serde(default)]` so
+    /// legacy rows deserialize with no citations.
+    #[serde(default)]
+    citations: Vec<Citation>,
+    /// Correction link (v0.4.0): the id this memory replaces. Written at
+    /// save time from the incoming [`Memory`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes: Option<String>,
+    /// Inverse correction link: the id of the memory that superseded this
+    /// one. Written by the server's linking UPDATE; exclusion queries
+    /// filter on it. `None` (absent) unless superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    /// When the supersede link landed (unix seconds), for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_at_unix: Option<i64>,
+    /// Doctrine revision number (direction B, v0.4.0). `None` for every
+    /// non-doctrine memory. `skip_serializing_if` keeps the SurrealDB
+    /// field as `NONE` rather than `NULL` for non-doctrine rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<u32>,
     #[serde(default)]
     created_at: String,
     /// Provenance: the authoring instance (ADR provenance-tier). Defaults
@@ -358,6 +507,12 @@ impl MemoryRecord {
             session_id: memory.session_id.clone(),
             namespace: ns.as_str().to_string(),
             importance: memory.importance,
+            evidence: memory.evidence,
+            citations: memory.citations.clone(),
+            supersedes: memory.supersedes.clone(),
+            superseded_by: memory.superseded_by.clone(),
+            superseded_at_unix: memory.superseded_at_unix,
+            revision: memory.revision,
             created_at: memory.created_at.clone(),
             origin: memory.origin.clone(),
             authority: memory.authority.clone(),
@@ -378,7 +533,53 @@ impl MemoryRecord {
             origin: self.origin,
             authority: self.authority,
             importance: self.importance,
+            evidence: self.evidence,
+            citations: self.citations,
+            supersedes: self.supersedes,
+            superseded_by: self.superseded_by,
+            superseded_at_unix: self.superseded_at_unix,
+            revision: self.revision,
             created_at: self.created_at,
+        }
+    }
+}
+
+/// The persisted form of an archived doctrine version. Mirrors
+/// [`DoctrineVersion`] plus the owning namespace (every other wire
+/// record carries it; the record key embeds the namespace but queries
+/// filter on the field).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DoctrineVersionRecord {
+    doc_id: String,
+    version: u32,
+    content: String,
+    content_hash: String,
+    archived_at_unix: i64,
+    active: bool,
+    namespace: String,
+}
+
+impl DoctrineVersionRecord {
+    fn from_version(version: &DoctrineVersion, ns: &NamespaceId) -> Self {
+        Self {
+            doc_id: version.doc_id.clone(),
+            version: version.version,
+            content: version.content.clone(),
+            content_hash: version.content_hash.clone(),
+            archived_at_unix: version.archived_at_unix,
+            active: version.active,
+            namespace: ns.as_str().to_string(),
+        }
+    }
+
+    fn into_version(self) -> DoctrineVersion {
+        DoctrineVersion {
+            doc_id: self.doc_id,
+            version: self.version,
+            content: self.content,
+            content_hash: self.content_hash,
+            archived_at_unix: self.archived_at_unix,
+            active: self.active,
         }
     }
 }
@@ -523,6 +724,12 @@ impl QueueRecord {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: self.importance,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
             created_at: String::new(),
         };
         QueuedExtraction {
@@ -546,6 +753,12 @@ impl QueueRecord {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: self.importance,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
             created_at: String::new(),
         }
     }
@@ -583,12 +796,23 @@ fn memory_key(ns: &NamespaceId, id: &MemoryId) -> String {
     format!("{}:{}", ns.as_str(), id.0)
 }
 
+/// Surreal record key for an archived doctrine version:
+/// `<namespace>_<doc-id>_v<version>`. The namespace is embedded because
+/// record ids are global per table — the same doctrine id may live in
+/// more than one wall.
+fn doctrine_version_key(ns: &NamespaceId, id: &MemoryId, version: u32) -> String {
+    format!("{}_{}_v{}", ns.as_str(), id.0, version)
+}
+
 #[async_trait]
 impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
         // Content-hash dedup (Phase 2.2): reject exact duplicates within
         // the namespace, returning the existing id so callers can recover.
-        if let Some(existing) = self.check_duplicate(ns, &memory.content).await? {
+        // LIVE rows only (review round 2, R2-4): a retired row's content
+        // must not block re-saving that content elsewhere — retirement
+        // moved its canonical on.
+        if let Some(existing) = self.check_duplicate_live(ns, &memory.content).await? {
             return Err(IjimaError::duplicate(format!(
                 "content already stored as {}",
                 existing.0
@@ -606,12 +830,104 @@ impl Store for SurrealStore {
             None => (None, None),
         };
         let record = MemoryRecord::from_memory(&memory, ns, embedding, embed_model);
+        // Supersede linking (v0.4.0): a save declaring `supersedes`
+        // writes the inverse link onto its target in the same logical
+        // The successor row is inserted FIRST; the inverse link is
+        // written onto the target afterwards, and any link failure
+        // compensates by deleting the just-inserted row (review round 1,
+        // P1-1: link-before-insert corrupted the graph when the insert
+        // failed — e.g. a reused record id — leaving both rows excluded).
+        // Rejections: absent target (NotFound-equivalent), cross-namespace
+        // target (NotFound — recall is ns-scoped), already-superseded
+        // target (Conflict — chains go through the successor),
+        // self-supersede (Conflict).
+        //
+        // R4-1: the COMPLETE transition runs under the supersede lock —
+        // a mutually-referencing pair of concurrent saves then sees the
+        // serial outcome (both targets absent, both rejected) instead of
+        // claiming each other into a correction cycle. Non-supersede
+        // saves take no lock.
+        let _supersede_guard = if memory.supersedes.is_some() {
+            Some(self.supersede_lock.lock().await)
+        } else {
+            None
+        };
         let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
             .db
             .create((MEMORIES_TABLE, memory_key(ns, &memory.id)))
             .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
+        if let Some(target_id) = &memory.supersedes {
+            let link: Result<(), IjimaError> = async {
+                if target_id == &memory.id.0 {
+                    return Err(IjimaError::duplicate("memory cannot supersede itself"));
+                }
+                // Atomic claim (review round 2, R2-2): the inverse link is
+                // taken with a conditional UPDATE — only a target that is
+                // still unclaimed (`superseded_by = NONE`) can be linked,
+                // so concurrent successors cannot both win. The claim
+                // fails the same way whether the target vanished or was
+                // claimed between insert and link.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or_default();
+                let mut claimed = self
+                    .db
+                    .query(
+                        "UPDATE type::table($table)
+                         SET superseded_by = $sid, superseded_at_unix = $now
+                         WHERE namespace = $ns AND memory_id = $tid AND superseded_by = NONE
+                         RETURN AFTER",
+                    )
+                    .bind(("table", MEMORIES_TABLE))
+                    .bind(("sid", memory.id.0.clone()))
+                    .bind(("now", now))
+                    .bind(("ns", ns.as_str().to_string()))
+                    .bind(("tid", target_id.clone()))
+                    .await
+                    .map_err(store_err)?;
+                #[derive(serde::Serialize, Deserialize)]
+                struct ClaimedRow {
+                    superseded_by: Option<String>,
+                }
+                let rows = take_vec::<ClaimedRow>(&mut claimed)?;
+                let Some(row) = rows.into_iter().next() else {
+                    // Nothing claimed: the target is absent in this
+                    // namespace, or already superseded. Distinguish for
+                    // the error message.
+                    let exists: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+                        .db
+                        .select((MEMORIES_TABLE, memory_key(ns, &MemoryId(target_id.clone()))))
+                        .await
+                        .map_err(store_err)?;
+                    let Some(existing) = exists else {
+                        return Err(IjimaError::not_found(format!(
+                            "supersede target {} not found in this namespace",
+                            target_id
+                        )));
+                    };
+                    return Err(IjimaError::duplicate(format!(
+                        "supersede target {} is already superseded (by {}) — supersede the successor instead",
+                        target_id,
+                        existing.0.superseded_by.clone().unwrap_or_default()
+                    )));
+                };
+                let _ = row;
+                Ok(())
+            }
+            .await;
+            if let Err(e) = link {
+                // Compensation: the successor was stored but its target
+                // link failed — remove it so the graph stays consistent.
+                let _: Result<Option<surrealdb::types::SerdeWrapper<MemoryRecord>>, _> = self
+                    .db
+                    .delete((MEMORIES_TABLE, memory_key(ns, &memory.id)))
+                    .await;
+                return Err(e);
+            }
+        }
         Ok(memory.id)
     }
 
@@ -623,6 +939,32 @@ impl Store for SurrealStore {
             .query(format!(
                 "SELECT memory_id FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND content_hash = $hash LIMIT 1"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("hash", hash))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct IdRow {
+            memory_id: String,
+        }
+        let rows = take_vec::<IdRow>(&mut result)?;
+        Ok(rows.into_iter().next().map(|r| MemoryId(r.memory_id)))
+    }
+
+    async fn check_duplicate_live(
+        &self,
+        ns: &NamespaceId,
+        content: &str,
+    ) -> Result<Option<MemoryId>> {
+        use sha2::{Digest, Sha256};
+        let hash = hex(&Sha256::digest(content.as_bytes()));
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT memory_id FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns AND content_hash = $hash AND superseded_by = NONE
+                 LIMIT 1"
             ))
             .bind(("ns", ns.as_str().to_string()))
             .bind(("hash", hash))
@@ -682,9 +1024,11 @@ impl Store for SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
-                        origin, authority, importance, created_at
+                        origin, authority, importance, revision, created_at,
+                        evidence, citations, supersedes, superseded_by, superseded_at_unix
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns
+                   AND superseded_by = NONE
                  ORDER BY importance DESC, created_at DESC
                  LIMIT $lim"
             ))
@@ -692,8 +1036,23 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let records = take_vec::<MemoryRecord>(&mut result)?;
-        Ok(records.into_iter().map(|r| r.into_memory()).collect())
+        take_memories(&mut result)
+    }
+
+    async fn recent_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns AND superseded_by = NONE
+                 ORDER BY created_at DESC
+                 LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        take_memories(&mut result)
     }
 
     async fn export_memories(
@@ -890,10 +1249,12 @@ impl Store for SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
-                        origin, authority, importance, created_at,
+                        origin, authority, importance, revision, created_at,
+                        evidence, citations, supersedes, superseded_by, superseded_at_unix,
                         vector::similarity::cosine(embedding, $query) AS score
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND embedding IS NOT NONE
+                   AND superseded_by = NONE
                  ORDER BY score DESC
                  LIMIT $lim"
             ))
@@ -918,6 +1279,225 @@ impl Store for SurrealStore {
                 similarity: r.score as f32,
             })
             .collect())
+    }
+
+    async fn list_doctrine_versions(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+    ) -> Result<Vec<DoctrineVersion>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc
+                 ORDER BY version ASC"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        let rows = take_vec::<DoctrineVersionRecord>(&mut result)?;
+        Ok(rows.into_iter().map(|r| r.into_version()).collect())
+    }
+
+    async fn mark_doctrine_active(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        _live_content: &str,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let _guard = self.doctrine_lock.lock().await;
+        // Self-consistent (review round 2, R2-3): recompute from the row
+        // that is ACTUALLY live now, under the doctrine lock — a racing
+        // ingest/rollback may have rewritten it since the caller formed
+        // its parameter.
+        let live = self
+            .recall_memory(ns, id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        let live_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        self.set_active_flags(ns, id, &live_hash).await
+    }
+
+    async fn mark_superseded(
+        &self,
+        ns: &NamespaceId,
+        target: &MemoryId,
+        by: &MemoryId,
+    ) -> Result<()> {
+        // Direct inverse-link write used by the doctrine cross-id dedup
+        // path (review round 1, P1-4) to retire a stale duplicate row.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        let _ = self
+            .db
+            .query(
+                "UPDATE type::table($table) SET superseded_by = $by, superseded_at_unix = $now
+                 WHERE namespace = $ns AND memory_id = $id",
+            )
+            .bind(("table", MEMORIES_TABLE))
+            .bind(("by", by.0.clone()))
+            .bind(("now", now))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("id", target.0.clone()))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn commit_doctrine_ingest(
+        &self,
+        ns: &NamespaceId,
+        mut memory: Memory,
+    ) -> Result<(MemoryId, u32)> {
+        use sha2::{Digest, Sha256};
+        let _guard = self.doctrine_lock.lock().await;
+
+        // --- authoritative dedup (review round 5: R5-1, R5-3) ---
+        // Unchanged content at this id, on a LIVE row: no-op, keep the
+        // revision. A RETIRED holder does not satisfy the ingest (round
+        // 6 breaker finding): it falls through to the normal path, which
+        // archives its body, restores its stable identity, and re-stores
+        // the row live — un-retiring it.
+        let live = self.recall_memory(ns, &memory.id).await?;
+        if let Some(live) = &live
+            && live.content == memory.content
+            && live.superseded_by.is_none()
+        {
+            return Ok((memory.id.clone(), live.revision.unwrap_or(1)));
+        }
+        // Content already LIVE under another id: that row is canonical —
+        // retire this id's stale row (if any, and different) via the
+        // supersede link and report the canonical identity. No deletion
+        // happens on this path, so a raced reject cannot destroy the
+        // prior document (R5-3).
+        if let Some(canonical_id) = self.check_duplicate_live(ns, &memory.content).await?
+            && canonical_id != memory.id
+        {
+            let canonical = self
+                .recall_memory(ns, &canonical_id)
+                .await?
+                .ok_or_else(|| {
+                    IjimaError::not_found(format!("doctrine doc {} not found", canonical_id.0))
+                })?;
+            if let Some(mine) = &live
+                && mine.superseded_by.is_none()
+                && mine.content != memory.content
+            {
+                self.mark_superseded(ns, &memory.id, &canonical_id).await?;
+            }
+            return Ok((canonical_id, canonical.revision.unwrap_or(1)));
+        }
+
+        // --- allocation half ---
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT version, content_hash FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", memory.id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct VersionRow {
+            version: u32,
+            content_hash: String,
+        }
+        let rows = take_vec::<VersionRow>(&mut result)?;
+        let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
+
+        // Archive the outgoing body; its identity counts toward the
+        // returning-body check below (R5-2: identical concurrent ingests
+        // must reuse the identity, not allocate past a stale snapshot).
+        let out_version = self.archive_outgoing(ns, &memory.id, &live).await?;
+        let out_hash = live
+            .as_ref()
+            .map(|l| hex(&Sha256::digest(l.content.as_bytes())));
+        let new_hash = hex(&Sha256::digest(memory.content.as_bytes()));
+
+        // Stable identity: a returning body restores its original number;
+        // a new body takes max-ever + 1.
+        let revision = if out_hash.as_deref() == Some(new_hash.as_str()) {
+            // The outgoing body IS the incoming body re-asserted at this
+            // id (identity-preserving replace): keep its identity.
+            out_version.unwrap_or(memory.revision.unwrap_or(max_version + 1))
+        } else if let Some(prior) = rows.iter().find(|r| r.content_hash == new_hash) {
+            prior.version
+        } else {
+            let live_rev = live.as_ref().and_then(|m| m.revision).unwrap_or(0);
+            max_version.max(live_rev).max(
+                // an archived outgoing body this call just created can
+                // raise the ceiling for genuinely-new content
+                out_version.unwrap_or(0),
+            ) + 1
+        };
+        memory.revision = Some(revision);
+
+        // --- commit half ---
+        let _ = self.delete_memory(ns, &memory.id).await;
+        let id = self.store_memory(ns, memory).await?;
+        let live = self
+            .recall_memory(ns, &id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        let live_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        self.set_active_flags(ns, &id, &live_hash).await?;
+        Ok((id, revision))
+    }
+    async fn activate_doctrine_version(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        to: u32,
+    ) -> Result<MemoryId> {
+        let _guard = self.doctrine_lock.lock().await;
+        let version: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
+            .db
+            .select((DOCTRINE_VERSIONS_TABLE, doctrine_version_key(ns, id, to)))
+            .await
+            .map_err(store_err)?;
+        let version = version.map(|w| w.0).ok_or_else(|| {
+            IjimaError::not_found(format!("doctrine version {} v{} not found", id.0, to))
+        })?;
+        let mut live = self
+            .recall_memory(ns, id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        // Preserve the OUTGOING body before the rewrite (review round 1,
+        // P1-3 + round 3): rolling back from v2 to v1 archives v2, so
+        // re-advancing never loses it. Direct call to the unlocked
+        // helper — the doctrine lock is already held here (calling the
+        // locked prepare would self-deadlock: tokio Mutex is not
+        // reentrant).
+        if live.content != version.content {
+            self.archive_outgoing(ns, id, &Some(live.clone())).await?;
+        }
+        live.content = version.content.clone();
+        live.revision = Some(version.version);
+        let (embedding, embed_model) = match &self.embedder {
+            Some(e) => (
+                embed_for(e.as_ref(), &live.content)?,
+                Some(e.model_id().to_string()),
+            ),
+            None => (None, None),
+        };
+        let record = MemoryRecord::from_memory(&live, ns, embedding, embed_model);
+        let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+            .db
+            .upsert((MEMORIES_TABLE, memory_key(ns, id)))
+            .content(surrealdb::types::SerdeWrapper(record))
+            .await
+            .map_err(store_err)?;
+        use sha2::{Digest, Sha256};
+        let live_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        self.set_active_flags(ns, id, &live_hash).await?;
+        Ok(id.clone())
     }
 
     async fn ingest_turn(&self, ns: &NamespaceId, turn: SessionTurn) -> Result<()> {
@@ -1616,6 +2196,12 @@ mod tests {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
             created_at: "0".into(),
         }
     }
@@ -1720,6 +2306,12 @@ mod tests {
             origin: ijima_core::InstanceId::local(),
             authority: ijima_core::AuthorityScope::local(),
             importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
             created_at,
         };
         // Old chatter in two namespaces (both must go) …
@@ -2420,6 +3012,12 @@ mod tests {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
             created_at: "0".into(),
         }
     }
@@ -2627,6 +3225,210 @@ mod tests {
         assert!(contents.contains("export this memory"));
         // Clean up.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== Supersede mechanism (v0.4.0 U2) =====
+
+    #[tokio::test]
+    async fn supersede_links_both_directions() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        store
+            .store_memory(&ns, sample_memory("mem_a", "the original claim"))
+            .await
+            .expect("store A");
+        let mut b = sample_memory("mem_b", "the corrected claim");
+        b.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, b).await.expect("store B");
+
+        let a = store
+            .recall_memory(&ns, &MemoryId("mem_a".into()))
+            .await
+            .expect("recall A")
+            .expect("A present");
+        assert_eq!(a.superseded_by.as_deref(), Some("mem_b"));
+        assert!(
+            a.superseded_at_unix.is_some(),
+            "the linking UPDATE stamps an audit timestamp"
+        );
+        let b = store
+            .recall_memory(&ns, &MemoryId("mem_b".into()))
+            .await
+            .expect("recall B")
+            .expect("B present");
+        assert_eq!(b.supersedes.as_deref(), Some("mem_a"));
+        assert!(b.superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn superseding_absent_target_rejects() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        let mut b = sample_memory("mem_b", "correction with no target");
+        b.supersedes = Some("mem_nonexistent".into());
+        let err = store.store_memory(&ns, b).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::NotFound { .. }),
+            "not-found class: {err:?}"
+        );
+        // The rejected save stored nothing.
+        assert!(
+            store
+                .recall_memory(&ns, &MemoryId("mem_b".into()))
+                .await
+                .expect("recall")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_already_superseded_rejects() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        store
+            .store_memory(&ns, sample_memory("mem_a", "original claim"))
+            .await
+            .unwrap();
+        let mut b = sample_memory("mem_b", "first correction");
+        b.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, b).await.expect("A <- B");
+
+        // C superseding A: A is already superseded → conflict.
+        let mut c = sample_memory("mem_c", "second correction");
+        c.supersedes = Some("mem_a".into());
+        let err = store.store_memory(&ns, c).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::Duplicate { .. }),
+            "conflict class: {err:?}"
+        );
+
+        // C superseding B (the successor) succeeds — chains forward.
+        let mut c = sample_memory("mem_c", "second correction");
+        c.supersedes = Some("mem_b".into());
+        store.store_memory(&ns, c).await.expect("B <- C succeeds");
+        let b_rec = store
+            .recall_memory(&ns, &MemoryId("mem_b".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b_rec.superseded_by.as_deref(), Some("mem_c"));
+    }
+
+    #[tokio::test]
+    async fn self_supersede_rejects() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        let mut m = sample_memory("mem_self", "self reference");
+        m.supersedes = Some("mem_self".into());
+        let err = store.store_memory(&ns, m).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::Duplicate { .. }),
+            "conflict class: {err:?}"
+        );
+        assert!(
+            store
+                .recall_memory(&ns, &MemoryId("mem_self".into()))
+                .await
+                .expect("recall")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn wakeup_excludes_superseded() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        // A: high importance but superseded.
+        let mut a = sample_memory("mem_a", "old important claim");
+        a.importance = 0.9;
+        store.store_memory(&ns, a).await.unwrap();
+        // Successor supersedes A.
+        let mut s = sample_memory("mem_s", "replacement claim");
+        s.importance = 0.1;
+        s.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, s).await.unwrap();
+        // B: fresh, lower importance, never superseded.
+        let mut b = sample_memory("mem_b", "fresh current claim");
+        b.importance = 0.5;
+        store.store_memory(&ns, b).await.unwrap();
+
+        let ids: Vec<String> = store
+            .list_memories(&ns, 10)
+            .await
+            .expect("wake-up list")
+            .into_iter()
+            .map(|m| m.id.0)
+            .collect();
+        assert!(
+            !ids.contains(&"mem_a".to_string()),
+            "superseded A must be excluded despite its 0.9 importance: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"mem_b".to_string()),
+            "fresh B must be present: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_and_browse_exclude_superseded() {
+        let store = SurrealStore::open_embedded_with(Arc::new(TestEmbedder))
+            .await
+            .expect("open with embedder");
+        let ns = NamespaceId::new("ns_supersede");
+        // A is the nearest match for the query but is superseded.
+        let mut a = sample_memory("mem_a", "rust memory store");
+        a.importance = 0.9;
+        store.store_memory(&ns, a).await.unwrap();
+        let mut s = sample_memory("mem_s", "replacement about surreal db");
+        s.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, s).await.unwrap();
+        store
+            .store_memory(&ns, sample_memory("mem_b", "fresh unrelated text"))
+            .await
+            .unwrap();
+
+        // Search matching A's content omits A.
+        let hits = store
+            .search_memories(&ns, &Embedding(vec![3.0, 0.0, 1.0, 1.0]), 10)
+            .await
+            .expect("search");
+        assert!(
+            !hits.iter().any(|h| h.memory.id.0 == "mem_a"),
+            "search must omit superseded A"
+        );
+
+        // Browse omits A too.
+        let listed = store.list_memories(&ns, 10).await.expect("browse");
+        assert!(
+            !listed.iter().any(|m| m.id.0 == "mem_a"),
+            "browse must omit superseded A"
+        );
+
+        // Recall by id still returns the fossil with its links.
+        let a = store
+            .recall_memory(&ns, &MemoryId("mem_a".into()))
+            .await
+            .expect("recall")
+            .expect("fossil recallable");
+        assert_eq!(a.superseded_by.as_deref(), Some("mem_s"));
+    }
+
+    #[tokio::test]
+    async fn supersede_is_namespace_scoped() {
+        let store = fresh().await;
+        let x = NamespaceId::new("ns_supersede_x");
+        let y = NamespaceId::new("ns_supersede_y");
+        store
+            .store_memory(&x, sample_memory("mem_a", "lives only in X"))
+            .await
+            .unwrap();
+        let mut b = sample_memory("mem_b", "tries to supersede across ns");
+        b.supersedes = Some("mem_a".into());
+        let err = store.store_memory(&y, b).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::NotFound { .. }),
+            "not-found class: {err:?}"
+        );
     }
 }
 
