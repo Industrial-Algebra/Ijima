@@ -221,6 +221,7 @@ impl SurrealStore {
                         origin, authority, importance, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND project = $proj AND topic = $topic
+                   AND superseded_by = NONE
                  ORDER BY importance DESC, created_at DESC LIMIT $lim"
             ))
             .bind(("ns", ns.as_str().to_string()))
@@ -323,6 +324,18 @@ struct MemoryRecord {
     /// legacy rows deserialize with no citations.
     #[serde(default)]
     citations: Vec<Citation>,
+    /// Correction link (v0.4.0): the id this memory replaces. Written at
+    /// save time from the incoming [`Memory`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes: Option<String>,
+    /// Inverse correction link: the id of the memory that superseded this
+    /// one. Written by the server's linking UPDATE; exclusion queries
+    /// filter on it. `None` (absent) unless superseded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_by: Option<String>,
+    /// When the supersede link landed (unix seconds), for audit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    superseded_at_unix: Option<i64>,
     #[serde(default)]
     created_at: String,
     /// Provenance: the authoring instance (ADR provenance-tier). Defaults
@@ -371,6 +384,9 @@ impl MemoryRecord {
             importance: memory.importance,
             evidence: memory.evidence,
             citations: memory.citations.clone(),
+            supersedes: memory.supersedes.clone(),
+            superseded_by: memory.superseded_by.clone(),
+            superseded_at_unix: memory.superseded_at_unix,
             created_at: memory.created_at.clone(),
             origin: memory.origin.clone(),
             authority: memory.authority.clone(),
@@ -393,6 +409,9 @@ impl MemoryRecord {
             importance: self.importance,
             evidence: self.evidence,
             citations: self.citations,
+            supersedes: self.supersedes,
+            superseded_by: self.superseded_by,
+            superseded_at_unix: self.superseded_at_unix,
             created_at: self.created_at,
         }
     }
@@ -540,6 +559,9 @@ impl QueueRecord {
             importance: self.importance,
             evidence: EvidenceGrade::Interpreted,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: String::new(),
         };
         QueuedExtraction {
@@ -565,6 +587,9 @@ impl QueueRecord {
             importance: self.importance,
             evidence: EvidenceGrade::Interpreted,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: String::new(),
         }
     }
@@ -625,6 +650,48 @@ impl Store for SurrealStore {
             None => (None, None),
         };
         let record = MemoryRecord::from_memory(&memory, ns, embedding, embed_model);
+        // Supersede linking (v0.4.0): a save declaring `supersedes`
+        // writes the inverse link onto its target in the same logical
+        // operation. Rejections: absent target (NotFound-equivalent),
+        // cross-namespace target (NotFound — recall is ns-scoped),
+        // already-superseded target (Conflict — chains go through the
+        // successor), self-supersede (Conflict).
+        if let Some(target_id) = &memory.supersedes {
+            if target_id == &memory.id.0 {
+                return Err(IjimaError::duplicate("memory cannot supersede itself"));
+            }
+            let target_key = (MEMORIES_TABLE, memory_key(ns, &MemoryId(target_id.clone())));
+            let existing: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+                .db
+                .select(target_key.clone())
+                .await
+                .map_err(store_err)?;
+            let Some(existing) = existing else {
+                return Err(IjimaError::not_found(format!(
+                    "supersede target {} not found in this namespace",
+                    target_id
+                )));
+            };
+            let mut target = existing.0;
+            if let Some(by) = &target.superseded_by {
+                return Err(IjimaError::duplicate(format!(
+                    "supersede target {} is already superseded (by {}) — supersede the successor instead",
+                    target_id, by
+                )));
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or_default();
+            target.superseded_by = Some(memory.id.0.clone());
+            target.superseded_at_unix = Some(now);
+            let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+                .db
+                .update(target_key)
+                .content(surrealdb::types::SerdeWrapper(target))
+                .await
+                .map_err(store_err)?;
+        }
         let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
             .db
             .create((MEMORIES_TABLE, memory_key(ns, &memory.id)))
@@ -704,6 +771,7 @@ impl Store for SurrealStore {
                         origin, authority, importance, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns
+                   AND superseded_by = NONE
                  ORDER BY importance DESC, created_at DESC
                  LIMIT $lim"
             ))
@@ -913,6 +981,7 @@ impl Store for SurrealStore {
                         vector::similarity::cosine(embedding, $query) AS score
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND embedding IS NOT NONE
+                   AND superseded_by = NONE
                  ORDER BY score DESC
                  LIMIT $lim"
             ))
@@ -1637,6 +1706,9 @@ mod tests {
             importance: 0.5,
             evidence: EvidenceGrade::Interpreted,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: "0".into(),
         }
     }
@@ -1743,6 +1815,9 @@ mod tests {
             importance: 0.5,
             evidence: EvidenceGrade::Interpreted,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at,
         };
         // Old chatter in two namespaces (both must go) …
@@ -2445,6 +2520,9 @@ mod tests {
             importance: 0.5,
             evidence: EvidenceGrade::Interpreted,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: "0".into(),
         }
     }
@@ -2652,6 +2730,210 @@ mod tests {
         assert!(contents.contains("export this memory"));
         // Clean up.
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ===== Supersede mechanism (v0.4.0 U2) =====
+
+    #[tokio::test]
+    async fn supersede_links_both_directions() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        store
+            .store_memory(&ns, sample_memory("mem_a", "the original claim"))
+            .await
+            .expect("store A");
+        let mut b = sample_memory("mem_b", "the corrected claim");
+        b.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, b).await.expect("store B");
+
+        let a = store
+            .recall_memory(&ns, &MemoryId("mem_a".into()))
+            .await
+            .expect("recall A")
+            .expect("A present");
+        assert_eq!(a.superseded_by.as_deref(), Some("mem_b"));
+        assert!(
+            a.superseded_at_unix.is_some(),
+            "the linking UPDATE stamps an audit timestamp"
+        );
+        let b = store
+            .recall_memory(&ns, &MemoryId("mem_b".into()))
+            .await
+            .expect("recall B")
+            .expect("B present");
+        assert_eq!(b.supersedes.as_deref(), Some("mem_a"));
+        assert!(b.superseded_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn superseding_absent_target_rejects() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        let mut b = sample_memory("mem_b", "correction with no target");
+        b.supersedes = Some("mem_nonexistent".into());
+        let err = store.store_memory(&ns, b).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::NotFound { .. }),
+            "not-found class: {err:?}"
+        );
+        // The rejected save stored nothing.
+        assert!(
+            store
+                .recall_memory(&ns, &MemoryId("mem_b".into()))
+                .await
+                .expect("recall")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn superseding_already_superseded_rejects() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        store
+            .store_memory(&ns, sample_memory("mem_a", "original claim"))
+            .await
+            .unwrap();
+        let mut b = sample_memory("mem_b", "first correction");
+        b.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, b).await.expect("A <- B");
+
+        // C superseding A: A is already superseded → conflict.
+        let mut c = sample_memory("mem_c", "second correction");
+        c.supersedes = Some("mem_a".into());
+        let err = store.store_memory(&ns, c).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::Duplicate { .. }),
+            "conflict class: {err:?}"
+        );
+
+        // C superseding B (the successor) succeeds — chains forward.
+        let mut c = sample_memory("mem_c", "second correction");
+        c.supersedes = Some("mem_b".into());
+        store.store_memory(&ns, c).await.expect("B <- C succeeds");
+        let b_rec = store
+            .recall_memory(&ns, &MemoryId("mem_b".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b_rec.superseded_by.as_deref(), Some("mem_c"));
+    }
+
+    #[tokio::test]
+    async fn self_supersede_rejects() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        let mut m = sample_memory("mem_self", "self reference");
+        m.supersedes = Some("mem_self".into());
+        let err = store.store_memory(&ns, m).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::Duplicate { .. }),
+            "conflict class: {err:?}"
+        );
+        assert!(
+            store
+                .recall_memory(&ns, &MemoryId("mem_self".into()))
+                .await
+                .expect("recall")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn wakeup_excludes_superseded() {
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_supersede");
+        // A: high importance but superseded.
+        let mut a = sample_memory("mem_a", "old important claim");
+        a.importance = 0.9;
+        store.store_memory(&ns, a).await.unwrap();
+        // Successor supersedes A.
+        let mut s = sample_memory("mem_s", "replacement claim");
+        s.importance = 0.1;
+        s.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, s).await.unwrap();
+        // B: fresh, lower importance, never superseded.
+        let mut b = sample_memory("mem_b", "fresh current claim");
+        b.importance = 0.5;
+        store.store_memory(&ns, b).await.unwrap();
+
+        let ids: Vec<String> = store
+            .list_memories(&ns, 10)
+            .await
+            .expect("wake-up list")
+            .into_iter()
+            .map(|m| m.id.0)
+            .collect();
+        assert!(
+            !ids.contains(&"mem_a".to_string()),
+            "superseded A must be excluded despite its 0.9 importance: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"mem_b".to_string()),
+            "fresh B must be present: {ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_and_browse_exclude_superseded() {
+        let store = SurrealStore::open_embedded_with(Arc::new(TestEmbedder))
+            .await
+            .expect("open with embedder");
+        let ns = NamespaceId::new("ns_supersede");
+        // A is the nearest match for the query but is superseded.
+        let mut a = sample_memory("mem_a", "rust memory store");
+        a.importance = 0.9;
+        store.store_memory(&ns, a).await.unwrap();
+        let mut s = sample_memory("mem_s", "replacement about surreal db");
+        s.supersedes = Some("mem_a".into());
+        store.store_memory(&ns, s).await.unwrap();
+        store
+            .store_memory(&ns, sample_memory("mem_b", "fresh unrelated text"))
+            .await
+            .unwrap();
+
+        // Search matching A's content omits A.
+        let hits = store
+            .search_memories(&ns, &Embedding(vec![3.0, 0.0, 1.0, 1.0]), 10)
+            .await
+            .expect("search");
+        assert!(
+            !hits.iter().any(|h| h.memory.id.0 == "mem_a"),
+            "search must omit superseded A"
+        );
+
+        // Browse omits A too.
+        let listed = store.list_memories(&ns, 10).await.expect("browse");
+        assert!(
+            !listed.iter().any(|m| m.id.0 == "mem_a"),
+            "browse must omit superseded A"
+        );
+
+        // Recall by id still returns the fossil with its links.
+        let a = store
+            .recall_memory(&ns, &MemoryId("mem_a".into()))
+            .await
+            .expect("recall")
+            .expect("fossil recallable");
+        assert_eq!(a.superseded_by.as_deref(), Some("mem_s"));
+    }
+
+    #[tokio::test]
+    async fn supersede_is_namespace_scoped() {
+        let store = fresh().await;
+        let x = NamespaceId::new("ns_supersede_x");
+        let y = NamespaceId::new("ns_supersede_y");
+        store
+            .store_memory(&x, sample_memory("mem_a", "lives only in X"))
+            .await
+            .unwrap();
+        let mut b = sample_memory("mem_b", "tries to supersede across ns");
+        b.supersedes = Some("mem_a".into());
+        let err = store.store_memory(&y, b).await.expect_err("must reject");
+        assert!(
+            matches!(err, IjimaError::NotFound { .. }),
+            "not-found class: {err:?}"
+        );
     }
 }
 

@@ -14,7 +14,7 @@
 //! | Method | Path | Capability | Store method |
 //! |---|---|---|---|
 //! | GET | `/health` | (none) | — |
-//! | POST | `/memories` | `memory:write` | `store_memory` |
+//! | POST | `/memories` | `memory:write` | `store_memory` (supersedes link) |
 //! | GET | `/memories/:id` | `memory:read` | `recall_memory` |
 //! | DELETE | `/memories/:id` | `memory:write` | `delete_memory` |
 //! | POST | `/memories/search` | `memory:read` | `search_memories` |
@@ -177,6 +177,7 @@ impl IntoResponse for ApiError {
 fn internal(e: ijima_core::IjimaError) -> ApiError {
     match e {
         ijima_core::IjimaError::Duplicate { detail } => ApiError::Conflict(detail),
+        ijima_core::IjimaError::NotFound { .. } => ApiError::NotFound,
         other => ApiError::Internal(other.to_string()),
     }
 }
@@ -686,6 +687,9 @@ async fn promote_memory(
         // stays observed; verify-pass fix).
         evidence: memory.evidence,
         citations: memory.citations.clone(),
+        supersedes: None,
+        superseded_by: None,
+        superseded_at_unix: None,
         created_at: memory.created_at.clone(),
     };
     let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
@@ -805,6 +809,9 @@ async fn ingest_doctrine(
         importance: 1.0,
         evidence: ijima_core::memory::EvidenceGrade::Interpreted,
         citations: Vec::new(),
+        supersedes: None,
+        superseded_by: None,
+        superseded_at_unix: None,
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -2973,6 +2980,9 @@ mod tests {
                             importance: 0.5,
                             evidence: ijima_core::memory::EvidenceGrade::Interpreted,
                             citations: Vec::new(),
+                            supersedes: None,
+                            superseded_by: None,
+                            superseded_at_unix: None,
                             created_at: "0".into(),
                         },
                     )
@@ -3174,6 +3184,9 @@ mod tests {
                 importance: 0.5,
                 evidence: ijima_core::memory::EvidenceGrade::Interpreted,
                 citations: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                superseded_at_unix: None,
                 created_at: "0".into(),
             })
             .collect();
@@ -3825,6 +3838,9 @@ mod tests {
                 importance: 0.5,
                 evidence: ijima_core::memory::EvidenceGrade::Interpreted,
                 citations: Vec::new(),
+                supersedes: None,
+                superseded_by: None,
+                superseded_at_unix: None,
                 created_at: "0".into(),
             },
             similarity: sim,

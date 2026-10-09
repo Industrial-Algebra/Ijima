@@ -68,6 +68,20 @@ pub struct Memory {
     /// typically empty) for `Interpreted`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub citations: Vec<Citation>,
+    /// Correction link (v0.4.0): the id of the memory this one supersedes
+    /// ("this replaces that"). Set once at save time; the server writes
+    /// the inverse link onto the target atomically with the insert.
+    /// Chains forward only (A ← B ← C); re-superseding a superseded
+    /// memory is rejected — supersede the successor instead.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub supersedes: Option<String>,
+    /// Inverse correction link, written by the server: the id of the
+    /// memory that superseded this one. Exclusion queries filter on this.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub superseded_by: Option<String>,
+    /// When the supersede link landed (unix seconds), for audit.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub superseded_at_unix: Option<i64>,
     /// Creation timestamp. v0: Unix epoch seconds as a string (monotonic
     /// for DESC ordering). Future: ISO-8601 when a time crate lands.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -207,6 +221,9 @@ mod tests {
                 kind: CitationKind::Commit,
                 locator: "abc123".into(),
             }],
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: "123".into(),
         };
         assert_eq!(m.id.0, "mem_01");
@@ -230,6 +247,20 @@ mod tests {
         assert!(m.citations.is_empty());
     }
 
+    #[cfg(feature = "federation")]
+    #[test]
+    fn supersede_fields_default_none() {
+        // Unit-1 JSON (evidence grade + citations present) predates the
+        // supersede links: all three must deserialize as `None`.
+        let m: Memory = serde_json::from_str(
+            r#"{"id":"mem_legacy","content":"c","project":"p","topic":"t","source":"Mined","harness":"Pi","importance":0.5,"evidence":"Observed","citations":[{"kind":"Commit","locator":"abc123"}],"created_at":"1"}"#,
+        )
+        .expect("Unit-1 JSON must deserialize");
+        assert!(m.supersedes.is_none());
+        assert!(m.superseded_by.is_none());
+        assert!(m.superseded_at_unix.is_none());
+    }
+
     #[test]
     fn validate_evidence_rejects_observed_without_citations() {
         let m = Memory {
@@ -245,6 +276,9 @@ mod tests {
             importance: 0.5,
             evidence: EvidenceGrade::Observed,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: "1".into(),
         };
         let err = m.validate_evidence().expect_err("must reject");
@@ -269,6 +303,9 @@ mod tests {
                 kind: CitationKind::Commit,
                 locator: "abc123".into(),
             }],
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: "1".into(),
         };
         assert!(m.validate_evidence().is_ok());
@@ -289,6 +326,9 @@ mod tests {
             importance: 0.5,
             evidence: EvidenceGrade::Interpreted,
             citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
             created_at: "1".into(),
         };
         assert!(m.validate_evidence().is_ok());
