@@ -78,6 +78,17 @@ and session. Source tiers map to Schubert trust grades — the foundation
 for federation cross-talk policies and context-poisoning protection
 ([ADR](docs/adr/provenance-tier-model.md)).
 
+Since 0.4.0 every memory also carries an **evidence grade** — a second
+axis crossing tier lines: `Observed` (the authoring process directly
+witnessed it — requires at least one typed citation, enforced at save)
+or `Interpreted` (the default, including all legacy rows). Provenance
+says *who wrote it*; the evidence grade says *how they know it*.
+**Corrections are structural**: a save declaring `supersedes: <id>`
+displaces its target from wake-up, search, and browse regardless of
+importance — see the book's [corrections chapter](book/src/concepts/corrections.md).
+Doctrine re-versions itself instead: archived bodies, stable revision
+identities, and one-command admin rollback.
+
 ## Quick start
 
 ```bash
@@ -95,11 +106,15 @@ export IJIMA_DIR=~/.ijima
 Then talk to it over HTTP:
 
 ```bash
-# Store a memory (needs a memory:write token)
+# Store a memory (needs a memory:write token; evidence/citations are
+# the 0.4 trust fields — absent means Interpreted, the weaker default)
 curl -X POST http://127.0.0.1:7373/memories \
   -H "authorization: Bearer <token>" \
   -H "content-type: application/json" \
-  -d '{"id":"m1","content":"Decided to use SurrealDB","project":"ijima","topic":"storage","source":"Explicit","harness":"Pi"}'
+  -d '{"id":"m1","content":"Decided to use SurrealDB","project":"ijima","topic":"storage","source":"Explicit","harness":"Pi","evidence":"Observed","citations":[{"kind":"Commit","locator":"<sha>"}]}'
+
+# Correct it later — supersedes displaces the target from wake-up/search/browse (recall by id keeps the fossil)
+# curl -X POST .../memories -d '{"id":"m2","content":"Amended: ...","supersedes":"m1", ...}'
 
 # Semantic search (daemon embeds centrally with candle)
 curl -X POST http://127.0.0.1:7373/memories/search \

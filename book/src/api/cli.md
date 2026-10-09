@@ -80,6 +80,13 @@ upsert, additions append); id-carrying frontmatter passes through
 verbatim; byte-identical files collapse to one row. `--dry-run`
 prints the plan without a daemon (`--url`/`--token` optional there).
 
+Since 0.4.0, each ingest response carries the doc's `revision` (stable
+body identity — see [provenance](../concepts/provenance.md)) and any
+advisory `warnings` from the stance scan (density, accretion,
+long-dense patterns) for the corpus reviewer. Changed bodies archive
+the outgoing version server-side; `POST /doctrine/rollback {"id", "to"}`
+(admin) restores any archived version.
+
 ## `ijima kg-delete`
 
 Hard-deletes one triple (the misplaced-data cleanup tool — soft
