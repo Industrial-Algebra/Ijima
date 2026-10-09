@@ -189,6 +189,32 @@ pub trait Store: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Recompute `active` flags for a doctrine doc's archived versions
+    /// against the CURRENT live body (truthful-by-construction: active =
+    /// archived body matches live). Called by ingest after storing.
+    /// Default no-op so non-Surreal implementers compile unchanged.
+    async fn mark_doctrine_active(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        live_content: &str,
+    ) -> Result<()> {
+        let _ = (ns, id, live_content);
+        Ok(())
+    }
+
+    /// Write an inverse supersede link directly (doctrine cross-id dedup
+    /// retires stale duplicates this way). Default no-op.
+    async fn mark_superseded(
+        &self,
+        ns: &NamespaceId,
+        target: &MemoryId,
+        by: &MemoryId,
+    ) -> Result<()> {
+        let _ = (ns, target, by);
+        Ok(())
+    }
+
     /// Re-activate version `to` of a doctrine doc: rewrite the live
     /// memory row's content from that version's body, set its `revision`
     /// to that version's number, and mark that version active (all others

@@ -846,11 +846,32 @@ async fn ingest_doctrine(
         .await
         .map_err(internal)?
     {
-        let revision = existing
-            .as_ref()
-            .filter(|m| m.id == existing_id)
-            .and_then(|m| m.revision)
-            .unwrap_or(1);
+        // Canonical revision comes from the ROW THAT HOLDS the content
+        // (review round 1, P1-4) — not from the incoming id's prior row.
+        let canonical = store
+            .recall_memory(&ns, &existing_id)
+            .await
+            .map_err(internal)?;
+        let revision = canonical.as_ref().and_then(|m| m.revision).unwrap_or(1);
+        // A stale row under the INCOMING id holding other content is
+        // retired via the supersede link: identical content now lives at
+        // the canonical id, and the stale duplicate must drop out of
+        // wake-up/search/browse.
+        if existing_id.0 != req.id {
+            let stale = store
+                .recall_memory(&ns, &MemoryId(req.id.clone()))
+                .await
+                .map_err(internal)?;
+            if let Some(stale_row) = stale
+                && stale_row.superseded_by.is_none()
+                && stale_row.content != req.content
+            {
+                store
+                    .mark_superseded(&ns, &MemoryId(req.id.clone()), &existing_id)
+                    .await
+                    .map_err(internal)?;
+            }
+        }
         return Ok(Json(DoctrineIngestResponse {
             id: existing_id.0,
             revision,
@@ -881,7 +902,7 @@ async fn ingest_doctrine(
     }
     let memory = Memory {
         id: MemoryId(req.id.clone()),
-        content: req.content,
+        content: req.content.clone(),
         project: req.project,
         topic: req.topic,
         source: ijima_core::memory::MemorySource::Doctrine,
@@ -908,6 +929,12 @@ async fn ingest_doctrine(
             .unwrap_or_default(),
     };
     store.store_memory(&ns, memory).await.map_err(internal)?;
+    // Truthful active flags: exactly the archived version matching the
+    // live body, if any (review round 1, P1-3).
+    store
+        .mark_doctrine_active(&ns, &MemoryId(req.id.clone()), &req.content)
+        .await
+        .map_err(internal)?;
     Ok(Json(DoctrineIngestResponse {
         id: req.id,
         revision,
@@ -934,7 +961,7 @@ async fn list_doctrine_versions(
 async fn rollback_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
-    Query(q): Query<DoctrineDocQuery>,
+    Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRollbackRequest>,
 ) -> Result<Json<IdResponse>, ApiError> {
     if !principal.0.may(ADMIN) {
@@ -958,9 +985,8 @@ async fn rollback_doctrine(
 
 /// How many personal essentials to include in a wake-up response.
 const WAKEUP_PERSONAL_LIMIT: usize = 20;
-/// The lexicographic stratum: top rows by importance-first ordering.
-const WAKEUP_TOP_STRATUM: usize = 12;
-/// The recency stratum: freshest rows regardless of importance.
+/// The recency stratum: freshest rows regardless of importance,
+/// admitted ahead of the lexicographic fill (review round 1).
 const WAKEUP_RECENT_STRATUM: usize = 8;
 /// How many doctrine entries to include.
 const WAKEUP_DOCTRINE_LIMIT: usize = 50;
@@ -995,21 +1021,25 @@ async fn wakeup(
     let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
 
     let (top, recent, doctrine) = tokio::join!(
-        store.list_memories(&essentials_ns, WAKEUP_TOP_STRATUM),
+        store.list_memories(&essentials_ns, WAKEUP_PERSONAL_LIMIT),
         store.recent_memories(&essentials_ns, WAKEUP_RECENT_STRATUM),
         store.list_memories(&doctrine_ns, WAKEUP_DOCTRINE_LIMIT),
     );
-    // Stratified composition: lexicographic top first, then the freshest
-    // rows not already selected (v0.4.0 starvation fix). Dedup by id —
-    // a row in both strata appears once, in the top.
+    // Stratified composition (v0.4.0 starvation fix, review round 1):
+    // the recency stratum is admitted FIRST — its guarantee (freshest
+    // rows reach wake-up even when the lexicographic top is saturated)
+    // is the point of the design — then the lexicographic order fills
+    // the remaining budget. An underfull wall (fewer rows than the
+    // limit) therefore returns every eligible row; a saturated wall
+    // returns 8 freshest + 12 highest-importance. Dedup by id.
     let mut seen = std::collections::HashSet::new();
     let mut personal_essentials = Vec::with_capacity(WAKEUP_PERSONAL_LIMIT);
-    for m in top.map_err(internal)? {
+    for m in recent.map_err(internal)? {
         if seen.insert(m.id.0.clone()) {
             personal_essentials.push(m);
         }
     }
-    for m in recent.map_err(internal)? {
+    for m in top.map_err(internal)? {
         if seen.insert(m.id.0.clone()) {
             personal_essentials.push(m);
         }
@@ -2998,6 +3028,54 @@ mod tests {
 
     /// POSTs a doctrine body via the admin endpoint; asserts 200 and
     /// returns the parsed ingest response.
+    /// Review-round-1 helper: a full PascalCase Memory body.
+    fn full_mem(id: &str, content: &str, created_at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "content": content,
+            "project": "ijima",
+            "topic": "general",
+            "source": "Explicit",
+            "harness": "Pi",
+            "session_id": "sess_r1",
+            "importance": 0.7,
+            "created_at": created_at,
+        })
+    }
+
+    /// Review-round-1 helper: POST a JSON body with a bearer token.
+    fn post_json(uri: &str, token: &str, body: &serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", token.to_string())
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// Review-round-1 helper: recall a memory in the caller's namespace.
+    async fn get_mem(app: &Router, token: &str, id: &str) -> Memory {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/memories/{id}"))
+                    .header("authorization", token.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
     async fn post_doctrine(
         app: &Router,
         token: &str,
@@ -3025,13 +3103,17 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        serde_json::from_slice(
-            &axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap(),
-        )
-        .unwrap()
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "ingest failed: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        serde_json::from_slice(&bytes).unwrap()
     }
 
     /// GETs the archived versions of a doctrine doc (global wall).
@@ -5209,5 +5291,239 @@ mod tests {
             serde_json::from_value(body).expect("deserializes as TokenRevocation");
         auth.hydrate_revocations(&listed);
         assert!(auth.is_revoked(&victim));
+    }
+    // ---------- review round 1 regression tests (PR #131) ----------
+
+    /// P1-1: a supersede save whose insert fails must leave the graph
+    /// uncorrupted — no row ends up excluded by a link to a save that
+    /// never landed.
+    #[tokio::test]
+    async fn failed_supersede_leaves_no_corruption() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+        let uri = "/memories";
+
+        let a = full_mem("mem_r1a", "original claim", "0");
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &a))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut b = full_mem("mem_r1b", "correction", "1");
+        b["supersedes"] = "mem_r1a".into();
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &b))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Reuse A's record id with new content, superseding B: the insert
+        // fails (key exists) and B must NOT be linked to the failed save.
+        let mut c = full_mem("mem_r1a", "conflicting reuse", "2");
+        c["supersedes"] = "mem_r1b".into();
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &c))
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::OK, "reused id must fail");
+
+        // B is visible (not superseded); A is superseded by B only.
+        let b_row: Memory = get_mem(&app, &write, "mem_r1b").await;
+        assert!(
+            b_row.superseded_by.is_none(),
+            "B unlinked: {:?}",
+            b_row.superseded_by
+        );
+        let a_row: Memory = get_mem(&app, &write, "mem_r1a").await;
+        assert_eq!(a_row.superseded_by.as_deref(), Some("mem_r1b"));
+
+        // Missing-target supersede: the just-inserted successor is
+        // compensated away (recall 404s).
+        let mut d = full_mem("mem_r1d", "dangling", "3");
+        d["supersedes"] = "mem_ghost".into();
+        let res = app
+            .clone()
+            .oneshot(post_json(uri, &write, &d))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/mem_r1d")
+                    .header("authorization", write.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND, "compensated away");
+    }
+
+    /// P1-2: read paths (list/search/wake-up) preserve the stored
+    /// evidence grade and citations — projections must carry them.
+    #[tokio::test]
+    async fn read_paths_preserve_evidence() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+        let mut m = seed_mem("mem_ev", 0.9, "5000");
+        m.evidence = ijima_core::memory::EvidenceGrade::Observed;
+        m.citations = vec![ijima_core::memory::Citation {
+            kind: ijima_core::memory::CitationKind::Session,
+            locator: "sess_ev".into(),
+        }];
+        store.store_memory(&ns, m).await.expect("seed");
+
+        let listed = store.list_memories(&ns, 10).await.expect("list");
+        let row = listed.iter().find(|m| m.id.0 == "mem_ev").expect("listed");
+        assert_eq!(row.evidence, ijima_core::memory::EvidenceGrade::Observed);
+        assert_eq!(row.citations.len(), 1);
+        assert_eq!(row.citations[0].locator, "sess_ev");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let found = body["personal_essentials"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "mem_ev" && m["evidence"] == "Observed");
+        assert!(found, "wake-up carries the grade: {}", body);
+    }
+
+    /// P1-3: rollback then re-ingest keeps version identities stable — no
+    /// duplicate archive of an already-archived body, at most one active.
+    #[tokio::test]
+    async fn rollback_then_ingest_keeps_version_identity() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-r1", "v1").await;
+        post_doctrine(&app, &admin, uri, "doc-r1", "v2").await;
+        // Roll back to v1, then ingest v3.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback")
+                    .header("authorization", admin.clone())
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "doc-r1", "to": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "P2-5: body id, no query id");
+        post_doctrine(&app, &admin, uri, "doc-r1", "v3").await;
+
+        let versions = list_versions(&app, &admin, "doc-r1").await;
+        let hashes: std::collections::HashSet<_> =
+            versions.iter().map(|v| v.content_hash.clone()).collect();
+        assert_eq!(
+            hashes.len(),
+            versions.len(),
+            "no duplicate bodies: {versions:?}"
+        );
+        assert_eq!(versions.len(), 2, "v1 and v2 archived: {versions:?}");
+        let actives = versions.iter().filter(|v| v.active).count();
+        assert!(actives <= 1, "at most one active: {versions:?}");
+        let live = recall_doctrine(&app, &admin, "doc-r1").await;
+        assert_eq!(live.content, "v3");
+    }
+
+    /// P1-4: cross-id byte-identical ingest reports the CANONICAL id and
+    /// revision, and retires the stale duplicate via the supersede link.
+    #[tokio::test]
+    async fn cross_id_dedup_reports_canonical_and_retires_stale() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-can", "canonical body").await;
+        post_doctrine(&app, &admin, uri, "doc-can", "canonical body v2").await;
+        post_doctrine(&app, &admin, uri, "doc-stale", "obsolete body").await;
+
+        // Re-ingest under the STALE id with the canonical current content.
+        let r = post_doctrine(&app, &admin, uri, "doc-stale", "canonical body v2").await;
+        assert_eq!(r["id"], "doc-can", "canonical id reported: {r}");
+        assert_eq!(r["revision"].as_u64(), Some(2), "canonical revision: {r}");
+
+        let stale = recall_doctrine(&app, &admin, "doc-stale").await;
+        assert_eq!(
+            stale.superseded_by.as_deref(),
+            Some("doc-can"),
+            "stale row retired"
+        );
+    }
+
+    /// P2-6: an underfull wall returns every eligible row — importance
+    /// aligned WITH recency must not drop tail rows below the strata cut.
+    #[tokio::test]
+    async fn underfull_wall_returns_all_eligible() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+        // 15 rows: newest = highest importance (fully overlapping strata).
+        for i in 0..15 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(
+                        &format!("mem_u_{i:02}"),
+                        0.9 - (i as f32 * 0.02),
+                        &format!("{:04}", 3000 - i),
+                    ),
+                )
+                .await
+                .expect("seed");
+        }
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["personal_essentials"].as_array().map(Vec::len),
+            Some(15),
+            "all eligible rows return: {}",
+            body
+        );
     }
 }
