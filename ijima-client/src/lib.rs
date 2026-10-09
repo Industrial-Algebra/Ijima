@@ -42,6 +42,12 @@
 //!     origin: InstanceId::local(),
 //!     authority: AuthorityScope::local(),
 //!     importance: 0.5,
+//!     evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+//!     citations: vec![],
+//!     supersedes: None,
+//!     superseded_by: None,
+//!     superseded_at_unix: None,
+//!     revision: None,
 //!     created_at: String::new(),
 //! }).await?;
 //!
