@@ -4,6 +4,105 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-10-09 — "The Trust Machinery"
+
+The 0.4 arc, scoped by operator decision (2026-09-22) from the 09-22
+dive's synthesis: *prose about behavior is interpreted-tier; behavior
+itself is observed-tier — only observed-tier claims should compound.*
+The trust machinery gives that thesis its substrate. The dreamer and
+the rank fork (decay vs derived) go to 0.5 by the same decision.
+
+### Evidence grades (direction D)
+
+- Every `Memory` carries `EvidenceGrade` (`Observed`/`Interpreted`,
+  default `Interpreted` — legacy rows and ungraded saves are the weaker
+  claim, never masquerading as observed fact) plus typed `Citation`s
+  (Commit/Report/Session/File/Url).
+- **Observed claims cite or they do not ship**: saving `Observed`
+  without at least one citation is rejected 400.
+- Auto-capture stamps `Observed` with a Session citation (it witnessed
+  the session); promotion carries the source's grade and citations.
+- The two axes: provenance tier = *who wrote it*; evidence grade =
+  *how they know it*. The grade crosses tier lines.
+
+### Supersede — the ritual becomes a mechanism
+
+- A save declaring `supersedes: <id>` writes the inverse link onto its
+  target atomically; superseded rows are excluded from wake-up, search,
+  and browse regardless of tier arithmetic, while recall keeps them
+  visible (fossils, not deletions).
+- RABBIT_HOLE_2026-09-22 §1 found corrections working only as
+  choreography — a manual 0.8 save tying the wrong memory and winning
+  the recency tiebreak, while any correction arriving by any other path
+  lost forever to `ORDER BY importance DESC, created_at DESC`. The
+  archaeology (RABBIT_HOLE_2026-10-08): the multiplicative ranking was
+  the founding spec; the SQL was the simplification; which layer is
+  authoritative was the 0.4 question. 0.4.0 answers by making
+  corrections structural.
+- Chain-through-successor semantics (re-superseding a superseded row is
+  rejected); the complete insert/validate/claim transition is atomic
+  (conditional claim + compensation + store-level serialization), so
+  concurrent successors, reused ids, and mutually-referencing saves all
+  see the serial outcome.
+
+### Doctrine versioning, rollback, and ingest validation (directions B + A)
+
+- Ingest archives the outgoing body before overwriting — the
+  delete-then-store history destruction ends.
+- **Revision numbers are stable body identities**: a returning body
+  restores the number it first went live with; a new body takes
+  max-ever + 1; no number ever identifies two different bodies.
+- One-command admin rollback (`POST /doctrine/rollback {id, to}`)
+  rewrites the live row from any archived version; active flags are
+  truthful by construction (the archived version matching the live
+  body, if any).
+- The whole ingest transition — authoritative live-dedup (retired rows
+  are never canonical; losers are retired via supersede links, never
+  deleted), archive, allocation, replacement, active-recompute — runs
+  under one lock: concurrent ingests, rollbacks, dedups, and
+  restorations serialize with stable identities.
+- A-slice stance validation: advisory warnings (density, accretion,
+  long-dense) surface in ingest responses for the PR reviewer —
+  doctrine stays PR-reviewed, never auto-blocked.
+- Doctrine bodies ingest as `Observed` with a Report citation.
+- `/memories/check` is live-only, matching the save path it preflights.
+
+### Stratified wake-up — the starvation fix
+
+- Personal essentials compose two strata: the recency stratum (8
+  freshest non-superseded rows, admitted first — the guarantee) plus
+  lexicographic fill to 20. A wall saturated by high-importance rows
+  can no longer starve fresh default-tier memories out of wake-up;
+  underfull walls return every eligible row.
+
+### Extension and docs
+
+- `memory_save` gains `evidence`/`citations`/`supersedes` parameters
+  (absent params produce absent body keys — server defaults apply);
+  offline builder tests and live e2e round-trips to the 0.4 contract.
+- Book: the evidence-axis section (two-axes table), corrections,
+  doctrine versioning/rollback routes, stratified wake-up.
+- ROADMAP status header caught up (was "unreleased — toward 0.1.0",
+  four releases stale); README Status section diffed per the new
+  release-checklist line.
+
+### Dependencies
+
+- surrealdb 3.2.4 → 3.3.0 (#130): the active rkyv moves to 0.8.18,
+  closing RUSTSEC-2026-0235 in the build graph. A residual
+  `rkyv 0.7.46` lock entry remains via `rust_decimal`'s optional edge —
+  not in the compiled Linux build path (documented, not shipped).
+  rsa Marvin-attack timing (RUSTSEC-2023-0071) remains
+  documented-unfixed upstream.
+
+### Process
+
+- The arc was built via ia-moment generation dispatch (five units
+  against plan contracts) and reviewed through seven astra-class rounds
+  to convergence: 19 findings, all verified-then-fixed with named
+  regression tests; four fix-attempt defects disclosed and caught by
+  gates. The regression suite pins every repro.
+
 ## [0.3.1] — 2026-09-21 — extension: declarative per-project namespaces
 
 The pi extension gains project-local configuration: a repo declares which

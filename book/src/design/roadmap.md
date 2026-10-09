@@ -2,6 +2,21 @@
 
 **Shipped:**
 
+- **v0.4.0 "The Trust Machinery"** (2026-10-09) — evidence grades
+  (`Observed`/`Interpreted` + typed citations; observed claims cite or
+  they don't ship), supersede links (corrections displace their targets
+  — the correction ritual became a mechanism), doctrine versioning with
+  stable revision identities + one-command admin rollback + advisory
+  stance-validation warnings, stratified wake-up (8-freshest + 20-fill;
+  the starvation fix), live-only dedup preflight, surrealdb 3.3.0
+  (rkyv 0.8 in the build graph).
+- **v0.3.1** (2026-09-21) — declarative per-project namespaces
+  (`.pi/ijima.json`), `IJIMA_HOME`, the token-fallback `~` expansion
+  fix.
+- **v0.3.0 "The Curated Brain"** (2026-09-10) — org-scoped doctrine
+  walls, `doctrine:write` least-privilege capability, tree-mode ingest
+  CLI, AutoCapture TTL sweeper, KG hard-delete, logical export, npm
+  trusted publishing for the pi extension.
 - **v0.1.0** (2026-08-10) — the library: two-store model, Schubert
   capability auth, SurrealDB backend, mining pipeline, pi extension,
   crates.io publication of core/server/miner/client.
