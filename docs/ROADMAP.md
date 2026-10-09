@@ -19,11 +19,14 @@ The goal: any agent can ask *"what do we know about X?"* and get an
 answer drawing on every harness's accumulated context — scoped to what
 that agent is allowed to see.
 
-## Current state (unreleased — toward 0.1.0)
+## Current state (v0.4.0 shipped 2026-10-09)
 
-> **Not yet shipped.** The features below are merged to `develop` (118
-tests) but nothing is 0.1.0 until the crates are published to crates.io
-> and the release is tagged. The authoritative status of what's merged:
+> **Shipped: v0.4.0 "The Trust Machinery"** — evidence grades, supersede
+> links, doctrine versioning with stable revision identities + rollback,
+> stratified wake-up. All four crates on crates.io and the pi extension
+> on npm at 0.4.0. Production central-memory service since August 2026.
+> The capability table below reflects the shipped surface; 0.5 inputs
+> (dreamer, rank fork, retrieval dynamics) live in `docs/discovery/`:
 
 | Capability | Status |
 |---|---|

@@ -12,7 +12,7 @@ import * as path from "node:path";
 import {
   build_search_request,
   parse_search_response,
-  build_save_request,
+  build_save_request as wasm_build_save_request,
   parse_save_response,
   build_check_duplicate_request,
   parse_check_duplicate_response,
@@ -242,6 +242,40 @@ function parseError(msg: string) {
 }
 
 // ---------------------------------------------------------------------------
+// build_save_request — the wasm builder plus the v0.4.0 trust-machinery
+// extras. Kept in TS because the wasm core's signature is frozen for this
+// unit (no Rust edits): the extras are added to the parsed body ONLY when
+// present, so absent params leave the server defaults (Interpreted, no
+// citations, no supersede link) in place. Exported for the offline tests.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the JSON body for `POST /memories`.
+ *
+ * @param extras v0.4.0 extras. Each key is written to the body only when
+ *   it is not `undefined` — an absent `evidence`/`citations`/`supersedes`
+ *   must not appear in the body at all.
+ */
+export function build_save_request(
+  id: string,
+  content: string,
+  project: string,
+  topic: string,
+  importance?: number | null,
+  extras?: { evidence?: string; citations?: unknown[]; supersedes?: string },
+): string {
+  const body = JSON.parse(
+    wasm_build_save_request(id, content, project, topic, importance),
+  );
+  if (extras) {
+    if (extras.evidence !== undefined) body.evidence = extras.evidence;
+    if (extras.citations !== undefined) body.citations = extras.citations;
+    if (extras.supersedes !== undefined) body.supersedes = extras.supersedes;
+  }
+  return JSON.stringify(body);
+}
+
+// ---------------------------------------------------------------------------
 // Extension entry point
 // ---------------------------------------------------------------------------
 
@@ -322,7 +356,8 @@ export default function (pi: ExtensionAPI) {
     label: "Memory Save",
     description:
       "Explicitly save a piece of information to persistent memory." +
-      " Use for important decisions, facts, or context to remember across sessions.",
+      " Use for important decisions, facts, or context to remember across sessions." +
+      " Claims you directly observed should pass evidence: \"Observed\" with citations; corrections pass supersedes.",
     parameters: Type.Object({
       content: Type.String({
         description: "The information to remember (include context)",
@@ -342,6 +377,54 @@ export default function (pi: ExtensionAPI) {
             "Importance weight 0.0-1.0 (default: 0.8 for manual saves). Higher = more likely to appear in wake-up.",
         }),
       ),
+      evidence: Type.Optional(
+        Type.Union(
+          [Type.Literal("Observed"), Type.Literal("Interpreted")],
+          {
+            description:
+              "Evidence grade. Observed = you directly witnessed this " +
+              "(command output, file content, an event in this session) " +
+              "— requires >= 1 citation and the server rejects otherwise. " +
+              "Interpreted (default) = inference, judgment, or summary " +
+              "about artifacts.",
+          },
+        ),
+      ),
+      citations: Type.Optional(
+        Type.Array(
+          Type.Object({
+            kind: Type.Union(
+              [
+                Type.Literal("Commit"),
+                Type.Literal("Report"),
+                Type.Literal("Session"),
+                Type.Literal("File"),
+                Type.Literal("Url"),
+              ],
+              { description: "Artifact kind the locator points at" },
+            ),
+            locator: Type.String({
+              description:
+                "Opaque locator: commit sha, report path, session id, " +
+                "file path, or URL",
+            }),
+          }),
+          {
+            description:
+              "Citations grounding an Observed grade " +
+              "(no citation, no observed claim)",
+          },
+        ),
+      ),
+      supersedes: Type.Optional(
+        Type.String({
+          description:
+            "Id of the memory this one corrects. Superseded memories " +
+            "drop out of wake-up/search/browse regardless of importance " +
+            "— the correction displaces its target. Chain by superseding " +
+            "the successor, not the already-superseded original.",
+        }),
+      ),
     }),
     async execute(_tid, params, signal) {
       const id = await contentId(params.content);
@@ -351,6 +434,11 @@ export default function (pi: ExtensionAPI) {
         params.project ?? "general",
         params.topic ?? "general",
         params.importance,
+        {
+          evidence: params.evidence,
+          citations: params.citations,
+          supersedes: params.supersedes,
+        },
       );
       const { ok, status, text } = await ijimaFetch(
         withHome("/memories"),

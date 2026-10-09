@@ -86,6 +86,23 @@ The extension does the remembering so the agent doesn't have to:
 `Explicit` tier with higher importance — auto-capture is the floor,
 not the ceiling.
 
+### `memory_save` parameters
+
+| Parameter | Semantics |
+|---|---|
+| `content` | The information to remember (required). |
+| `project` / `topic` | Palace room + taxonomy placement (default `general`). |
+| `importance` | 0.0–1.0; higher ranks earlier in wake-up (default 0.8 for manual saves). |
+| `evidence` | `Observed` or `Interpreted` (default). `Observed` = directly witnessed (command output, file content, a session event) and **requires ≥ 1 citation** — the server rejects it otherwise (`400`). |
+| `citations` | Typed pointers grounding an `Observed` save: `{ kind: Commit\|Report\|Session\|File\|Url, locator }`. No citation, no observed claim. |
+| `supersedes` | Id of the memory this save corrects. The target drops out of wake-up/search/browse regardless of importance; chain through the successor, never the already-superseded original. |
+
+Wake-up composition is **stratified** (0.4): the top 12 by
+importance-first ordering plus the 8 freshest rows, with superseded
+memories excluded from both strata. `evidence`, `citations`, and
+`supersedes` are forwarded to `POST /memories`; absent params leave the
+server defaults (Interpreted, no citations, no supersede link) in place.
+
 ## What the extension provides
 
 | pi tool | Ijima surface |

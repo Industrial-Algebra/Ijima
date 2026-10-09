@@ -75,7 +75,7 @@ pub use provenance::{AuthorityScope, InstanceId};
 pub use repo::RepoDirectory;
 pub use revocation::TokenRevocation;
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
-pub use store::{NamespaceCount, SearchHit, Store, StoreStats};
+pub use store::{DoctrineVersion, NamespaceCount, SearchHit, Store, StoreStats};
 
 /// Convenience `Result` alias used throughout the Ijima crates.
 pub type Result<T, E = IjimaError> = core::result::Result<T, E>;
