@@ -487,14 +487,21 @@ fn default_record_importance() -> f32 {
     0.5
 }
 
-/// Deserializes a projected-null-or-absent field into the default.
+/// Deserializes a projected-NONE-or-absent field into the default.
 /// SurrealQL projections materialize EVERY selected column for every
-/// matched row: a pre-0.4 record lacking the column comes back as
-/// `null` (an "Option value" to serde), which `#[serde(default)]`
-/// alone does not absorb — only absence does. Production walls are
-/// full of legacy rows, so the ranked/list/search projections must
-/// read null as "field did not exist" (v0.4.1 hotfix: the v0.4.0
-/// projection fix broke wake-up on every mixed wall).
+/// matched row: a pre-0.4 record lacking the column surfaces through
+/// the SDK as `Value::None` (serde: "invalid type: Option value"),
+/// which `#[serde(default)]` alone does not absorb — only true absence
+/// does. Production walls are full of legacy rows, so the ranked/
+/// list/search projections must read NONE as "field did not exist"
+/// (v0.4.1 hotfix: the v0.4.0 projection fix broke wake-up on every
+/// mixed wall).
+///
+/// NOTE the boundary: this covers projected **NONE/missing** values —
+/// the legacy-row compatibility case. A column explicitly written as
+/// database `NULL` (or JSON null) still fails deserialization, which
+/// is deliberate: 0.4+ writes never produce null for these fields, so
+/// an explicit null signals malformed data we want loud, not silent.
 fn null_as_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
 where
     T: serde::Deserialize<'de> + Default,
