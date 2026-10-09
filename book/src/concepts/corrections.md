@@ -15,8 +15,9 @@ mechanism." Supersede is the mechanism.
 
 Saving a memory that declares `supersedes: <target_id>`:
 
-- writes the inverse link (`superseded_by`, `supersedes_at_unix`) onto
-  the target **atomically with the save**;
+- writes the inverse link (`superseded_by`, `superseded_at_unix`) onto
+  the target as part of the save — serialized and
+  failure-compensated (see below);
 - **excludes the target** from wake-up, search, and browse —
   regardless of either row's importance, tier, or age;
 - **keeps the target recallable by id**, with its links intact —
@@ -42,12 +43,17 @@ POST /memories
 - **Self-supersede** is rejected (409); a target absent from the
   namespace is 404.
 - **Namespace-scoped**: the link resolution never crosses walls.
-- **Concurrency-safe**: the complete insert → validate → claim
-  transition is serialized and the claim itself is a conditional atomic
-  update — concurrent successors of one target yield exactly one
-  winner; mutually-referencing saves see the serial outcome (both
-  rejected, both compensated away) instead of forming a correction
-  cycle. The correction graph is acyclic by construction.
+- **Concurrency-safe (the precise guarantee)**: a supersede save is
+  *insert → conditional claim → compensate*, serialized per process —
+  not a single transaction. The claim on the target is one conditional
+  atomic update (`UPDATE … WHERE superseded_by = NONE`), so concurrent
+  successors of one target yield exactly one winner; a claim that
+  fails (absent, claimed, or self target) compensates by deleting the
+  just-inserted successor, leaving the pre-attempt graph. Mutually
+  referencing saves see the serial outcome — both rejected and
+  compensated away — instead of forming a correction cycle. The
+  correction graph is acyclic by construction under single-process
+  operation; cross-process serialization is federation's problem.
 
 ## Where exclusion applies
 

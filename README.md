@@ -113,7 +113,7 @@ curl -X POST http://127.0.0.1:7373/memories \
   -H "content-type: application/json" \
   -d '{"id":"m1","content":"Decided to use SurrealDB","project":"ijima","topic":"storage","source":"Explicit","harness":"Pi","evidence":"Observed","citations":[{"kind":"Commit","locator":"<sha>"}]}'
 
-# Correct it later — the supersedes link displaces the target everywhere
+# Correct it later — supersedes displaces the target from wake-up/search/browse (recall by id keeps the fossil)
 # curl -X POST .../memories -d '{"id":"m2","content":"Amended: ...","supersedes":"m1", ...}'
 
 # Semantic search (daemon embeds centrally with candle)

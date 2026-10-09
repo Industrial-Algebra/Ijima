@@ -475,8 +475,10 @@ research question, not a design decision, and it is correctly deferred.
    found (a wrong 0.8 save outranked every ≤0.7 correction forever;
    corrections worked only as manual-save choreography). Targets stay
    recallable — fossils, not deletions. Chains go through successors;
-   the transition is atomic and serialized; the graph is acyclic by
-   construction (7-round adversarial review converged here).
+   the transition is insert → conditional atomic claim → compensation,
+   serialized per process (not a transaction); the graph is acyclic by
+   construction under single-process operation (7-round adversarial
+   review converged here).
 3. **Doctrine revisions are stable body identities.** A returning body
    restores the number it first went live with; a new body takes
    max-ever + 1; no number ever identifies two bodies. Rollback
