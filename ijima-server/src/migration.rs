@@ -110,6 +110,8 @@ pub fn map_pipalace_memory(row: &PiPalaceRow) -> Memory {
             Some(row.session_id.clone())
         },
         importance: row.importance.clamp(0.0, 1.0) as f32,
+        evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+        citations: Vec::new(),
         created_at: row.timestamp.clone(),
         origin: InstanceId::local(),
         authority: AuthorityScope::local(),
@@ -128,6 +130,8 @@ pub fn map_zeroclaw_memory(row: &ZeroClawRow) -> Memory {
         harness: Harness::Other,
         session_id: row.session_id.clone(),
         importance: 0.5,
+        evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+        citations: Vec::new(),
         created_at: row.created_at.clone(),
         origin: InstanceId::local(),
         authority: AuthorityScope::local(),

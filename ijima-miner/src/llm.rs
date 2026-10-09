@@ -198,6 +198,8 @@ fn llm_memory(line: &LlmLine, ctx: &MiningContext) -> Memory {
         origin: InstanceId::local(),
         authority: AuthorityScope::local(),
         importance: line.confidence.clamp(0.0, 1.0),
+        evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+        citations: Vec::new(),
         created_at: ctx.now.clone(),
     }
 }

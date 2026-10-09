@@ -49,6 +49,27 @@ pub enum AuthRejection {
 /// Back-compat alias: the historical single-variant name.
 pub type AuthError = AuthRejection;
 
+/// Direction D (v0.4.0) auto-capture stamping. Auto-capture literally
+/// witnessed the session, so every memory it produces is an `Observed`
+/// claim citing that session. With no session id there is nothing to
+/// cite, so the claim falls back to `Interpreted` (citation-less).
+pub fn stamp_auto_capture_evidence(memory: &mut ijima_core::Memory) {
+    use ijima_core::memory::{Citation, CitationKind, EvidenceGrade};
+    match memory.session_id.clone() {
+        Some(session_id) => {
+            memory.evidence = EvidenceGrade::Observed;
+            memory.citations = vec![Citation {
+                kind: CitationKind::Session,
+                locator: session_id,
+            }];
+        }
+        None => {
+            memory.evidence = EvidenceGrade::Interpreted;
+            memory.citations = Vec::new();
+        }
+    }
+}
+
 impl IntoResponse for AuthRejection {
     fn into_response(self) -> axum::response::Response {
         match self {
@@ -150,5 +171,45 @@ mod tests {
             .await
             .expect_err("must reject");
         assert_eq!(err.into_response().status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn autocapture_stamps_observed_with_session_citation() {
+        use ijima_core::harness::Harness;
+        use ijima_core::memory::{CitationKind, EvidenceGrade, MemorySource};
+        use ijima_core::{AuthorityScope, InstanceId, Memory, MemoryId};
+
+        // A fixture transcript exchange: each captured turn becomes an
+        // AutoCapture memory carrying the originating session id.
+        let session = "sess_fixture_7";
+        let fixture = |id: &str, content: &str| Memory {
+            id: MemoryId(id.into()),
+            content: content.into(),
+            project: "ijima".into(),
+            topic: "general".into(),
+            source: MemorySource::AutoCapture,
+            harness: Harness::Pi,
+            session_id: Some(session.into()),
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
+            importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            created_at: "0".into(),
+        };
+        let mut produced = vec![
+            fixture("mem_cap_1", "> q1\n\na1"),
+            fixture("mem_cap_2", "> q2\n\na2"),
+        ];
+        for memory in &mut produced {
+            stamp_auto_capture_evidence(memory);
+        }
+
+        for memory in &produced {
+            assert_eq!(memory.evidence, EvidenceGrade::Observed);
+            assert_eq!(memory.citations.len(), 1);
+            assert_eq!(memory.citations[0].kind, CitationKind::Session);
+            assert_eq!(memory.citations[0].locator, session);
+        }
     }
 }

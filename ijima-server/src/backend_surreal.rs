@@ -32,7 +32,10 @@ use ijima_core::{
     IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
     NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room,
     SearchHit, Session, SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel,
-    TunnelTraversal, embeddings::Embedder, harness::Harness, memory::MemorySource,
+    TunnelTraversal,
+    embeddings::Embedder,
+    harness::Harness,
+    memory::{Citation, EvidenceGrade, MemorySource},
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
@@ -312,6 +315,14 @@ struct MemoryRecord {
     namespace: String,
     #[serde(default = "default_record_importance")]
     importance: f32,
+    /// Evidence grade (direction D). `#[serde(default)]` so legacy rows
+    /// (persisted before the field existed) deserialize as `Interpreted`.
+    #[serde(default)]
+    evidence: EvidenceGrade,
+    /// Citations grounding an `Observed` grade. `#[serde(default)]` so
+    /// legacy rows deserialize with no citations.
+    #[serde(default)]
+    citations: Vec<Citation>,
     #[serde(default)]
     created_at: String,
     /// Provenance: the authoring instance (ADR provenance-tier). Defaults
@@ -358,6 +369,8 @@ impl MemoryRecord {
             session_id: memory.session_id.clone(),
             namespace: ns.as_str().to_string(),
             importance: memory.importance,
+            evidence: memory.evidence,
+            citations: memory.citations.clone(),
             created_at: memory.created_at.clone(),
             origin: memory.origin.clone(),
             authority: memory.authority.clone(),
@@ -378,6 +391,8 @@ impl MemoryRecord {
             origin: self.origin,
             authority: self.authority,
             importance: self.importance,
+            evidence: self.evidence,
+            citations: self.citations,
             created_at: self.created_at,
         }
     }
@@ -523,6 +538,8 @@ impl QueueRecord {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: self.importance,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
             created_at: String::new(),
         };
         QueuedExtraction {
@@ -546,6 +563,8 @@ impl QueueRecord {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: self.importance,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
             created_at: String::new(),
         }
     }
@@ -1616,6 +1635,8 @@ mod tests {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
             created_at: "0".into(),
         }
     }
@@ -1720,6 +1741,8 @@ mod tests {
             origin: ijima_core::InstanceId::local(),
             authority: ijima_core::AuthorityScope::local(),
             importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
             created_at,
         };
         // Old chatter in two namespaces (both must go) …
@@ -2420,6 +2443,8 @@ mod tests {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
             created_at: "0".into(),
         }
     }

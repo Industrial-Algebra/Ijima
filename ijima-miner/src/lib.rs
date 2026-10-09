@@ -215,6 +215,8 @@ mod tests {
                 origin: InstanceId::local(),
                 authority: AuthorityScope::local(),
                 importance: 0.5,
+                evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                citations: Vec::new(),
                 created_at: "0".into(),
             }
         }

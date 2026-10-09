@@ -438,6 +438,14 @@ async fn store_memory(
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default();
     }
+    // Auto-capture witnessed the session — stamp Observed + Session citation.
+    if memory.source == MemorySource::AutoCapture {
+        crate::extractor::stamp_auto_capture_evidence(&mut memory);
+    }
+    // Direction D: observed claims cite or they do not ship.
+    if let Err(msg) = memory.validate_evidence() {
+        return Err(ApiError::BadRequest(msg));
+    }
     let id = store.store_memory(&ns, memory).await.map_err(internal)?;
     Ok(Json(IdResponse { id: id.0 }))
 }
@@ -673,6 +681,11 @@ async fn promote_memory(
         origin: memory.origin.clone(),
         authority: memory.authority.clone(),
         importance: memory.importance,
+        // Promotion copies curated content, not just text — the evidence
+        // grade and its citations travel with it (a promoted observation
+        // stays observed; verify-pass fix).
+        evidence: memory.evidence,
+        citations: memory.citations.clone(),
         created_at: memory.created_at.clone(),
     };
     let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
@@ -790,6 +803,8 @@ async fn ingest_doctrine(
         origin: ijima_core::InstanceId::local(),
         authority: ijima_core::AuthorityScope::local(),
         importance: 1.0,
+        evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+        citations: Vec::new(),
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
@@ -2956,6 +2971,8 @@ mod tests {
                             origin: ijima_core::InstanceId::local(),
                             authority: ijima_core::AuthorityScope::local(),
                             importance: 0.5,
+                            evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                            citations: Vec::new(),
                             created_at: "0".into(),
                         },
                     )
@@ -3155,6 +3172,8 @@ mod tests {
                 origin: ijima_core::InstanceId::local(),
                 authority: ijima_core::AuthorityScope::local(),
                 importance: 0.5,
+                evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                citations: Vec::new(),
                 created_at: "0".into(),
             })
             .collect();
@@ -3804,6 +3823,8 @@ mod tests {
                 origin: ijima_core::InstanceId::local(),
                 authority: ijima_core::AuthorityScope::local(),
                 importance: 0.5,
+                evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                citations: Vec::new(),
                 created_at: "0".into(),
             },
             similarity: sim,
@@ -4049,6 +4070,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn store_memory_rejects_observed_without_citations() {
+        let (app, auth) = app_with_store().await;
+        let body = |citations: serde_json::Value| {
+            serde_json::json!({
+                "id": "mem_obs",
+                "content": "observed but uncited",
+                "project": "ijima",
+                "topic": "evidence",
+                "source": "Explicit",
+                "harness": "Pi",
+                "session_id": "sess_1",
+                "importance": 0.5,
+                "created_at": "0",
+                "evidence": "Observed",
+                "citations": citations,
+            })
+            .to_string()
+        };
+
+        // Observed with no citation → 400 naming the missing citation.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body(serde_json::json!([]))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = String::from_utf8(
+            axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("cites nothing"), "body: {text}");
+
+        // Same body with one citation → 200.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories")
+                    .header("authorization", bearer(&auth, "elliott", MEMORY_WRITE))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body(
+                        serde_json::json!([{ "kind": "Commit", "locator": "abc123" }]),
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

@@ -59,10 +59,84 @@ pub struct Memory {
     /// question.) Defaults to 0.5, matching pi-mempalace.
     #[cfg_attr(feature = "serde", serde(default = "default_importance"))]
     pub importance: f32,
+    /// Evidence grade (direction D). Defaults to `Interpreted` — legacy
+    /// rows and ungraded saves are interpretations, never observed fact.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub evidence: EvidenceGrade,
+    /// Citations grounding an `Observed` grade. Validated non-empty at
+    /// save time (see [`Memory::validate_evidence`]); meaningless (and
+    /// typically empty) for `Interpreted`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub citations: Vec<Citation>,
     /// Creation timestamp. v0: Unix epoch seconds as a string (monotonic
     /// for DESC ordering). Future: ISO-8601 when a time crate lands.
     #[cfg_attr(feature = "serde", serde(default))]
     pub created_at: String,
+}
+
+/// Evidence grade (direction D, v0.4.0): is this content a claim the
+/// authoring process directly observed, or an interpretation it formed?
+/// Composes with the provenance tiers — the grade crosses tier lines
+/// (an explicit save can still be an interpretation), so it is its own
+/// axis. Defaults to `Interpreted`: ungraded and legacy rows are the
+/// weaker claim, never masquerading as observed fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum EvidenceGrade {
+    /// Directly observed behavior/event: the authoring process witnessed
+    /// the thing itself (a session transcript event, a command output, a
+    /// git artifact). Requires at least one [`Citation`].
+    Observed,
+    /// An interpretation, inference, claim, or summary formed about
+    /// artifacts or events. No citation requirement — attribution is the
+    /// grade itself.
+    #[default]
+    Interpreted,
+}
+
+/// A typed pointer to the artifact that grounds an [`EvidenceGrade::Observed`]
+/// memory. "No citation, no candidate" — observed claims cite or they do
+/// not ship.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Citation {
+    /// What kind of artifact the locator points at.
+    pub kind: CitationKind,
+    /// Opaque locator: commit sha, report path, session id, file path, URL.
+    pub locator: String,
+}
+
+/// The artifact kinds Ijima knows how to cite (v0.4.0 set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CitationKind {
+    /// A git commit sha.
+    Commit,
+    /// A path (or id) into the report corpus.
+    Report,
+    /// An Ijima session id.
+    Session,
+    /// A file path.
+    File,
+    /// A URL.
+    Url,
+}
+
+impl Memory {
+    /// Direction D invariant: an `Observed` memory must carry at least one
+    /// citation. Returns a human-readable error string (mapped to 400 at
+    /// the API layer) when violated.
+    pub fn validate_evidence(&self) -> Result<(), String> {
+        if self.evidence == EvidenceGrade::Observed && self.citations.is_empty() {
+            Err(format!(
+                "memory {} claims EvidenceGrade::Observed but cites nothing — \
+                 observed claims require >= 1 citation",
+                self.id.0
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -128,6 +202,11 @@ mod tests {
             origin: InstanceId::local(),
             authority: AuthorityScope::local(),
             importance: 0.8,
+            evidence: EvidenceGrade::Observed,
+            citations: vec![Citation {
+                kind: CitationKind::Commit,
+                locator: "abc123".into(),
+            }],
             created_at: "123".into(),
         };
         assert_eq!(m.id.0, "mem_01");
@@ -136,6 +215,90 @@ mod tests {
         assert_eq!(m.importance, 0.8);
         assert_eq!(m.created_at, "123");
         assert_eq!(m.session_id.as_deref(), Some("sess_7"));
+        assert_eq!(m.evidence, EvidenceGrade::Observed);
+        assert_eq!(m.citations.len(), 1);
+    }
+
+    #[cfg(feature = "federation")]
+    #[test]
+    fn legacy_json_deserializes_as_interpreted() {
+        let m: Memory = serde_json::from_str(
+            r#"{"id":"mem_x","content":"c","project":"p","topic":"t","source":"Mined","harness":"Pi","importance":0.5,"created_at":"1"}"#,
+        )
+        .expect("legacy JSON must deserialize");
+        assert_eq!(m.evidence, EvidenceGrade::Interpreted);
+        assert!(m.citations.is_empty());
+    }
+
+    #[test]
+    fn validate_evidence_rejects_observed_without_citations() {
+        let m = Memory {
+            id: MemoryId("mem_uncited".into()),
+            content: "c".into(),
+            project: "p".into(),
+            topic: "t".into(),
+            source: MemorySource::Explicit,
+            harness: Harness::Pi,
+            session_id: None,
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
+            importance: 0.5,
+            evidence: EvidenceGrade::Observed,
+            citations: Vec::new(),
+            created_at: "1".into(),
+        };
+        let err = m.validate_evidence().expect_err("must reject");
+        assert!(err.contains("mem_uncited"), "error names the memory: {err}");
+    }
+
+    #[test]
+    fn validate_evidence_accepts_observed_with_citation() {
+        let m = Memory {
+            id: MemoryId("mem_cited".into()),
+            content: "c".into(),
+            project: "p".into(),
+            topic: "t".into(),
+            source: MemorySource::Explicit,
+            harness: Harness::Pi,
+            session_id: None,
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
+            importance: 0.5,
+            evidence: EvidenceGrade::Observed,
+            citations: vec![Citation {
+                kind: CitationKind::Commit,
+                locator: "abc123".into(),
+            }],
+            created_at: "1".into(),
+        };
+        assert!(m.validate_evidence().is_ok());
+    }
+
+    #[test]
+    fn validate_evidence_accepts_interpreted_without_citations() {
+        let m = Memory {
+            id: MemoryId("mem_interp".into()),
+            content: "c".into(),
+            project: "p".into(),
+            topic: "t".into(),
+            source: MemorySource::Mined,
+            harness: Harness::Pi,
+            session_id: None,
+            origin: InstanceId::local(),
+            authority: AuthorityScope::local(),
+            importance: 0.5,
+            evidence: EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            created_at: "1".into(),
+        };
+        assert!(m.validate_evidence().is_ok());
+    }
+
+    #[cfg(feature = "federation")]
+    #[test]
+    fn evidence_grade_serializes_pascalcase() {
+        let json = serde_json::to_string(&EvidenceGrade::Observed).expect("serialize");
+        assert_eq!(json, "\"Observed\"");
     }
 
     #[test]

@@ -992,6 +992,8 @@ mod tests {
                 origin: ijima_core::InstanceId::local(),
                 authority: ijima_core::AuthorityScope::local(),
                 importance: 0.5,
+                evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+                citations: Vec::new(),
                 created_at: String::new(),
             })
             .await
