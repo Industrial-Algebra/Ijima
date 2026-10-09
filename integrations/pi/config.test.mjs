@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 const mod = await import("./index.js");
-const { resolveProjectConfig, homeNamespace, withHome, resolveIjimaUrl } = mod;
+const { resolveProjectConfig, homeNamespace, withHome, resolveIjimaUrl, build_save_request } = mod;
 
 let pass = 0;
 let fail = 0;
@@ -112,6 +112,47 @@ try {
     else process.env[k] = v;
   }
 }
+
+// ---------------------------------------------------------------------------
+// memory_save body builder (v0.4.0 U5) — evidence / citations / supersedes
+// extras are forwarded ONLY when present.
+// ---------------------------------------------------------------------------
+
+// t9: no extras → none of the trust-machinery keys appear on the body.
+const bare = JSON.parse(build_save_request("mem_a", "c", "p", "t", 0.8));
+check(
+  "save body omits evidence keys when params absent",
+  !("evidence" in bare) && !("citations" in bare) && !("supersedes" in bare),
+);
+
+// t10: extras forwarded verbatim.
+const withExtras = JSON.parse(
+  build_save_request("mem_b", "c2", "p", "t", 0.8, {
+    evidence: "Observed",
+    citations: [{ kind: "Commit", locator: "abc" }],
+    supersedes: "mem_old",
+  }),
+);
+check(
+  "save body forwards evidence extras verbatim",
+  withExtras.evidence === "Observed" &&
+    Array.isArray(withExtras.citations) &&
+    withExtras.citations.length === 1 &&
+    withExtras.citations[0].kind === "Commit" &&
+    withExtras.citations[0].locator === "abc" &&
+    withExtras.supersedes === "mem_old",
+);
+
+// t11: Interpreted alone → evidence key present, citations key absent.
+const interpreted = JSON.parse(
+  build_save_request("mem_c", "c3", "p", "t", 0.8, {
+    evidence: "Interpreted",
+  }),
+);
+check(
+  "save body forwards interpreted without citations",
+  interpreted.evidence === "Interpreted" && !("citations" in interpreted),
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

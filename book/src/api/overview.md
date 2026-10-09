@@ -37,6 +37,8 @@ as deliberate, logged maintenance targets).
 | `POST` | `/namespaces/grant`, `/namespaces/revoke` | `admin` |
 | `GET` | `/namespaces/members?namespace=` | `admin` |
 | `POST` | `/doctrine[?namespace=]` | `admin` (global) or `doctrine:write` (wall-scoped) |
+| `GET` | `/doctrine/versions[?namespace=&id=]` | `memory:read` (wall) / `admin` or `doctrine:write` (global) — list archived revisions |
+| `POST` | `/doctrine/rollback[?namespace=]` | `admin` — re-activate an archived revision |
 | `GET` | `/export[?namespace=]` | `admin` (JSONL; x-export-count header) |
 | `GET` | `/federation/state`, routed-write, conflict-signal | `federation` feature |
 
