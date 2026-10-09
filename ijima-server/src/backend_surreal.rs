@@ -436,13 +436,13 @@ struct MemoryRecord {
     namespace: String,
     #[serde(default = "default_record_importance")]
     importance: f32,
-    /// Evidence grade (direction D). `#[serde(default)]` so legacy rows
-    /// (persisted before the field existed) deserialize as `Interpreted`.
-    #[serde(default)]
+    /// Evidence grade (direction D). `#[serde(default)]` handles
+    /// absence; `null_as_default` handles the projected-null a legacy
+    /// row yields under an explicit SELECT list.
+    #[serde(default, deserialize_with = "null_as_default")]
     evidence: EvidenceGrade,
-    /// Citations grounding an `Observed` grade. `#[serde(default)]` so
-    /// legacy rows deserialize with no citations.
-    #[serde(default)]
+    /// Citations grounding an `Observed` grade — same dual tolerance.
+    #[serde(default, deserialize_with = "null_as_default")]
     citations: Vec<Citation>,
     /// Correction link (v0.4.0): the id this memory replaces. Written at
     /// save time from the incoming [`Memory`].
@@ -485,6 +485,23 @@ struct MemoryRecord {
 
 fn default_record_importance() -> f32 {
     0.5
+}
+
+/// Deserializes a projected-null-or-absent field into the default.
+/// SurrealQL projections materialize EVERY selected column for every
+/// matched row: a pre-0.4 record lacking the column comes back as
+/// `null` (an "Option value" to serde), which `#[serde(default)]`
+/// alone does not absorb — only absence does. Production walls are
+/// full of legacy rows, so the ranked/list/search projections must
+/// read null as "field did not exist" (v0.4.1 hotfix: the v0.4.0
+/// projection fix broke wake-up on every mixed wall).
+fn null_as_default<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+where
+    T: serde::Deserialize<'de> + Default,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<T>::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 impl MemoryRecord {
@@ -3429,6 +3446,90 @@ mod tests {
             matches!(err, IjimaError::NotFound { .. }),
             "not-found class: {err:?}"
         );
+    }
+
+    // ---------- v0.4.1 hotfix: legacy-row projection compatibility ----------
+
+    #[test]
+    fn record_deserializes_legacy_absent_and_null_forms() {
+        let absent = r#"{"memory_id":"m1","content":"c","namespace":"n","project":"ijima","topic":"t","source":"Mined","harness":"Pi","importance":0.5}"#;
+        let rec: MemoryRecord = serde_json::from_str(absent).expect("absent fields default");
+        assert_eq!(rec.evidence, EvidenceGrade::Interpreted);
+        assert!(rec.citations.is_empty());
+
+        let nulled = r#"{"memory_id":"m1","content":"c","namespace":"n","project":"ijima","topic":"t","source":"Mined","harness":"Pi","importance":0.5,"evidence":null,"citations":null}"#;
+        let rec: MemoryRecord = serde_json::from_str(nulled).expect("nulls default too");
+        assert_eq!(rec.evidence, EvidenceGrade::Interpreted);
+        assert!(rec.citations.is_empty());
+
+        let present = r#"{"memory_id":"m1","content":"c","namespace":"n","project":"ijima","topic":"t","source":"Mined","harness":"Pi","importance":0.5,"evidence":"Observed","citations":[{"kind":"Commit","locator":"abc"}]}"#;
+        let rec: MemoryRecord = serde_json::from_str(present).expect("present fields");
+        assert_eq!(rec.evidence, EvidenceGrade::Observed);
+        assert_eq!(rec.citations.len(), 1);
+        assert_eq!(rec.citations[0].locator, "abc");
+    }
+
+    #[tokio::test]
+    async fn legacy_rows_survive_ranked_projections() {
+        // Seeds a genuinely pre-0.4-shaped row (SET-based raw insert: none
+        // of the 0.4 fields exist) and walks every projected read path
+        // that 500'd in production on mixed walls.
+        let store = fresh().await;
+        let ns = NamespaceId::new("ns_legacy_probe");
+        store
+            .db
+            .query(
+                "CREATE type::record($table, $key) SET
+                    memory_id = $mid, content = $content,
+                    content_hash = $hash, project = $project, topic = $topic,
+                    source = $source, harness = $harness, session_id = $sid,
+                    namespace = $namespace, importance = $importance,
+                    origin = $origin, authority = $authority,
+                    created_at = $created",
+            )
+            .bind(("table", MEMORIES_TABLE))
+            .bind(("key", "ns_legacy_probe_mem_legacy_1"))
+            .bind(("mid", "mem_legacy_1"))
+            .bind(("content", "written by the 0.3 daemon"))
+            .bind(("hash", "deadbeef"))
+            .bind(("project", "ijima"))
+            .bind(("topic", "legacy"))
+            .bind(("source", "AutoCapture"))
+            .bind(("harness", "Pi"))
+            .bind(("sid", "sess_old"))
+            .bind(("namespace", ns.as_str()))
+            .bind(("importance", 0.9f64))
+            .bind(("origin", "local"))
+            .bind(("authority", "local"))
+            .bind(("created", "1000"))
+            .await
+            .expect("raw legacy insert");
+
+        let listed = store
+            .list_memories(&ns, 10)
+            .await
+            .expect("list over legacy row");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].evidence, EvidenceGrade::Interpreted);
+        assert!(listed[0].citations.is_empty());
+
+        let recent = store
+            .recent_memories(&ns, 10)
+            .await
+            .expect("recent over legacy row");
+        assert_eq!(recent.len(), 1);
+
+        let by_topic = store
+            .project_topic_memories(&ns, "ijima", "legacy", 10)
+            .await
+            .expect("project-topic over legacy row");
+        assert_eq!(by_topic.len(), 1);
+
+        // Search needs an embedder (absent on the bare embedded store),
+        // but the projection still runs for any row carrying an
+        // embedding; a no-embedding legacy row simply never matches.
+        // The projection's null-tolerance is covered by the unit test
+        // above plus the three paths already exercised here.
     }
 }
 
