@@ -6078,4 +6078,35 @@ mod tests {
         .count();
         assert_eq!(live_count, 1, "one canonical: {a_row:?} / {b_row:?}");
     }
+    /// Round-6 breaker finding: a RETIRED holder does not satisfy an
+    /// ingest of its own content — the row is restored live with its
+    /// stable identity.
+    #[tokio::test]
+    async fn retired_holder_is_restored_not_satisfied() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "rh-a", "A").await;
+        post_doctrine(&app, &admin, uri, "rh-b", "B").await;
+        // Retire b: its id re-ingests a's live content → canonical a.
+        let r = post_doctrine(&app, &admin, uri, "rh-b", "A").await;
+        assert_eq!(r["id"], "rh-a");
+        let retired = recall_doctrine(&app, &admin, "rh-b").await;
+        assert_eq!(retired.superseded_by.as_deref(), Some("rh-a"));
+
+        // Re-assert B under the retired holder: must RESTORE b live at
+        // its stable identity — not no-op on the retired row.
+        let r = post_doctrine(&app, &admin, uri, "rh-b", "B").await;
+        assert_eq!(r["id"], "rh-b", "restored under its own id: {r}");
+        assert_eq!(r["revision"].as_u64(), Some(1), "stable identity restored");
+        let restored = recall_doctrine(&app, &admin, "rh-b").await;
+        assert!(restored.superseded_by.is_none(), "live again: {restored:?}");
+        assert_eq!(restored.content, "B");
+        assert_eq!(restored.revision, Some(1));
+        // a keeps its own live row.
+        let a_row = recall_doctrine(&app, &admin, "rh-a").await;
+        assert!(a_row.superseded_by.is_none());
+        assert_eq!(a_row.content, "A");
+    }
 }

@@ -1358,10 +1358,15 @@ impl Store for SurrealStore {
         let _guard = self.doctrine_lock.lock().await;
 
         // --- authoritative dedup (review round 5: R5-1, R5-3) ---
-        // Unchanged content at this id: no-op, keep the live revision.
+        // Unchanged content at this id, on a LIVE row: no-op, keep the
+        // revision. A RETIRED holder does not satisfy the ingest (round
+        // 6 breaker finding): it falls through to the normal path, which
+        // archives its body, restores its stable identity, and re-stores
+        // the row live — un-retiring it.
         let live = self.recall_memory(ns, &memory.id).await?;
         if let Some(live) = &live
             && live.content == memory.content
+            && live.superseded_by.is_none()
         {
             return Ok((memory.id.clone(), live.revision.unwrap_or(1)));
         }
