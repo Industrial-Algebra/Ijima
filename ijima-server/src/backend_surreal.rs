@@ -154,6 +154,66 @@ impl SurrealStore {
         })
     }
 
+    /// Archive a doc's OUTGOING body under the identity it went live
+    /// with (its live revision — or max+1 when it never carried one).
+    /// LOCK-FREE: callers hold the doctrine lock (prepare, activate).
+    /// Upsert semantics: a racing writer cannot collide on the create;
+    /// the hash check is an optimization, not the guard.
+    async fn archive_outgoing(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        live: &Option<Memory>,
+    ) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let Some(live) = live else { return Ok(()) };
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT version, content_hash FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct VersionRow {
+            version: u32,
+            content_hash: String,
+        }
+        let rows = take_vec::<VersionRow>(&mut result)?;
+        let out_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        if rows.iter().any(|r| r.content_hash == out_hash) {
+            return Ok(());
+        }
+        let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
+        let version = live.revision.unwrap_or(max_version + 1);
+        let archived_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        let record = DoctrineVersion {
+            doc_id: id.0.clone(),
+            version,
+            content: live.content.clone(),
+            content_hash: out_hash,
+            archived_at_unix,
+            active: false,
+        };
+        let wire = DoctrineVersionRecord::from_version(&record, ns);
+        let _: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
+            .db
+            .upsert((
+                DOCTRINE_VERSIONS_TABLE,
+                doctrine_version_key(ns, id, version),
+            ))
+            .content(surrealdb::types::SerdeWrapper(wire))
+            .await
+            .map_err(store_err)?;
+        Ok(())
+    }
+
     /// Active-flag write WITHOUT taking the doctrine lock — callers hold
     /// it. (tokio's Mutex is not reentrant; the round-2 first cut
     /// deadlocked here.)
@@ -1201,12 +1261,14 @@ impl Store for SurrealStore {
             .collect())
     }
 
-    async fn archive_doctrine_version(&self, ns: &NamespaceId, id: &MemoryId) -> Result<u32> {
+    async fn prepare_doctrine_ingest(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        new_content: &str,
+    ) -> Result<u32> {
         use sha2::{Digest, Sha256};
-        let live = self
-            .recall_memory(ns, id)
-            .await?
-            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        let _guard = self.doctrine_lock.lock().await;
         let mut result = self
             .db
             .query(format!(
@@ -1223,43 +1285,29 @@ impl Store for SurrealStore {
             content_hash: String,
         }
         let rows = take_vec::<VersionRow>(&mut result)?;
-        let content_hash = hex(&Sha256::digest(live.content.as_bytes()));
-        // Idempotent archive (review rounds 1-2): a body that was already
-        // archived — e.g. the live row restored by an earlier rollback —
-        // is NOT archived again. The RETURN value is the doc's current
-        // maximum version number either way, so callers derive the next
-        // revision as `ret + 1` without conflating archive identity with
-        // the revision counter (R2-1: A→B→rollback-A→C must be revision 3,
-        // not 2).
-        if rows.iter().any(|r| r.content_hash == content_hash) {
-            return Ok(rows.iter().map(|r| r.version).max().unwrap_or(0));
-        }
-        let version = rows.iter().map(|r| r.version).max().unwrap_or(0) + 1;
-        let archived_at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or_default();
-        let record = DoctrineVersion {
-            doc_id: id.0.clone(),
-            version,
-            content: live.content,
-            content_hash,
-            archived_at_unix,
-            active: false,
-        };
-        let wire = DoctrineVersionRecord::from_version(&record, ns);
-        let _: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
-            .db
-            .create((
-                DOCTRINE_VERSIONS_TABLE,
-                doctrine_version_key(ns, id, version),
-            ))
-            .content(surrealdb::types::SerdeWrapper(wire))
-            .await
-            .map_err(store_err)?;
-        Ok(version)
-    }
+        let max_version = rows.iter().map(|r| r.version).max().unwrap_or(0);
 
+        let live = self.recall_memory(ns, id).await?;
+        // Unchanged content: no transition, keep the live revision.
+        if let Some(live) = &live
+            && live.content == new_content
+        {
+            return Ok(live.revision.unwrap_or(1));
+        }
+
+        // Archive the OUTGOING body under the identity it went live with.
+        self.archive_outgoing(ns, id, &live).await?;
+
+        // Allocate the incoming body's revision. Stable identity
+        // (R3-1): a body this doc has already carried RESTORES its
+        // original number; a genuinely new body takes max-ever + 1.
+        let new_hash = hex(&Sha256::digest(new_content.as_bytes()));
+        if let Some(prior) = rows.iter().find(|r| r.content_hash == new_hash) {
+            return Ok(prior.version);
+        }
+        let live_rev = live.as_ref().and_then(|m| m.revision).unwrap_or(0);
+        Ok(max_version.max(live_rev) + 1)
+    }
     async fn list_doctrine_versions(
         &self,
         ns: &NamespaceId,
@@ -1348,11 +1396,13 @@ impl Store for SurrealStore {
             .await?
             .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
         // Preserve the OUTGOING body before the rewrite (review round 1,
-        // P1-3): rolling back from v2 to v1 archives v2, so re-advancing
-        // never loses it. Idempotent — an already-archived body is a
-        // no-op returning its existing version number.
+        // P1-3 + round 3): rolling back from v2 to v1 archives v2, so
+        // re-advancing never loses it. Direct call to the unlocked
+        // helper — the doctrine lock is already held here (calling the
+        // locked prepare would self-deadlock: tokio Mutex is not
+        // reentrant).
         if live.content != version.content {
-            self.archive_doctrine_version(ns, id).await?;
+            self.archive_outgoing(ns, id, &Some(live.clone())).await?;
         }
         live.content = version.content.clone();
         live.revision = Some(version.version);

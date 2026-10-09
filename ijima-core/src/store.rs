@@ -182,11 +182,21 @@ pub trait Store: Send + Sync {
         limit: usize,
     ) -> Result<Vec<SearchHit>>;
 
-    /// Archive the current body of a doctrine doc as an inactive version
-    /// row and return the version number assigned. Called by the ingest
-    /// path BEFORE overwriting a changed doctrine memory.
-    async fn archive_doctrine_version(&self, ns: &NamespaceId, id: &MemoryId) -> Result<u32> {
-        let _ = (ns, id);
+    /// The single doctrine-ingest transition (review round 3, R3-1/R3-2):
+    /// under the doctrine lock — archives the OUTGOING body if the content
+    /// changes, then allocates the incoming body's revision. Revision
+    /// numbers are STABLE BODY IDENTITIES: a returning body restores the
+    /// number it first went live with; a genuinely new body takes
+    /// max(ever-assigned) + 1. No number ever identifies two different
+    /// bodies. Returns the revision the incoming content should carry.
+    /// No-op (returns the live revision) when the content is unchanged.
+    async fn prepare_doctrine_ingest(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        new_content: &str,
+    ) -> Result<u32> {
+        let _ = (ns, id, new_content);
         Err(IjimaError::unsupported(
             "doctrine versioning requires the SurrealDB backend",
         ))

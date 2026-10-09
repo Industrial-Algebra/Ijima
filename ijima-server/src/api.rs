@@ -466,8 +466,9 @@ struct CheckDuplicateResponse {
 }
 
 /// Pre-check for content-hash dedup (`POST /memories/check`). Returns
-/// the existing memory id if identical content is already stored in the
-/// caller's (effective) namespace.
+/// the existing memory id if identical content is already stored LIVE
+/// (un-superseded) in the caller's (effective) namespace — retired
+/// rows' content does not block a save.
 async fn check_duplicate(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
@@ -478,8 +479,12 @@ async fn check_duplicate(
         return Err(ApiError::Forbidden);
     }
     let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+    // Live rows only (review round 3, R3-3): the endpoint is a save
+    // preflight — a RETIRED row's content no longer blocks a fresh save,
+    // and reporting it as the duplicate made the shipped importer skip
+    // valid saves.
     let dup = store
-        .check_duplicate(&ns, &req.content)
+        .check_duplicate_live(&ns, &req.content)
         .await
         .map_err(internal)?;
     Ok(Json(CheckDuplicateResponse {
@@ -878,19 +883,13 @@ async fn ingest_doctrine(
             warnings: Vec::new(),
         }));
     }
-    // Archive the prior body and bump the revision when this id already
-    // exists with different content; first ingest starts at revision 1.
-    let revision = match &existing {
-        Some(row) if row.content != req.content => {
-            let v = store
-                .archive_doctrine_version(&ns, &MemoryId(row.id.0.clone()))
-                .await
-                .map_err(internal)?;
-            v + 1
-        }
-        Some(row) => row.revision.unwrap_or(1),
-        None => 1,
-    };
+    // The single locked ingest transition (review round 3): archives the
+    // outgoing body and allocates the incoming revision — stable body
+    // identities, no archive/create races with rollback.
+    let revision = store
+        .prepare_doctrine_ingest(&ns, &MemoryId(req.id.clone()), &req.content)
+        .await
+        .map_err(internal)?;
     let warnings = crate::doctrine::stance_warnings(&req.content, prior_body.as_deref());
     // Re-store the live row. `store_memory` dedups + creates, so any stale
     // row is removed first — the version archive already preserved it.
@@ -5620,5 +5619,157 @@ mod tests {
             StatusCode::NOT_FOUND,
             "loser compensated away"
         );
+    }
+    /// R3-1: revision numbers are stable body identities — no number
+    /// ever identifies two different bodies (A→B→A→C→D ⇒ 1,2,1,3,4).
+    #[tokio::test]
+    async fn revision_identities_are_stable() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        let seq = [
+            ("body A", 1u64),
+            ("body B", 2),
+            ("body A", 1), // returning body restores its identity
+            ("body C", 3),
+            ("body D", 4),
+        ];
+        for (body, expect_rev) in seq {
+            let r = post_doctrine(&app, &admin, uri, "doc-ident", body).await;
+            assert_eq!(
+                r["revision"].as_u64(),
+                Some(expect_rev),
+                "body {body:?} must be revision {expect_rev}: {r}"
+            );
+        }
+        // Archive identities stay 1:1 with bodies.
+        let versions = list_versions(&app, &admin, "doc-ident").await;
+        let mut seen: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+        for v in &versions {
+            let prev = seen.insert(v.version, v.content_hash.clone());
+            assert!(
+                prev.is_none() || prev.as_deref() == Some(v.content_hash.as_str()),
+                "version {} identifies two bodies: {versions:?}",
+                v.version
+            );
+        }
+    }
+
+    /// R3-2: rollback racing an ingest of the same doc — both succeed,
+    /// no archive-creation collision, final state self-consistent.
+    #[tokio::test]
+    async fn rollback_ingest_race_no_collision() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+        post_doctrine(&app, &admin, uri, "doc-race", "r1").await;
+        post_doctrine(&app, &admin, uri, "doc-race", "r2").await;
+
+        let rollback = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/doctrine/rollback")
+                .header("authorization", admin.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"id": "doc-race", "to": 1}).to_string(),
+                ))
+                .unwrap(),
+        );
+        let ingest = app.clone().oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("authorization", admin.clone())
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "id": "doc-race", "content": "r3", "project": "ijima", "topic": "arch"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        );
+        let (rr, ri) = tokio::join!(rollback, ingest);
+        assert_eq!(rr.expect("rollback req").status(), StatusCode::OK);
+        assert_eq!(
+            ri.expect("ingest req").status(),
+            StatusCode::OK,
+            "ingest must not 500 on an archive collision"
+        );
+
+        // Final state: live is whichever landed last; actives tell the
+        // truth about it; both bodies are recoverable.
+        let live = recall_doctrine(&app, &admin, "doc-race").await;
+        assert!(
+            live.content == "r1" || live.content == "r3",
+            "live is one of the two racers: {live:?}"
+        );
+        let versions = list_versions(&app, &admin, "doc-race").await;
+        let actives = versions.iter().filter(|v| v.active).count();
+        assert!(actives <= 1, "at most one active: {versions:?}");
+        for v in &versions {
+            if v.active {
+                let matches_live = v.content == live.content;
+                assert!(matches_live, "active must match live: {v:?} vs {live:?}");
+            }
+        }
+    }
+
+    /// R3-3: the check endpoint is a save preflight — retired duplicates
+    /// do not block; the same content saves fresh.
+    #[tokio::test]
+    async fn check_endpoint_ignores_retired_duplicates() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+
+        let old = full_mem("mem_ck_old", "old body", "0");
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &old))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let mut new = full_mem("mem_ck_new", "new body", "1");
+        new["supersedes"] = "mem_ck_old".into();
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &new))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Preflight the retired content: no live duplicate.
+        let res = app
+            .clone()
+            .oneshot(post_json(
+                "/memories/check",
+                &write,
+                &serde_json::json!({"content": "old body"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            body["duplicate"],
+            serde_json::Value::Null,
+            "retired is not a blocker: {body}"
+        );
+
+        // And the save the preflight promises: succeeds under a fresh id.
+        let fresh = full_mem("mem_ck_fresh", "old body", "2");
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &fresh))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 }
