@@ -28,7 +28,7 @@ re-implement memory logic.
 
 ## Status
 
-**v0.4.0 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
+**v0.4.1 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
 the pi extension on npm ([`@industrialalgebra/ijima-pi`](https://www.npmjs.com/package/@industrialalgebra/ijima-pi)).
 In production as a fleet's central memory service since August 2026
 (six-week soak reviewed 2026-09-21: error-free since 08-21, hourly mirror,
@@ -36,7 +36,9 @@ weekly restore drills). **0.4.0 is the trust machinery**: evidence grades
 (Observed claims cite or they don't ship), supersede links (corrections
 displace their targets — the ritual became a mechanism), doctrine
 versioning with stable revision identities and one-command rollback, and
-stratified wake-up (the starvation fix). See [`CHANGELOG.md`](CHANGELOG.md)
+stratified wake-up (the starvation fix). 0.4.1 is the legacy-row hotfix:
+ranked reads tolerate pre-0.4 records under the new projections. See
+[`CHANGELOG.md`](CHANGELOG.md)
 and [`docs/ROADMAP.md`](docs/ROADMAP.md). The decision log lives in
 [`docs/DESIGN.md`](docs/DESIGN.md) (D1–D11) and [`docs/adr/`](docs/adr/);
 0.5 design inputs (the dreamer, the rank fork, retrieval dynamics) in
