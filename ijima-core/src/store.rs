@@ -153,6 +153,19 @@ pub trait Store: Send + Sync {
     /// view). Powers `GET /status`.
     async fn store_stats(&self) -> Result<StoreStats>;
 
+    /// Content-hash dedup restricted to LIVE rows (`superseded_by`
+    /// unset) — retired duplicates are never canonical (review round 2,
+    /// R2-4: re-ingesting a retired body must not resolve to its retired
+    /// holder and form a supersede cycle). Default delegates to
+    /// [`Store::check_duplicate`] for non-Surreal implementers.
+    async fn check_duplicate_live(
+        &self,
+        ns: &NamespaceId,
+        content: &str,
+    ) -> Result<Option<MemoryId>> {
+        self.check_duplicate(ns, content).await
+    }
+
     /// Checks whether a memory with identical content already exists in
     /// `ns` (content-hash dedup). Returns the existing [`MemoryId`] if so.
     async fn check_duplicate(&self, ns: &NamespaceId, content: &str) -> Result<Option<MemoryId>>;

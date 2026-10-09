@@ -842,7 +842,7 @@ async fn ingest_doctrine(
     // instead of failing. Re-ingesting identical content is a no-op
     // (same id, same revision, no new archive).
     if let Some(existing_id) = store
-        .check_duplicate(&ns, &req.content)
+        .check_duplicate_live(&ns, &req.content)
         .await
         .map_err(internal)?
     {
@@ -5454,6 +5454,9 @@ mod tests {
         assert!(actives <= 1, "at most one active: {versions:?}");
         let live = recall_doctrine(&app, &admin, "doc-r1").await;
         assert_eq!(live.content, "v3");
+        // R2-1: C is the doc's THIRD distinct body — revision 3, not 2
+        // (archive identity must not be conflated with the counter).
+        assert_eq!(live.revision, Some(3), "third body, third revision");
     }
 
     /// P1-4: cross-id byte-identical ingest reports the CANONICAL id and
@@ -5524,6 +5527,98 @@ mod tests {
             Some(15),
             "all eligible rows return: {}",
             body
+        );
+    }
+    /// R2-4: re-ingesting a RETIRED body must not resolve the dedup to
+    /// the retired holder — that formed canonical↔stale supersede cycles
+    /// that hid both rows.
+    #[tokio::test]
+    async fn reingesting_retired_body_forms_no_cycle() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-cyc-a", "body X").await;
+        post_doctrine(&app, &admin, uri, "doc-cyc-b", "body Y").await;
+        // Retire A: its id now re-ingests B's current content → canonical.
+        let r = post_doctrine(&app, &admin, uri, "doc-cyc-a", "body Y").await;
+        assert_eq!(r["id"], "doc-cyc-b");
+        let retired = recall_doctrine(&app, &admin, "doc-cyc-a").await;
+        assert_eq!(retired.superseded_by.as_deref(), Some("doc-cyc-b"));
+
+        // The cycle attempt: re-ingest the RETIRED body (X) under B.
+        // The retired holder (A) must not be canonical — a fresh body
+        // lands under B instead, and neither row points at the other.
+        let r = post_doctrine(&app, &admin, uri, "doc-cyc-b", "body X").await;
+        assert_eq!(r["id"], "doc-cyc-b", "no retired canonical: {r}");
+        let b_row = recall_doctrine(&app, &admin, "doc-cyc-b").await;
+        assert!(b_row.superseded_by.is_none(), "B not superseded: {b_row:?}");
+        assert_eq!(b_row.content, "body X");
+        let a_row = recall_doctrine(&app, &admin, "doc-cyc-a").await;
+        assert_eq!(
+            a_row.superseded_by.as_deref(),
+            Some("doc-cyc-b"),
+            "A still retired, no cycle"
+        );
+    }
+
+    /// R2-2: concurrent successors of one target — exactly one claim
+    /// wins; the loser is rejected and compensated away.
+    #[tokio::test]
+    async fn concurrent_supersedes_exactly_one_claim_wins() {
+        let (app, auth) = app_with_store().await;
+        let write = bearer(&auth, "ci", MEMORY_WRITE);
+        let a = full_mem("mem_cc_a", "target claim", "0");
+        let res = app
+            .clone()
+            .oneshot(post_json("/memories", &write, &a))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mut b = full_mem("mem_cc_b", "successor one", "1");
+        b["supersedes"] = "mem_cc_a".into();
+        let mut c = full_mem("mem_cc_c", "successor two", "2");
+        c["supersedes"] = "mem_cc_a".into();
+        let (rb, rc) = tokio::join!(
+            app.clone().oneshot(post_json("/memories", &write, &b)),
+            app.clone().oneshot(post_json("/memories", &write, &c)),
+        );
+        let statuses = [
+            rb.expect("b request").status(),
+            rc.expect("c request").status(),
+        ];
+        let oks = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+        assert_eq!(oks, 1, "exactly one successor wins: {statuses:?}");
+
+        let target: Memory = get_mem(&app, &write, "mem_cc_a").await;
+        let winner = if statuses[0] == StatusCode::OK {
+            "mem_cc_b"
+        } else {
+            "mem_cc_c"
+        };
+        assert_eq!(target.superseded_by.as_deref(), Some(winner));
+        // The loser stored nothing (compensated).
+        let loser = if statuses[0] == StatusCode::OK {
+            "mem_cc_c"
+        } else {
+            "mem_cc_b"
+        };
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/memories/{loser}"))
+                    .header("authorization", write.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "loser compensated away"
         );
     }
 }

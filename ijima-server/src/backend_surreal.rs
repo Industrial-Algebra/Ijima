@@ -68,6 +68,12 @@ pub struct SurrealStore {
     /// [`Store::search_memories`] is available. When absent, search
     /// returns [`IjimaError::Store`].
     embedder: Option<Arc<dyn Embedder>>,
+    /// Serializes doctrine mutations (rollback/active-recompute) within
+    /// this process (review round 2, R2-3): concurrent rollbacks must not
+    /// interleave live-rewrite with active-flag recomputation. The daemon
+    /// is single-process; cross-process serialization is federation's
+    /// problem, not 0.4's.
+    doctrine_lock: tokio::sync::Mutex<()>,
 }
 
 impl SurrealStore {
@@ -141,7 +147,39 @@ impl SurrealStore {
             .map_err(|e| IjimaError::Store {
                 detail: format!("surrealdb define indexes: {e}"),
             })?;
-        Ok(Self { db, embedder })
+        Ok(Self {
+            doctrine_lock: tokio::sync::Mutex::new(()),
+            db,
+            embedder,
+        })
+    }
+
+    /// Active-flag write WITHOUT taking the doctrine lock — callers hold
+    /// it. (tokio's Mutex is not reentrant; the round-2 first cut
+    /// deadlocked here.)
+    async fn set_active_flags(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        live_hash: &str,
+    ) -> Result<()> {
+        // `active` is truthful by construction: exactly the archived
+        // version whose body matches the live row — none, when the live
+        // body has never been superseded by a later ingest (review
+        // round 1, P1-3).
+        let _ = self
+            .db
+            .query(format!(
+                "UPDATE {DOCTRINE_VERSIONS_TABLE}
+                 SET active = (content_hash == $hash)
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("hash", live_hash.to_string()))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        Ok(())
     }
 
     /// The `DEFINE INDEX` statements run at store open. Covers the columns
@@ -702,7 +740,10 @@ impl Store for SurrealStore {
     async fn store_memory(&self, ns: &NamespaceId, memory: Memory) -> Result<MemoryId> {
         // Content-hash dedup (Phase 2.2): reject exact duplicates within
         // the namespace, returning the existing id so callers can recover.
-        if let Some(existing) = self.check_duplicate(ns, &memory.content).await? {
+        // LIVE rows only (review round 2, R2-4): a retired row's content
+        // must not block re-saving that content elsewhere — retirement
+        // moved its canonical on.
+        if let Some(existing) = self.check_duplicate_live(ns, &memory.content).await? {
             return Err(IjimaError::duplicate(format!(
                 "content already stored as {}",
                 existing.0
@@ -742,34 +783,58 @@ impl Store for SurrealStore {
                 if target_id == &memory.id.0 {
                     return Err(IjimaError::duplicate("memory cannot supersede itself"));
                 }
-                let target_key = (MEMORIES_TABLE, memory_key(ns, &MemoryId(target_id.clone())));
-                let existing: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> =
-                    self.db.select(target_key.clone()).await.map_err(store_err)?;
-                let Some(existing) = existing else {
-                    return Err(IjimaError::not_found(format!(
-                        "supersede target {} not found in this namespace",
-                        target_id
-                    )));
-                };
-                let mut target = existing.0;
-                if let Some(by) = &target.superseded_by {
-                    return Err(IjimaError::duplicate(format!(
-                        "supersede target {} is already superseded (by {}) — supersede the successor instead",
-                        target_id, by
-                    )));
-                }
+                // Atomic claim (review round 2, R2-2): the inverse link is
+                // taken with a conditional UPDATE — only a target that is
+                // still unclaimed (`superseded_by = NONE`) can be linked,
+                // so concurrent successors cannot both win. The claim
+                // fails the same way whether the target vanished or was
+                // claimed between insert and link.
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or_default();
-                target.superseded_by = Some(memory.id.0.clone());
-                target.superseded_at_unix = Some(now);
-                let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+                let mut claimed = self
                     .db
-                    .update(target_key)
-                    .content(surrealdb::types::SerdeWrapper(target))
+                    .query(
+                        "UPDATE type::table($table)
+                         SET superseded_by = $sid, superseded_at_unix = $now
+                         WHERE namespace = $ns AND memory_id = $tid AND superseded_by = NONE
+                         RETURN AFTER",
+                    )
+                    .bind(("table", MEMORIES_TABLE))
+                    .bind(("sid", memory.id.0.clone()))
+                    .bind(("now", now))
+                    .bind(("ns", ns.as_str().to_string()))
+                    .bind(("tid", target_id.clone()))
                     .await
                     .map_err(store_err)?;
+                #[derive(serde::Serialize, Deserialize)]
+                struct ClaimedRow {
+                    superseded_by: Option<String>,
+                }
+                let rows = take_vec::<ClaimedRow>(&mut claimed)?;
+                let Some(row) = rows.into_iter().next() else {
+                    // Nothing claimed: the target is absent in this
+                    // namespace, or already superseded. Distinguish for
+                    // the error message.
+                    let exists: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+                        .db
+                        .select((MEMORIES_TABLE, memory_key(ns, &MemoryId(target_id.clone()))))
+                        .await
+                        .map_err(store_err)?;
+                    let Some(existing) = exists else {
+                        return Err(IjimaError::not_found(format!(
+                            "supersede target {} not found in this namespace",
+                            target_id
+                        )));
+                    };
+                    return Err(IjimaError::duplicate(format!(
+                        "supersede target {} is already superseded (by {}) — supersede the successor instead",
+                        target_id,
+                        existing.0.superseded_by.clone().unwrap_or_default()
+                    )));
+                };
+                let _ = row;
                 Ok(())
             }
             .await;
@@ -794,6 +859,32 @@ impl Store for SurrealStore {
             .query(format!(
                 "SELECT memory_id FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND content_hash = $hash LIMIT 1"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("hash", hash))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct IdRow {
+            memory_id: String,
+        }
+        let rows = take_vec::<IdRow>(&mut result)?;
+        Ok(rows.into_iter().next().map(|r| MemoryId(r.memory_id)))
+    }
+
+    async fn check_duplicate_live(
+        &self,
+        ns: &NamespaceId,
+        content: &str,
+    ) -> Result<Option<MemoryId>> {
+        use sha2::{Digest, Sha256};
+        let hash = hex(&Sha256::digest(content.as_bytes()));
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT memory_id FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns AND content_hash = $hash AND superseded_by = NONE
+                 LIMIT 1"
             ))
             .bind(("ns", ns.as_str().to_string()))
             .bind(("hash", hash))
@@ -1133,12 +1224,15 @@ impl Store for SurrealStore {
         }
         let rows = take_vec::<VersionRow>(&mut result)?;
         let content_hash = hex(&Sha256::digest(live.content.as_bytes()));
-        // Idempotent archive (review round 1, P1-3): a body that was
-        // already archived — e.g. the live row restored by an earlier
-        // rollback — must not be archived again under a fresh number;
-        // reuse the existing version identity.
-        if let Some(prior) = rows.iter().find(|r| r.content_hash == content_hash) {
-            return Ok(prior.version);
+        // Idempotent archive (review rounds 1-2): a body that was already
+        // archived — e.g. the live row restored by an earlier rollback —
+        // is NOT archived again. The RETURN value is the doc's current
+        // maximum version number either way, so callers derive the next
+        // revision as `ret + 1` without conflating archive identity with
+        // the revision counter (R2-1: A→B→rollback-A→C must be revision 3,
+        // not 2).
+        if rows.iter().any(|r| r.content_hash == content_hash) {
+            return Ok(rows.iter().map(|r| r.version).max().unwrap_or(0));
         }
         let version = rows.iter().map(|r| r.version).max().unwrap_or(0) + 1;
         let archived_at_unix = std::time::SystemTime::now()
@@ -1190,27 +1284,20 @@ impl Store for SurrealStore {
         &self,
         ns: &NamespaceId,
         id: &MemoryId,
-        live_content: &str,
+        _live_content: &str,
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
-        let live_hash = hex(&Sha256::digest(live_content.as_bytes()));
-        // `active` is truthful by construction: exactly the archived
-        // version whose body matches the live row — none, when the live
-        // body has never been superseded by a later ingest (review
-        // round 1, P1-3).
-        let _ = self
-            .db
-            .query(format!(
-                "UPDATE {DOCTRINE_VERSIONS_TABLE}
-                 SET active = (content_hash == $hash)
-                 WHERE namespace = $ns AND doc_id = $doc"
-            ))
-            .bind(("hash", live_hash))
-            .bind(("ns", ns.as_str().to_string()))
-            .bind(("doc", id.0.clone()))
-            .await
-            .map_err(store_err)?;
-        Ok(())
+        let _guard = self.doctrine_lock.lock().await;
+        // Self-consistent (review round 2, R2-3): recompute from the row
+        // that is ACTUALLY live now, under the doctrine lock — a racing
+        // ingest/rollback may have rewritten it since the caller formed
+        // its parameter.
+        let live = self
+            .recall_memory(ns, id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        let live_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        self.set_active_flags(ns, id, &live_hash).await
     }
 
     async fn mark_superseded(
@@ -1247,6 +1334,7 @@ impl Store for SurrealStore {
         id: &MemoryId,
         to: u32,
     ) -> Result<MemoryId> {
+        let _guard = self.doctrine_lock.lock().await;
         let version: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
             .db
             .select((DOCTRINE_VERSIONS_TABLE, doctrine_version_key(ns, id, to)))
@@ -1282,8 +1370,9 @@ impl Store for SurrealStore {
             .content(surrealdb::types::SerdeWrapper(record))
             .await
             .map_err(store_err)?;
-        self.mark_doctrine_active(ns, id, &live.content.clone())
-            .await?;
+        use sha2::{Digest, Sha256};
+        let live_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        self.set_active_flags(ns, id, &live_hash).await?;
         Ok(id.clone())
     }
 
