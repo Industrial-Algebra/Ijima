@@ -291,6 +291,14 @@ where
     Ok(wrapped.into_iter().map(|w| w.0).collect())
 }
 
+/// Maps `MemoryRecord` query results to domain [`Memory`] rows — the
+/// single row-mapping path shared by [`SurrealStore::list_memories`] and
+/// [`SurrealStore::recent_memories`].
+fn take_memories(result: &mut surrealdb::IndexedResults) -> Result<Vec<Memory>> {
+    let records = take_vec::<MemoryRecord>(result)?;
+    Ok(records.into_iter().map(|r| r.into_memory()).collect())
+}
+
 /// A `SELECT namespace` projection row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct NsOnly {
@@ -840,8 +848,23 @@ impl Store for SurrealStore {
             .bind(("lim", limit as i64))
             .await
             .map_err(store_err)?;
-        let records = take_vec::<MemoryRecord>(&mut result)?;
-        Ok(records.into_iter().map(|r| r.into_memory()).collect())
+        take_memories(&mut result)
+    }
+
+    async fn recent_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {MEMORIES_TABLE}
+                 WHERE namespace = $ns AND superseded_by = NONE
+                 ORDER BY created_at DESC
+                 LIMIT $lim"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("lim", limit as i64))
+            .await
+            .map_err(store_err)?;
+        take_memories(&mut result)
     }
 
     async fn export_memories(

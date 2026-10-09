@@ -115,6 +115,12 @@ pub trait Store: Send + Sync {
     /// essentials, L1b doctrine baseline).
     async fn list_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
 
+    /// Most-recent memories in a namespace (v0.4.0 stratified wake-up):
+    /// `created_at DESC`, superseded excluded, no importance gate — the
+    /// recency stratum guarantees fresh entries reach wake-up even when
+    /// the lexicographic top is saturated by high-importance rows.
+    async fn recent_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
     /// Lists memories in `ns`, optionally filtered to `project`/`topic`.
     /// Powers `GET /memories` (the `memory_recall` browse path — distinct
     /// from [`Self::list_memories`], which is the importance-ranked

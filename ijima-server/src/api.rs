@@ -958,6 +958,10 @@ async fn rollback_doctrine(
 
 /// How many personal essentials to include in a wake-up response.
 const WAKEUP_PERSONAL_LIMIT: usize = 20;
+/// The lexicographic stratum: top rows by importance-first ordering.
+const WAKEUP_TOP_STRATUM: usize = 12;
+/// The recency stratum: freshest rows regardless of importance.
+const WAKEUP_RECENT_STRATUM: usize = 8;
 /// How many doctrine entries to include.
 const WAKEUP_DOCTRINE_LIMIT: usize = 50;
 
@@ -965,7 +969,8 @@ const WAKEUP_DOCTRINE_LIMIT: usize = 50;
 struct WakeupResponse {
     /// L0: the authenticated principal's identity.
     identity: serde_json::Value,
-    /// L1a: the caller's personal essentials (top-N by importance + recency).
+    /// L1a: lexicographic top stratum + recency stratum (stratified v0.4.0
+    /// — see RABBIT_HOLE_2026-09-22_Ijima §1).
     personal_essentials: Vec<Memory>,
     /// L1b: the shared team doctrine baseline (identical across the team).
     doctrine: Vec<Memory>,
@@ -989,14 +994,31 @@ async fn wakeup(
     let essentials_ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
 
-    let (personal_essentials, doctrine) = tokio::join!(
-        store.list_memories(&essentials_ns, WAKEUP_PERSONAL_LIMIT),
+    let (top, recent, doctrine) = tokio::join!(
+        store.list_memories(&essentials_ns, WAKEUP_TOP_STRATUM),
+        store.recent_memories(&essentials_ns, WAKEUP_RECENT_STRATUM),
         store.list_memories(&doctrine_ns, WAKEUP_DOCTRINE_LIMIT),
     );
+    // Stratified composition: lexicographic top first, then the freshest
+    // rows not already selected (v0.4.0 starvation fix). Dedup by id —
+    // a row in both strata appears once, in the top.
+    let mut seen = std::collections::HashSet::new();
+    let mut personal_essentials = Vec::with_capacity(WAKEUP_PERSONAL_LIMIT);
+    for m in top.map_err(internal)? {
+        if seen.insert(m.id.0.clone()) {
+            personal_essentials.push(m);
+        }
+    }
+    for m in recent.map_err(internal)? {
+        if seen.insert(m.id.0.clone()) {
+            personal_essentials.push(m);
+        }
+    }
+    personal_essentials.truncate(WAKEUP_PERSONAL_LIMIT);
 
     Ok(Json(WakeupResponse {
         identity: serde_json::json!({ "principal": principal.0.principal.as_str() }),
-        personal_essentials: personal_essentials.map_err(internal)?,
+        personal_essentials,
         doctrine: doctrine.map_err(internal)?,
     }))
 }
@@ -3485,6 +3507,261 @@ mod tests {
         assert_eq!(body["doctrine"].as_array().unwrap().len(), 1);
         assert_eq!(body["doctrine"][0]["content"], "doctrine baseline");
         assert_eq!(body["doctrine"][0]["source"], "Doctrine");
+    }
+
+    /// Like [`app_with_store`] but also hands back the store handle so a
+    /// test can seed rows with precise `importance`/`created_at` values.
+    async fn app_with_store_handle() -> (Router, Arc<IjimaAuth>, Arc<dyn Store>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app(
+            auth.clone(),
+            store.clone(),
+            kg,
+            None,
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+        );
+        (app, auth, store)
+    }
+
+    /// A minimal explicitly-saved memory for stratified wake-up seeds.
+    fn seed_mem(id: &str, importance: f32, created_at: &str) -> Memory {
+        Memory {
+            id: MemoryId(id.into()),
+            content: format!("stratified wake-up seed {id}"),
+            project: "ijima".into(),
+            topic: "test".into(),
+            source: MemorySource::Explicit,
+            harness: Harness::Pi,
+            session_id: None,
+            origin: ijima_core::InstanceId::local(),
+            authority: ijima_core::AuthorityScope::local(),
+            importance,
+            evidence: ijima_core::memory::EvidenceGrade::Interpreted,
+            citations: Vec::new(),
+            supersedes: None,
+            superseded_by: None,
+            superseded_at_unix: None,
+            revision: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Drives `GET /wakeup` and returns the parsed response body.
+    async fn wakeup_body(app: Router, read: &str) -> serde_json::Value {
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The ordered ids in a wake-up `personal_essentials` array.
+    fn essential_ids(body: &serde_json::Value) -> Vec<String> {
+        body["personal_essentials"]
+            .as_array()
+            .expect("personal_essentials array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id").to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn wakeup_composes_both_strata() {
+        // 15 high-importance rows (old) + 5 fresh 0.5 rows. The top
+        // stratum (12) takes the 12 highest-importance rows; the recency
+        // stratum (8) brings in the 5 fresh rows plus 3 high-importance
+        // rows that fall below the top-12 cut. Result: exactly 20, and
+        // every fresh id is present.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        // 12 rows at 0.9 — the lexicographic top 12.
+        for i in 0..12 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(&format!("mem_top_{i:02}"), 0.9, &format!("{:04}", 1000 + i)),
+                )
+                .await
+                .expect("seed top");
+        }
+        // 3 rows at 0.8, newer than the top 12 — below the top-12 cut but
+        // inside the 8-freshest recency stratum.
+        let mut fresh_high = Vec::new();
+        for i in 0..3 {
+            let id = format!("mem_mid_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.8, &format!("{:04}", 2000 + i)))
+                .await
+                .expect("seed mid");
+            fresh_high.push(id);
+        }
+        // 5 rows at 0.5 with the newest timestamps — the starvation case.
+        let mut fresh_low = Vec::new();
+        for i in 0..5 {
+            let id = format!("mem_fresh_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.5, &format!("{:04}", 3000 + i)))
+                .await
+                .expect("seed fresh");
+            fresh_low.push(id);
+        }
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        assert_eq!(ids.len(), 20, "composed strata fill the budget: {ids:?}");
+        for id in &fresh_low {
+            assert!(ids.contains(id), "fresh 0.5 row {id} must reach wake-up");
+        }
+        for id in &fresh_high {
+            assert!(
+                ids.contains(id),
+                "mid row {id} must reach wake-up via recency"
+            );
+        }
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no duplicate ids: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn wakeup_recency_stratum_dedups() {
+        // 12 high-importance rows whose 3 newest also top the created_at
+        // ordering, so those 3 appear in both strata; 5 mid-age 0.5 rows
+        // fill the rest of the recency stratum. Dedup yields the union
+        // once each — no id twice.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        // 9 older high rows.
+        for i in 0..9 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(
+                        &format!("mem_high_old_{i:02}"),
+                        0.9,
+                        &format!("{:04}", 1000 + i),
+                    ),
+                )
+                .await
+                .expect("seed old high");
+        }
+        // 5 low rows in the middle of the age range.
+        let mut low = Vec::new();
+        for i in 0..5 {
+            let id = format!("mem_low_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.5, &format!("{:04}", 2000 + i)))
+                .await
+                .expect("seed low");
+            low.push(id);
+        }
+        // 3 newest rows, high importance — they appear in both strata.
+        let mut high_new = Vec::new();
+        for i in 0..3 {
+            let id = format!("mem_high_new_{i:02}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.9, &format!("{:04}", 3000 + i)))
+                .await
+                .expect("seed new high");
+            high_new.push(id);
+        }
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "no id twice: {ids:?}");
+        // Top stratum (12) = all 12 high rows. Recency stratum (8) = the 3
+        // newest high rows (already seen) + the 5 low rows.
+        assert_eq!(ids.len(), 17, "deduped union of the two strata: {ids:?}");
+        for id in &high_new {
+            assert!(
+                ids.contains(id),
+                "overlapping row {id} appears once, in the top"
+            );
+        }
+        for id in &low {
+            assert!(ids.contains(id), "recency-only row {id} must be present");
+        }
+    }
+
+    #[tokio::test]
+    async fn wakeup_recency_stratum_excludes_superseded() {
+        // A superseded memory carrying the newest timestamp must never
+        // enter wake-up — neither stratum admits superseded rows.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        store
+            .store_memory(&ns, seed_mem("mem_live", 0.9, "1000"))
+            .await
+            .expect("seed live");
+        store
+            .store_memory(&ns, seed_mem("mem_doomed", 0.9, "2000"))
+            .await
+            .expect("seed target");
+        let mut successor = seed_mem("mem_successor", 0.9, "3000");
+        successor.supersedes = Some("mem_doomed".into());
+        store
+            .store_memory(&ns, successor)
+            .await
+            .expect("seed successor");
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        assert!(
+            !ids.contains(&"mem_doomed".to_string()),
+            "superseded freshest row must be excluded: {ids:?}"
+        );
+        assert!(ids.contains(&"mem_successor".to_string()));
+    }
+
+    #[tokio::test]
+    async fn wakeup_underfull_wall_unchanged_behavior() {
+        // A wall with only 5 memories: both strata overlap fully, so the
+        // response is those 5 — no starvation, no invented slots.
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        let mut seeded = Vec::new();
+        for i in 0..5 {
+            let id = format!("mem_small_{i}");
+            store
+                .store_memory(&ns, seed_mem(&id, 0.5, &format!("{:04}", 1000 + i)))
+                .await
+                .expect("seed small wall");
+            seeded.push(id);
+        }
+
+        let body = wakeup_body(app, &read).await;
+        let ids = essential_ids(&body);
+        assert_eq!(ids.len(), 5, "underfull wall returns every row: {ids:?}");
+        for id in &seeded {
+            assert!(ids.contains(id), "row {id} must be present");
+        }
     }
 
     #[cfg(feature = "rate-limit")]
