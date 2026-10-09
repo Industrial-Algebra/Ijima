@@ -115,6 +115,7 @@ fn decision_memory(clause: &str, ctx: &MiningContext) -> Memory {
         supersedes: None,
         superseded_by: None,
         superseded_at_unix: None,
+        revision: None,
         created_at: ctx.now.clone(),
     }
 }
@@ -157,6 +158,7 @@ fn reference_memory(url: &str, ctx: &MiningContext) -> Memory {
         supersedes: None,
         superseded_by: None,
         superseded_at_unix: None,
+        revision: None,
         created_at: ctx.now.clone(),
     }
 }

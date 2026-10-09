@@ -997,6 +997,7 @@ mod tests {
                 supersedes: None,
                 superseded_by: None,
                 superseded_at_unix: None,
+                revision: None,
                 created_at: String::new(),
             })
             .await

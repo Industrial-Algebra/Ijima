@@ -198,6 +198,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "0".into(),
         };
         let mut produced = vec![

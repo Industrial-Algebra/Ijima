@@ -10,8 +10,8 @@
 use async_trait::async_trait;
 
 use crate::{
-    AcceptedExtraction, DiaryEntry, Embedding, Memory, MemoryId, NamespaceId, QueuedExtraction,
-    RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
+    AcceptedExtraction, DiaryEntry, Embedding, IjimaError, Memory, MemoryId, NamespaceId,
+    QueuedExtraction, RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
     harness::Harness,
     namespace::NamespaceMembership,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
@@ -48,6 +48,25 @@ pub struct NamespaceCount {
     pub namespace: String,
     /// Memories in that namespace.
     pub memories: usize,
+}
+
+/// An archived revision of a doctrine entry (direction B, v0.4.0).
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DoctrineVersion {
+    /// The doctrine doc id (memory id in the doctrine namespace).
+    pub doc_id: String,
+    /// 1-based revision number, monotonic per doc.
+    pub version: u32,
+    /// The archived body.
+    pub content: String,
+    /// SHA-256 hex of the body, for cheap diffing.
+    pub content_hash: String,
+    /// Unix seconds when this version was archived.
+    pub archived_at_unix: i64,
+    /// Is this the currently-active version? Exactly one is, after any
+    /// ingest or rollback; transiently none during the write itself.
+    pub active: bool,
 }
 
 /// The storage contract.
@@ -143,6 +162,42 @@ pub trait Store: Send + Sync {
         embedding: &Embedding,
         limit: usize,
     ) -> Result<Vec<SearchHit>>;
+
+    /// Archive the current body of a doctrine doc as an inactive version
+    /// row and return the version number assigned. Called by the ingest
+    /// path BEFORE overwriting a changed doctrine memory.
+    async fn archive_doctrine_version(&self, ns: &NamespaceId, id: &MemoryId) -> Result<u32> {
+        let _ = (ns, id);
+        Err(IjimaError::unsupported(
+            "doctrine versioning requires the SurrealDB backend",
+        ))
+    }
+
+    /// List archived versions of a doctrine doc, oldest first.
+    async fn list_doctrine_versions(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+    ) -> Result<Vec<DoctrineVersion>> {
+        let _ = (ns, id);
+        Ok(Vec::new())
+    }
+
+    /// Re-activate version `to` of a doctrine doc: rewrite the live
+    /// memory row's content from that version's body, set its `revision`
+    /// to that version's number, and mark that version active (all others
+    /// inactive). Returns the rewritten memory id.
+    async fn activate_doctrine_version(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        to: u32,
+    ) -> Result<MemoryId> {
+        let _ = (ns, id, to);
+        Err(IjimaError::unsupported(
+            "doctrine versioning requires the SurrealDB backend",
+        ))
+    }
 
     // ===== Palace organization (Phase 3.1 + 3.2) =====
 

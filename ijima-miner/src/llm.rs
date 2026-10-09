@@ -203,6 +203,7 @@ fn llm_memory(line: &LlmLine, ctx: &MiningContext) -> Memory {
         supersedes: None,
         superseded_by: None,
         superseded_at_unix: None,
+        revision: None,
         created_at: ctx.now.clone(),
     }
 }

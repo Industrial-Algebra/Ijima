@@ -111,6 +111,66 @@ pub fn read_doctrine_dir(dir: &Path) -> Result<Vec<(PathBuf, DoctrineEntry)>> {
     Ok(entries)
 }
 
+// ---------- stance scan (v0.4.0 U3, direction A) ----------
+
+/// A-slice ingest validation (direction A, v0.4.0): cheap static scan of
+/// a doctrine body for dose-dependent stance/persona directives — the
+/// poisoning signature from the 2026-09 incident. Advisory: warnings
+/// surface in the ingest response for the PR reviewer; doctrine remains
+/// PR-reviewed, never auto-blocked.
+pub fn stance_warnings(body: &str, prior_body: Option<&str>) -> Vec<String> {
+    const MARKERS: &[&str] = &[
+        "you must",
+        "you always",
+        "you never",
+        "you are",
+        "act as",
+        "adopt the persona",
+        "maintain the tone",
+        "embody",
+    ];
+
+    fn count_markers(text: &str) -> usize {
+        let lower = text.to_lowercase();
+        MARKERS.iter().map(|m| lower.match_indices(m).count()).sum()
+    }
+
+    let count = count_markers(body);
+    let chars = body.chars().count();
+    let density = if chars == 0 {
+        0.0
+    } else {
+        count as f64 / (chars as f64 / 1000.0)
+    };
+
+    let mut warnings = Vec::new();
+    // Dose-dependent stance directives: density per 1000 chars.
+    if density >= 5.0 {
+        warnings.push(format!(
+            "stance: stance-directive density {density:.1} per 1000 chars \
+             (>= 5 — the dose-dependent persona signature)"
+        ));
+    }
+    // Accretion across revisions: >= 50% growth and a materially large body.
+    if let Some(prior) = prior_body {
+        let prior_count = count_markers(prior);
+        if count as f64 >= prior_count as f64 * 1.5 && count >= 15 {
+            warnings.push(format!(
+                "stance: stance directives accreted across this revision \
+                 (prior {prior_count}, now {count})"
+            ));
+        }
+    }
+    // Length dose: a long body that is also stance-dense.
+    if chars > 12_000 && density >= 3.0 {
+        warnings.push(format!(
+            "stance: long, stance-dense body ({chars} chars, density {density:.1} per 1000) \
+             — the accretion pattern from the incident"
+        ));
+    }
+    warnings
+}
+
 // ---------- tree mode (v0.3.0 U2): markdown corpus trees ----------
 
 /// fnmatch-style glob against a posix relpath. `*` matches any run
@@ -556,6 +616,55 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn stance_scan_clean_prose_no_warnings() {
+        let body = "The storage layer persists memories in a table. ".repeat(70);
+        assert!(
+            body.chars().count() >= 3000,
+            "fixture is ~3000 chars: {}",
+            body.chars().count()
+        );
+        assert!(stance_warnings(&body, None).is_empty());
+    }
+
+    #[test]
+    fn stance_scan_dense_body_warns() {
+        let mut body = String::new();
+        for _ in 0..6 {
+            body.push_str("you must comply. ");
+        }
+        while body.len() < 1000 {
+            body.push('x');
+        }
+        let warnings = stance_warnings(&body, None);
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(warnings[0].contains("density"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn stance_scan_accretion_warns() {
+        let prior = "you must obey. ".repeat(10);
+        let new = "you must obey. ".repeat(16);
+        let warnings = stance_warnings(&new, Some(&prior));
+        let accretion = warnings
+            .iter()
+            .find(|w| w.contains("accret"))
+            .expect("accretion warning present");
+        assert!(accretion.contains("10"), "{accretion}");
+        assert!(accretion.contains("16"), "{accretion}");
+    }
+
+    #[test]
+    fn stance_scan_long_body_warns() {
+        let mut body = "you are useful. ".repeat(42);
+        while body.chars().count() < 13_000 {
+            body.push('x');
+        }
+        let warnings = stance_warnings(&body, None);
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(warnings[0].contains("long"), "{}", warnings[0]);
     }
 
     #[test]

@@ -42,12 +42,13 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "mining")]
 use ijima_core::capabilities::MINING_TRIGGER;
 use ijima_core::{
-    AcceptedExtraction, DiaryEntry, Embedder, EntityId, KnowledgeGraph, Memory, MemoryId,
-    NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Room,
-    SearchHit, Session, SessionId, SessionTurn, Store, TokenRevocation, TunnelTraversal,
+    AcceptedExtraction, DiaryEntry, DoctrineVersion, Embedder, EntityId, KnowledgeGraph, Memory,
+    MemoryId, NamespaceCount, NamespaceId, PalaceGraph, ProjectTaxon, QueuedExtraction,
+    RepoDirectory, Room, SearchHit, Session, SessionId, SessionTurn, Store, TokenRevocation,
+    TunnelTraversal,
     capabilities::{
-        ADMIN, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW, SESSION_INGEST,
-        TRUST_PROMOTE,
+        ADMIN, DOCTRINE_WRITE, KNOWLEDGE_READ, MEMORY_READ, MEMORY_WRITE, MINING_REVIEW,
+        SESSION_INGEST, TRUST_PROMOTE,
     },
     harness::Harness,
     memory::MemorySource,
@@ -99,6 +100,8 @@ pub fn app(
         .route("/namespaces/revoke", post(revoke_ns_membership))
         .route("/namespaces/members", get(list_ns_members))
         .route("/doctrine", post(ingest_doctrine))
+        .route("/doctrine/versions", get(list_doctrine_versions))
+        .route("/doctrine/rollback", post(rollback_doctrine))
         .route("/wakeup", get(wakeup))
         .route("/kg/triples", post(add_triple).get(find_triples))
         .route("/kg/entities/{id}", get(query_entity))
@@ -690,6 +693,7 @@ async fn promote_memory(
         supersedes: None,
         superseded_by: None,
         superseded_at_unix: None,
+        revision: memory.revision,
         created_at: memory.created_at.clone(),
     };
     let target_ns = ijima_core::NamespaceId::new(&req.target_namespace);
@@ -742,16 +746,64 @@ struct DoctrineRequest {
     topic: String,
 }
 
+/// Ingest response (v0.4.0 U3): the stored id, its doctrine revision, and
+/// any advisory stance-scan warnings for the PR reviewer.
+#[derive(Serialize)]
+struct DoctrineIngestResponse {
+    id: String,
+    revision: u32,
+    warnings: Vec<String>,
+}
+
+/// Query for a doctrine version read/rollback: optional namespace override
+/// plus the doc id.
+#[derive(Deserialize)]
+struct DoctrineDocQuery {
+    #[serde(default)]
+    namespace: Option<String>,
+    id: String,
+}
+
+/// Body for a doctrine rollback.
+#[derive(Deserialize)]
+struct DoctrineRollbackRequest {
+    id: String,
+    to: u32,
+}
+
+/// Resolves the namespace for a doctrine version read: the global wall
+/// (default, or explicit `ns_doctrine`) needs ADMIN or DOCTRINE_WRITE;
+/// any other wall needs MEMORY_READ and the usual `resolve_ns` rules.
+async fn resolve_doctrine_read_ns(
+    principal: &AuthPrincipal,
+    store: &dyn Store,
+    requested: Option<&str>,
+) -> Result<NamespaceId, ApiError> {
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    if requested.is_none_or(|r| r == default_ns) {
+        if !principal.0.may(ADMIN) && !principal.0.may(DOCTRINE_WRITE) {
+            return Err(ApiError::Forbidden);
+        }
+        Ok(NamespaceId::new(default_ns))
+    } else {
+        if !principal.0.may(MEMORY_READ) {
+            return Err(ApiError::Forbidden);
+        }
+        resolve_ns(principal, store, requested).await
+    }
+}
+
 /// Ingests a curated doctrine entry into the global `ns_doctrine`
 /// namespace. Admin-gated — doctrine is PR-reviewed in Git and never
-/// written by agents. Idempotent (delete-then-store) so re-ingests
-/// upsert cleanly. No redaction (doctrine is pre-reviewed).
+/// written by agents. Idempotent: re-ingesting identical content is a
+/// no-op; changed content archives the prior body as a version and bumps
+/// `revision`. No redaction (doctrine is pre-reviewed).
 async fn ingest_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
-) -> Result<Json<IdResponse>, ApiError> {
+) -> Result<Json<DoctrineIngestResponse>, ApiError> {
     if !principal.0.may(ijima_core::capabilities::ADMIN)
         && !principal.0.may(ijima_core::capabilities::DOCTRINE_WRITE)
     {
@@ -777,23 +829,55 @@ async fn ingest_doctrine(
     } else {
         return Err(ApiError::Forbidden);
     };
-    // Idempotent upsert: remove any existing entry, then store.
-    store
-        .delete_memory(&ns, &MemoryId(req.id.clone()))
+    // The existing row (if any) supplies the prior body for the stance
+    // scan and decides whether this ingest archives a version.
+    let existing = store
+        .recall_memory(&ns, &MemoryId(req.id.clone()))
         .await
         .map_err(internal)?;
+    let prior_body = existing.as_ref().map(|m| m.content.clone());
     // Content dedup is upsert-compatible here: if the exact content
-    // already lives in this namespace under another id (byte-identical
-    // corpus files), doctrine semantics say one row suffices — return
-    // the existing id instead of failing. Without this, re-ingesting a
-    // corpus containing duplicates 409s forever on the second file
-    // (found in the v0.3.0 U3 rehearsal).
-    if let Some(existing) = store
+    // already lives in this namespace (byte-identical corpus files),
+    // doctrine semantics say one row suffices — return the existing id
+    // instead of failing. Re-ingesting identical content is a no-op
+    // (same id, same revision, no new archive).
+    if let Some(existing_id) = store
         .check_duplicate(&ns, &req.content)
         .await
         .map_err(internal)?
     {
-        return Ok(Json(IdResponse { id: existing.0 }));
+        let revision = existing
+            .as_ref()
+            .filter(|m| m.id == existing_id)
+            .and_then(|m| m.revision)
+            .unwrap_or(1);
+        return Ok(Json(DoctrineIngestResponse {
+            id: existing_id.0,
+            revision,
+            warnings: Vec::new(),
+        }));
+    }
+    // Archive the prior body and bump the revision when this id already
+    // exists with different content; first ingest starts at revision 1.
+    let revision = match &existing {
+        Some(row) if row.content != req.content => {
+            let v = store
+                .archive_doctrine_version(&ns, &MemoryId(row.id.0.clone()))
+                .await
+                .map_err(internal)?;
+            v + 1
+        }
+        Some(row) => row.revision.unwrap_or(1),
+        None => 1,
+    };
+    let warnings = crate::doctrine::stance_warnings(&req.content, prior_body.as_deref());
+    // Re-store the live row. `store_memory` dedups + creates, so any stale
+    // row is removed first — the version archive already preserved it.
+    if existing.is_some() {
+        store
+            .delete_memory(&ns, &MemoryId(req.id.clone()))
+            .await
+            .map_err(internal)?;
     }
     let memory = Memory {
         id: MemoryId(req.id.clone()),
@@ -807,18 +891,67 @@ async fn ingest_doctrine(
         origin: ijima_core::InstanceId::local(),
         authority: ijima_core::AuthorityScope::local(),
         importance: 1.0,
-        evidence: ijima_core::memory::EvidenceGrade::Interpreted,
-        citations: Vec::new(),
+        // Doctrine bodies are Git-reviewed artifacts: observed, with the
+        // doc id as the citation locator.
+        evidence: ijima_core::memory::EvidenceGrade::Observed,
+        citations: vec![ijima_core::memory::Citation {
+            kind: ijima_core::memory::CitationKind::Report,
+            locator: req.id.clone(),
+        }],
         supersedes: None,
         superseded_by: None,
         superseded_at_unix: None,
+        revision: Some(revision),
         created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs().to_string())
             .unwrap_or_default(),
     };
     store.store_memory(&ns, memory).await.map_err(internal)?;
-    Ok(Json(IdResponse { id: req.id }))
+    Ok(Json(DoctrineIngestResponse {
+        id: req.id,
+        revision,
+        warnings,
+    }))
+}
+
+/// Lists the archived versions of a doctrine doc, oldest first.
+async fn list_doctrine_versions(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<DoctrineDocQuery>,
+) -> Result<Json<Vec<DoctrineVersion>>, ApiError> {
+    let ns = resolve_doctrine_read_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+    let versions = store
+        .list_doctrine_versions(&ns, &MemoryId(q.id))
+        .await
+        .map_err(internal)?;
+    Ok(Json(versions))
+}
+
+/// Rolls a doctrine doc back to an archived version. Admin-only —
+/// reverting the shared baseline is the operator's call.
+async fn rollback_doctrine(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<DoctrineDocQuery>,
+    Json(req): Json<DoctrineRollbackRequest>,
+) -> Result<Json<IdResponse>, ApiError> {
+    if !principal.0.may(ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    // Same `?namespace=` rules as ingest: default is the global wall;
+    // an explicit wall goes through `resolve_ns` (never private).
+    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let ns = match q.namespace.as_deref() {
+        None => NamespaceId::new(default_ns),
+        Some(requested) => resolve_ns(&principal, store.as_ref(), Some(requested)).await?,
+    };
+    let id = store
+        .activate_doctrine_version(&ns, &MemoryId(req.id), req.to)
+        .await
+        .map_err(internal)?;
+    Ok(Json(IdResponse { id: id.0 }))
 }
 
 // ---------- wake-up composition (D9 §4) ----------
@@ -2839,6 +2972,225 @@ mod tests {
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
     }
 
+    // ---------- doctrine versioning (v0.4.0 U3) ----------
+
+    /// POSTs a doctrine body via the admin endpoint; asserts 200 and
+    /// returns the parsed ingest response.
+    async fn post_doctrine(
+        app: &Router,
+        token: &str,
+        uri: &str,
+        id: &str,
+        content: &str,
+    ) -> serde_json::Value {
+        let body = serde_json::json!({
+            "id": id,
+            "content": content,
+            "project": "ijima",
+            "topic": "arch",
+        })
+        .to_string();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("authorization", token)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// GETs the archived versions of a doctrine doc (global wall).
+    async fn list_versions(
+        app: &Router,
+        token: &str,
+        id: &str,
+    ) -> Vec<ijima_core::DoctrineVersion> {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/doctrine/versions?namespace=ns_doctrine&id={id}"))
+                    .header("authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn recall_doctrine(app: &Router, token: &str, id: &str) -> Memory {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/memories/{id}?namespace=ns_doctrine"))
+                    .header("authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_versions_on_change() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        let r1 = post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        assert_eq!(r1["id"], "doc-x");
+        assert_eq!(r1["revision"].as_u64(), Some(1));
+
+        let r2 = post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+        assert_eq!(r2["revision"].as_u64(), Some(2));
+
+        let mem = recall_doctrine(&app, &admin, "doc-x").await;
+        assert_eq!(mem.content, "body B");
+        assert_eq!(mem.revision, Some(2));
+
+        let versions = list_versions(&app, &admin, "doc-x").await;
+        assert_eq!(versions.len(), 1, "one archived version: {versions:?}");
+        assert_eq!(versions[0].version, 1);
+        assert_eq!(versions[0].content, "body A");
+        assert!(!versions[0].active);
+    }
+
+    #[tokio::test]
+    async fn doctrine_reingest_identical_is_noop() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+
+        let again = post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+        assert_eq!(again["id"], "doc-x");
+        assert_eq!(again["revision"].as_u64(), Some(2));
+        assert_eq!(
+            list_versions(&app, &admin, "doc-x").await.len(),
+            1,
+            "identical re-ingest must not archive"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctrine_rollback_restores_body() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback?namespace=ns_doctrine&id=doc-x")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "doc-x", "to": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let mem = recall_doctrine(&app, &admin, "doc-x").await;
+        assert_eq!(mem.content, "body A");
+        assert_eq!(mem.revision, Some(1));
+
+        let versions = list_versions(&app, &admin, "doc-x").await;
+        let active: Vec<_> = versions.iter().filter(|v| v.active).collect();
+        assert_eq!(active.len(), 1, "exactly one active version: {versions:?}");
+        assert_eq!(active[0].version, 1);
+        assert_eq!(active[0].content, "body A");
+    }
+
+    #[tokio::test]
+    async fn doctrine_ingest_response_carries_warnings() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        // Stance-dense pathological body: the incident's poisoning shape.
+        let dense = "you must obey. ".repeat(200);
+        let resp = post_doctrine(
+            &app,
+            &admin,
+            "/doctrine?namespace=ns_doctrine",
+            "doc-dense",
+            &dense,
+        )
+        .await;
+        let warnings = resp["warnings"].as_array().expect("warnings array");
+        assert!(!warnings.is_empty(), "expected stance warnings: {resp}");
+    }
+
+    #[tokio::test]
+    async fn wakeup_doctrine_entries_carry_revision() {
+        let (app, auth) = app_with_store().await;
+        let admin = bearer(&auth, "ci", "admin");
+        let uri = "/doctrine?namespace=ns_doctrine";
+
+        post_doctrine(&app, &admin, uri, "doc-x", "body A").await;
+        post_doctrine(&app, &admin, uri, "doc-x", "body B").await;
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let wakeup: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let doctrine = wakeup["doctrine"].as_array().expect("doctrine array");
+        let doc = doctrine
+            .iter()
+            .find(|m| m["id"] == "doc-x")
+            .expect("doc-x appears in wake-up doctrine");
+        assert_eq!(doc["revision"].as_u64(), Some(2));
+    }
+
     #[tokio::test]
     async fn wakeup_honors_namespace_param() {
         // Agent homes (0.2.5): a member's wakeup with ?namespace= reads
@@ -2983,6 +3335,7 @@ mod tests {
                             supersedes: None,
                             superseded_by: None,
                             superseded_at_unix: None,
+                            revision: None,
                             created_at: "0".into(),
                         },
                     )
@@ -3187,6 +3540,7 @@ mod tests {
                 supersedes: None,
                 superseded_by: None,
                 superseded_at_unix: None,
+                revision: None,
                 created_at: "0".into(),
             })
             .collect();
@@ -3841,6 +4195,7 @@ mod tests {
                 supersedes: None,
                 superseded_by: None,
                 superseded_at_unix: None,
+                revision: None,
                 created_at: "0".into(),
             },
             similarity: sim,

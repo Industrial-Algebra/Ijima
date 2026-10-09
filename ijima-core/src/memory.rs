@@ -82,6 +82,13 @@ pub struct Memory {
     /// When the supersede link landed (unix seconds), for audit.
     #[cfg_attr(feature = "serde", serde(default))]
     pub superseded_at_unix: Option<i64>,
+    /// Doctrine revision number (direction B, v0.4.0): monotonically
+    /// increasing per doctrine doc, starting at 1 on first ingest. `None`
+    /// for every non-doctrine memory (the default). Flows through wake-up
+    /// so clients know which revision of the baseline they were served —
+    /// the hook 0.5 outcome correlation reads.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub revision: Option<u32>,
     /// Creation timestamp. v0: Unix epoch seconds as a string (monotonic
     /// for DESC ordering). Future: ISO-8601 when a time crate lands.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -224,6 +231,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "123".into(),
         };
         assert_eq!(m.id.0, "mem_01");
@@ -279,6 +287,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "1".into(),
         };
         let err = m.validate_evidence().expect_err("must reject");
@@ -306,6 +315,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "1".into(),
         };
         assert!(m.validate_evidence().is_ok());
@@ -329,6 +339,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "1".into(),
         };
         assert!(m.validate_evidence().is_ok());

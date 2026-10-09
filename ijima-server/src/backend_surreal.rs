@@ -28,11 +28,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ijima_core::{
-    AcceptedExtraction, AuthorityScope, DiaryEntry, Embedding, Entity, EntityId, EntityRecord,
-    IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId, NamespaceCount, NamespaceId,
-    NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction, RepoDirectory, Result, Room,
-    SearchHit, Session, SessionId, SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel,
-    TunnelTraversal,
+    AcceptedExtraction, AuthorityScope, DiaryEntry, DoctrineVersion, Embedding, Entity, EntityId,
+    EntityRecord, IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId,
+    NamespaceCount, NamespaceId, NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction,
+    RepoDirectory, Result, Room, SearchHit, Session, SessionId, SessionTurn, Store, StoreStats,
+    TokenRevocation, Triple, Tunnel, TunnelTraversal,
     embeddings::Embedder,
     harness::Harness,
     memory::{Citation, EvidenceGrade, MemorySource},
@@ -58,6 +58,8 @@ const ENTITIES_TABLE: &str = "entities";
 const TRIPLES_TABLE: &str = "triples";
 /// Repo directory (global Context Mapper registry).
 const REPO_TABLE: &str = "repo_directory";
+/// Archived doctrine revisions (direction B, v0.4.0).
+const DOCTRINE_VERSIONS_TABLE: &str = "doctrine_versions";
 
 /// A SurrealDB-backed [`Store`].
 pub struct SurrealStore {
@@ -163,6 +165,7 @@ impl SurrealStore {
         DEFINE TABLE IF NOT EXISTS token_revocations SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS namespace_members SCHEMALESS;
         DEFINE TABLE IF NOT EXISTS repo_directory  SCHEMALESS;
+        DEFINE TABLE IF NOT EXISTS doctrine_versions SCHEMALESS;
         DEFINE INDEX IF NOT EXISTS nmem_ns      ON TABLE namespace_members FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS nmem_ns_princ ON TABLE namespace_members FIELDS namespace, principal;
         DEFINE INDEX IF NOT EXISTS nmem_princ    ON TABLE namespace_members FIELDS principal;
@@ -176,6 +179,7 @@ impl SurrealStore {
         DEFINE INDEX IF NOT EXISTS trip_ns       ON TABLE triples         FIELDS namespace;
         DEFINE INDEX IF NOT EXISTS trip_subj     ON TABLE triples         FIELDS subject;
         DEFINE INDEX IF NOT EXISTS trip_obj      ON TABLE triples         FIELDS object;
+        DEFINE INDEX IF NOT EXISTS dv_ns_doc     ON TABLE doctrine_versions FIELDS namespace, doc_id;
     "#;
 
     /// Fetches all `(project, topic)` cells in `ns` with their memory counts.
@@ -218,7 +222,7 @@ impl SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
-                        origin, authority, importance, created_at
+                        origin, authority, importance, revision, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND project = $proj AND topic = $topic
                    AND superseded_by = NONE
@@ -336,6 +340,11 @@ struct MemoryRecord {
     /// When the supersede link landed (unix seconds), for audit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     superseded_at_unix: Option<i64>,
+    /// Doctrine revision number (direction B, v0.4.0). `None` for every
+    /// non-doctrine memory. `skip_serializing_if` keeps the SurrealDB
+    /// field as `NONE` rather than `NULL` for non-doctrine rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<u32>,
     #[serde(default)]
     created_at: String,
     /// Provenance: the authoring instance (ADR provenance-tier). Defaults
@@ -387,6 +396,7 @@ impl MemoryRecord {
             supersedes: memory.supersedes.clone(),
             superseded_by: memory.superseded_by.clone(),
             superseded_at_unix: memory.superseded_at_unix,
+            revision: memory.revision,
             created_at: memory.created_at.clone(),
             origin: memory.origin.clone(),
             authority: memory.authority.clone(),
@@ -412,7 +422,48 @@ impl MemoryRecord {
             supersedes: self.supersedes,
             superseded_by: self.superseded_by,
             superseded_at_unix: self.superseded_at_unix,
+            revision: self.revision,
             created_at: self.created_at,
+        }
+    }
+}
+
+/// The persisted form of an archived doctrine version. Mirrors
+/// [`DoctrineVersion`] plus the owning namespace (every other wire
+/// record carries it; the record key embeds the namespace but queries
+/// filter on the field).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DoctrineVersionRecord {
+    doc_id: String,
+    version: u32,
+    content: String,
+    content_hash: String,
+    archived_at_unix: i64,
+    active: bool,
+    namespace: String,
+}
+
+impl DoctrineVersionRecord {
+    fn from_version(version: &DoctrineVersion, ns: &NamespaceId) -> Self {
+        Self {
+            doc_id: version.doc_id.clone(),
+            version: version.version,
+            content: version.content.clone(),
+            content_hash: version.content_hash.clone(),
+            archived_at_unix: version.archived_at_unix,
+            active: version.active,
+            namespace: ns.as_str().to_string(),
+        }
+    }
+
+    fn into_version(self) -> DoctrineVersion {
+        DoctrineVersion {
+            doc_id: self.doc_id,
+            version: self.version,
+            content: self.content,
+            content_hash: self.content_hash,
+            archived_at_unix: self.archived_at_unix,
+            active: self.active,
         }
     }
 }
@@ -562,6 +613,7 @@ impl QueueRecord {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: String::new(),
         };
         QueuedExtraction {
@@ -590,6 +642,7 @@ impl QueueRecord {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: String::new(),
         }
     }
@@ -625,6 +678,14 @@ fn embed_for(embedder: &dyn Embedder, text: &str) -> Result<Option<Vec<f32>>> {
 /// The logical id stays in `memory_id` for wire responses.
 fn memory_key(ns: &NamespaceId, id: &MemoryId) -> String {
     format!("{}:{}", ns.as_str(), id.0)
+}
+
+/// Surreal record key for an archived doctrine version:
+/// `<namespace>_<doc-id>_v<version>`. The namespace is embedded because
+/// record ids are global per table — the same doctrine id may live in
+/// more than one wall.
+fn doctrine_version_key(ns: &NamespaceId, id: &MemoryId, version: u32) -> String {
+    format!("{}_{}_v{}", ns.as_str(), id.0, version)
 }
 
 #[async_trait]
@@ -768,7 +829,7 @@ impl Store for SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
-                        origin, authority, importance, created_at
+                        origin, authority, importance, revision, created_at
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns
                    AND superseded_by = NONE
@@ -977,7 +1038,7 @@ impl Store for SurrealStore {
             .db
             .query(format!(
                 "SELECT memory_id, content, project, topic, source, harness, session_id, namespace,
-                        origin, authority, importance, created_at,
+                        origin, authority, importance, revision, created_at,
                         vector::similarity::cosine(embedding, $query) AS score
                  FROM {MEMORIES_TABLE}
                  WHERE namespace = $ns AND embedding IS NOT NONE
@@ -1006,6 +1067,132 @@ impl Store for SurrealStore {
                 similarity: r.score as f32,
             })
             .collect())
+    }
+
+    async fn archive_doctrine_version(&self, ns: &NamespaceId, id: &MemoryId) -> Result<u32> {
+        use sha2::{Digest, Sha256};
+        let live = self
+            .recall_memory(ns, id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT version FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        #[derive(serde::Serialize, Deserialize)]
+        struct VersionRow {
+            version: u32,
+        }
+        let rows = take_vec::<VersionRow>(&mut result)?;
+        let version = rows.len() as u32 + 1;
+        let content_hash = hex(&Sha256::digest(live.content.as_bytes()));
+        let archived_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or_default();
+        let record = DoctrineVersion {
+            doc_id: id.0.clone(),
+            version,
+            content: live.content,
+            content_hash,
+            archived_at_unix,
+            active: false,
+        };
+        let wire = DoctrineVersionRecord::from_version(&record, ns);
+        let _: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
+            .db
+            .create((
+                DOCTRINE_VERSIONS_TABLE,
+                doctrine_version_key(ns, id, version),
+            ))
+            .content(surrealdb::types::SerdeWrapper(wire))
+            .await
+            .map_err(store_err)?;
+        Ok(version)
+    }
+
+    async fn list_doctrine_versions(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+    ) -> Result<Vec<DoctrineVersion>> {
+        let mut result = self
+            .db
+            .query(format!(
+                "SELECT * FROM {DOCTRINE_VERSIONS_TABLE}
+                 WHERE namespace = $ns AND doc_id = $doc
+                 ORDER BY version ASC"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        let rows = take_vec::<DoctrineVersionRecord>(&mut result)?;
+        Ok(rows.into_iter().map(|r| r.into_version()).collect())
+    }
+
+    async fn activate_doctrine_version(
+        &self,
+        ns: &NamespaceId,
+        id: &MemoryId,
+        to: u32,
+    ) -> Result<MemoryId> {
+        let version: Option<surrealdb::types::SerdeWrapper<DoctrineVersionRecord>> = self
+            .db
+            .select((DOCTRINE_VERSIONS_TABLE, doctrine_version_key(ns, id, to)))
+            .await
+            .map_err(store_err)?;
+        let version = version.map(|w| w.0).ok_or_else(|| {
+            IjimaError::not_found(format!("doctrine version {} v{} not found", id.0, to))
+        })?;
+        let mut live = self
+            .recall_memory(ns, id)
+            .await?
+            .ok_or_else(|| IjimaError::not_found(format!("doctrine doc {} not found", id.0)))?;
+        live.content = version.content.clone();
+        live.revision = Some(version.version);
+        let (embedding, embed_model) = match &self.embedder {
+            Some(e) => (
+                embed_for(e.as_ref(), &live.content)?,
+                Some(e.model_id().to_string()),
+            ),
+            None => (None, None),
+        };
+        let record = MemoryRecord::from_memory(&live, ns, embedding, embed_model);
+        let _: Option<surrealdb::types::SerdeWrapper<MemoryRecord>> = self
+            .db
+            .upsert((MEMORIES_TABLE, memory_key(ns, id)))
+            .content(surrealdb::types::SerdeWrapper(record))
+            .await
+            .map_err(store_err)?;
+        let _ = self
+            .db
+            .query(format!(
+                "UPDATE {DOCTRINE_VERSIONS_TABLE} SET active = false
+                 WHERE namespace = $ns AND doc_id = $doc"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .await
+            .map_err(store_err)?;
+        let _ = self
+            .db
+            .query(format!(
+                "UPDATE {DOCTRINE_VERSIONS_TABLE} SET active = true
+                 WHERE namespace = $ns AND doc_id = $doc AND version = $ver"
+            ))
+            .bind(("ns", ns.as_str().to_string()))
+            .bind(("doc", id.0.clone()))
+            .bind(("ver", to as i64))
+            .await
+            .map_err(store_err)?;
+        Ok(id.clone())
     }
 
     async fn ingest_turn(&self, ns: &NamespaceId, turn: SessionTurn) -> Result<()> {
@@ -1709,6 +1896,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "0".into(),
         }
     }
@@ -1818,6 +2006,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at,
         };
         // Old chatter in two namespaces (both must go) …
@@ -2523,6 +2712,7 @@ mod tests {
             supersedes: None,
             superseded_by: None,
             superseded_at_unix: None,
+            revision: None,
             created_at: "0".into(),
         }
     }
