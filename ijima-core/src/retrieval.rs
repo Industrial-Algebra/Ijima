@@ -54,9 +54,30 @@ pub struct RetrievalEvent {
     pub ts_unix: u64,
 }
 
+/// Aggregated ledger counts (U2): what the read paths served, by kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetrievalStats {
+    /// Total events counted.
+    pub total: u64,
+    /// Events by kind. Keys are the PascalCase kind names.
+    pub by_kind: std::collections::BTreeMap<String, u64>,
+    /// Distinct memory ids served at least once.
+    pub distinct_memories: u64,
+    /// Distinct retrieval ids (i.e. requests served).
+    pub distinct_retrievals: u64,
+    /// Oldest event ts (Unix seconds); 0 when empty.
+    pub oldest_ts_unix: u64,
+    /// Newest event ts (Unix seconds); 0 when empty.
+    pub newest_ts_unix: u64,
+}
+
 // The ledger's JSON shape is exercised through `serde_json`, which
 // ijima-core only links under `federation` (the crate's established
 // gating for JSON-dependent tests — see `memory.rs`).
+
+// serde_json is exposed by ijima-core only through the `federation`
+// feature (the crate's existing convention — see memory.rs), so the
+// round-trip tests ride that gate.
 #[cfg(all(test, feature = "federation"))]
 mod tests {
     use super::*;

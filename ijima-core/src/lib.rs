@@ -74,7 +74,7 @@ pub use namespace::{Namespace, NamespaceId, NamespaceKind, NamespaceMembership};
 pub use palace::{PalaceGraph, ProjectTaxon, Room, Tunnel, TunnelTraversal};
 pub use provenance::{AuthorityScope, InstanceId};
 pub use repo::RepoDirectory;
-pub use retrieval::{RetrievalEvent, RetrievalKind};
+pub use retrieval::{RetrievalEvent, RetrievalKind, RetrievalStats};
 pub use revocation::TokenRevocation;
 pub use session::{Session, SessionId, SessionTurn, TurnRole};
 pub use store::{DoctrineVersion, NamespaceCount, SearchHit, Store, StoreStats};

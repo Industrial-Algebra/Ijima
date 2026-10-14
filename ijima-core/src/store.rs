@@ -128,6 +128,28 @@ pub trait Store: Send + Sync {
     /// new failure mode for reads.
     async fn append_retrieval_events(&self, events: &[RetrievalEvent]) -> Result<()>;
 
+    /// Lists ledger events, newest first. `namespace` of `None` spans
+    /// every wall; `since_unix` filters `ts_unix >= since_unix`;
+    /// `limit` caps the rows (hard ceiling 10_000 applies at the
+    /// route, the store trusts the caller).
+    async fn list_retrieval_events(
+        &self,
+        namespace: Option<&str>,
+        since_unix: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::retrieval::RetrievalEvent>>;
+
+    /// Aggregated ledger counts for one wall (`namespace` of `None`
+    /// spans every wall).
+    async fn retrieval_ledger_stats(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<crate::retrieval::RetrievalStats>;
+
+    /// Deletes ledger events with `ts_unix < before_unix`. Returns
+    /// the number deleted.
+    async fn prune_retrieval_events(&self, before_unix: u64) -> Result<usize>;
+
     /// Lists memories in `ns`, optionally filtered to `project`/`topic`.
     /// Powers `GET /memories` (the `memory_recall` browse path — distinct
     /// from [`Self::list_memories`], which is the importance-ranked
