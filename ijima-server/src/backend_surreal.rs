@@ -1086,16 +1086,43 @@ impl Store for SurrealStore {
     }
 
     async fn append_retrieval_events(&self, events: &[RetrievalEvent]) -> Result<()> {
+        // Keys carry kind + namespace: memory ids are wall-LOCAL, so
+        // rid+mid+rank alone collides when the same id serves at the
+        // same rank from two lists in one retrieval (personal rank 0
+        // and doctrine rank 0 — review round 1, P1-1). Kind separates
+        // the lists by construction (doctrine events are the only
+        // WakeupDoctrine; personal events are the only strata kinds).
+        // One bad event must not abort the batch — attempt every
+        // append, surface the FIRST error after the loop, so a
+        // partial write still records everything appendable.
+        let mut first_err = None;
         for e in events {
-            let key = format!("{}_{}_{}", e.retrieval_id, e.memory_id, e.rank);
-            let _: Option<surrealdb::types::SerdeWrapper<RetrievalEvent>> = self
+            let key = format!(
+                "{}_{}_{}_{}_{}",
+                e.retrieval_id,
+                e.kind.as_str(),
+                e.namespace,
+                e.memory_id,
+                e.rank
+            );
+            let res: std::result::Result<
+                Option<surrealdb::types::SerdeWrapper<RetrievalEvent>>,
+                _,
+            > = self
                 .db
                 .create((RETRIEVAL_LEDGER_TABLE, key))
                 .content(surrealdb::types::SerdeWrapper(e.clone()))
-                .await
-                .map_err(store_err)?;
+                .await;
+            if let Err(e) = res
+                && first_err.is_none()
+            {
+                first_err = Some(store_err(e));
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     async fn list_retrieval_events(

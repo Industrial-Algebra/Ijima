@@ -596,8 +596,7 @@ async fn search_memories(
     // by similarity across all of them (pi-mempalace parity; the "empty
     // brain" incident: the pre-WS2 definition only merged private +
     // global, so freshly-imported corpora were invisible).
-    let mut wall_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    let mut resolved_ns: Option<NamespaceId> = None;
+
     let hits = if req.scope.as_deref() == Some("visible") {
         let own_ns = principal.0.personal_namespace();
         let mut namespaces = vec![own_ns.clone(), NamespaceId::new("global")];
@@ -616,41 +615,41 @@ async fn search_memories(
         }
         namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         namespaces.dedup_by(|a, b| a.as_str() == b.as_str());
-        let mut merged: Vec<SearchHit> = Vec::new();
+        let mut merged: Vec<(SearchHit, String)> = Vec::new();
         for ns in namespaces {
             let hits = store
                 .search_memories(&ns, &query, limit)
                 .await
                 .map_err(internal)?;
-            for h in &hits {
-                wall_of
-                    .entry(h.memory.id.0.clone())
-                    .or_insert_with(|| ns.as_str().to_string());
-            }
-            merged = merge_search_hits(merged, hits, limit);
+            let with_wall = hits
+                .into_iter()
+                .map(|h| (h, ns.as_str().to_string()))
+                .collect();
+            merged = merge_search_hits_with_walls(merged, with_wall, limit);
         }
         merged
     } else {
         let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
-        resolved_ns = Some(ns.clone());
         store
             .search_memories(&ns, &query, limit)
             .await
             .map_err(internal)?
+            .into_iter()
+            .map(|h| (h, ns.as_str().to_string()))
+            .collect()
     };
     let rid = new_retrieval_id();
     let ts = retrieval_ts();
     let ledger: Vec<ijima_core::RetrievalEvent> = hits
         .iter()
         .enumerate()
-        .map(|(rank, h)| ijima_core::RetrievalEvent {
+        .map(|(rank, (h, wall))| ijima_core::RetrievalEvent {
             retrieval_id: rid.clone(),
             kind: ijima_core::RetrievalKind::Search,
-            namespace: wall_of
-                .get(&h.memory.id.0)
-                .cloned()
-                .or_else(|| resolved_ns.as_ref().map(|n| n.as_str().to_string()))
-                .unwrap_or_default(),
+            // The wall the WINNING occurrence merged from (review
+            // round 1, P1-2) — carried through the merge, not
+            // recovered from a first-wall-wins map.
+            namespace: wall.clone(),
             memory_id: h.memory.id.0.clone(),
             principal: principal.0.principal.as_str().to_string(),
             rank: rank as u32,
@@ -661,24 +660,36 @@ async fn search_memories(
     if let Err(e) = store.append_retrieval_events(&ledger).await {
         tracing::warn!(error = %e, "retrieval ledger append failed (search)");
     }
-    Ok(Json(SearchResponse { memories: hits }))
+    let memories = hits.into_iter().map(|(h, _)| h).collect();
+    Ok(Json(SearchResponse { memories }))
 }
 
 /// Merges two scored hit lists by similarity (desc), deduplicating by memory
 /// id (the highest-similarity instance wins — NOT `dedup_by`, which only
 /// drops adjacent dups) and truncating to `limit`. Pure — the `scope=visible`
 /// path uses this to combine private + global results.
-fn merge_search_hits(a: Vec<SearchHit>, b: Vec<SearchHit>, limit: usize) -> Vec<SearchHit> {
+/// Visible-scope merge with wall attribution (v0.4.2 ledger, review
+/// round 1 P1-2): same semantics as [`merge_search_hits`] — sort by
+/// similarity desc, dedup by id keeping the highest-similarity
+/// occurrence, truncate — but each hit carries its contributing wall,
+/// so a duplicate id resolves to the WINNING wall, not the first wall
+/// that happened to serve it. Ties in similarity are resolved by
+/// insertion order (the earlier wall), which is deterministic under
+/// the sorted namespace iteration.
+fn merge_search_hits_with_walls(
+    a: Vec<(SearchHit, String)>,
+    b: Vec<(SearchHit, String)>,
+    limit: usize,
+) -> Vec<(SearchHit, String)> {
     use std::collections::HashSet;
-    let mut all: Vec<SearchHit> = a.into_iter().chain(b).collect();
-    all.sort_by(|x, y| {
+    let mut all: Vec<(SearchHit, String)> = a.into_iter().chain(b).collect();
+    all.sort_by(|(x, _), (y, _)| {
         y.similarity
             .partial_cmp(&x.similarity)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    // Keep the first (highest-similarity, post-sort) instance of each id.
     let mut seen: HashSet<String> = HashSet::new();
-    all.retain(|h| seen.insert(h.memory.id.0.clone()));
+    all.retain(|(h, _)| seen.insert(h.memory.id.0.clone()));
     all.truncate(limit);
     all
 }
@@ -4996,30 +5007,46 @@ mod tests {
         }
     }
 
+    fn walled(id: &str, sim: f32, wall: &str) -> (SearchHit, String) {
+        (hit_mem(id, sim), wall.to_string())
+    }
+
     #[test]
     fn merge_search_hits_ranks_desc_dedups_and_truncates() {
         // scope=visible merge: two ranked lists combine by similarity, dedup
         // by memory id (first wins), truncate to limit.
-        let a = vec![hit_mem("a", 0.9), hit_mem("b", 0.5)];
-        let b = vec![hit_mem("c", 0.8), hit_mem("a", 0.7)]; // 'a' dup, lower sim
-        let merged = merge_search_hits(a, b, 3);
+        let a = vec![walled("a", 0.9, "w1"), walled("b", 0.5, "w1")];
+        let b = vec![walled("c", 0.8, "w2"), walled("a", 0.7, "w2")]; // 'a' dup, lower sim
+        let merged: Vec<(SearchHit, String)> = merge_search_hits_with_walls(a, b, 3);
         // Sorted by similarity desc: a(0.9), c(0.8), b(0.5) — the dup a(0.7)
         // is dropped (first wins).
         assert_eq!(merged.len(), 3);
-        assert_eq!(merged[0].memory.id.0, "a");
-        assert_eq!((merged[0].similarity * 10.0).round() as i32, 9);
-        assert_eq!(merged[1].memory.id.0, "c");
-        assert_eq!(merged[2].memory.id.0, "b");
+        assert_eq!(merged[0].0.memory.id.0, "a");
+        assert_eq!((merged[0].0.similarity * 10.0).round() as i32, 9);
+        assert_eq!(merged[1].0.memory.id.0, "c");
+        assert_eq!(merged[2].0.memory.id.0, "b");
     }
 
     #[test]
     fn merge_search_hits_respects_limit() {
-        let a = vec![hit_mem("a", 0.9), hit_mem("b", 0.8)];
-        let b = vec![hit_mem("c", 0.7), hit_mem("d", 0.6)];
-        let merged = merge_search_hits(a, b, 2);
+        let a = vec![walled("a", 0.9, "w1"), walled("b", 0.8, "w1")];
+        let b = vec![walled("c", 0.7, "w2"), walled("d", 0.6, "w2")];
+        let merged = merge_search_hits_with_walls(a, b, 2);
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].memory.id.0, "a");
-        assert_eq!(merged[1].memory.id.0, "b");
+        assert_eq!(merged[0].0.memory.id.0, "a");
+        assert_eq!(merged[1].0.memory.id.0, "b");
+    }
+
+    #[test]
+    fn merge_search_hits_duplicate_id_keeps_winning_wall() {
+        // Review round 1, P1-2: the duplicate id resolves to the wall
+        // of the HIGHER-similarity occurrence, not the first-inserted.
+        let a = vec![walled("a", 0.6, "w_losing")]; // earlier wall, lower sim
+        let b = vec![walled("a", 0.95, "w_winning")];
+        let merged = merge_search_hits_with_walls(a, b, 5);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0.memory.id.0, "a");
+        assert_eq!(merged[0].1, "w_winning", "wall follows the winner");
     }
 
     #[cfg(feature = "mining")]
@@ -6610,6 +6637,141 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    // ---------- v0.4.2 review round 1 regressions ----------
+
+    #[tokio::test]
+    async fn wakeup_ledger_same_id_across_walls_records_both() {
+        // P1-1: memory ids are wall-LOCAL — the same id can serve at
+        // rank 0 from the personal wall AND rank 0 from doctrine in
+        // one retrieval. The old rid_mid_rank key collided, the
+        // second CREATE errored, and the batch aborted: 2 served, 1
+        // recorded. Kinds now disambiguate; both events must land.
+        let (app, auth, store) = app_with_concrete_store(None).await;
+        let admin = bearer(&auth, "ci", "admin");
+        let ns = NamespaceId::new("ns_elliott_private");
+        store
+            .store_memory(&ns, seed_mem("mem_dup", 0.9, "1000"))
+            .await
+            .expect("seed personal");
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "mem_dup",
+                            "content": "same id, doctrine wall",
+                            "project": "ijima",
+                            "topic": "ledger"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.status() == StatusCode::CREATED || res.status() == StatusCode::OK,
+            "doctrine seeded (created or idempotent ok): {}",
+            res.status()
+        );
+
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/wakeup")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let served = body["personal_essentials"].as_array().unwrap().len()
+            + body["doctrine"].as_array().unwrap().len();
+        assert!(served >= 2, "both walls serve: {body}");
+
+        let rows = ledger_rows(&store).await;
+        let dup_events: Vec<_> = rows
+            .iter()
+            .filter(|r| r["memory_id"] == "mem_dup")
+            .collect();
+        assert_eq!(dup_events.len(), 2, "one event PER serving: {rows:?}");
+        assert!(
+            dup_events.iter().any(|r| r["kind"] == "WakeupDoctrine")
+                && dup_events.iter().any(|r| r["kind"] != "WakeupDoctrine"),
+            "kinds distinguish the lists: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_ledger_attributes_duplicate_id_to_winning_wall() {
+        // P1-2: the same id on global and the private wall — the
+        // private copy matches the query exactly, the global copy
+        // does not. The served hit is the private one; the ledger
+        // must record ns_elliott_private, not the first wall that
+        // served the id.
+        use ijima_core::HashEmbedder;
+        let embedder: Arc<dyn ijima_core::Embedder> = Arc::new(HashEmbedder::default());
+        let (app, auth, store) = app_with_concrete_store(Some(embedder)).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let mut private = seed_mem("mem_wall_dup", 0.5, "0");
+        private.content = "exact winning phrase".into();
+        store
+            .store_memory(&NamespaceId::new("ns_elliott_private"), private)
+            .await
+            .expect("seed private");
+        let mut global = seed_mem("mem_wall_dup", 0.5, "0");
+        global.content = "unrelated filler text".into();
+        store
+            .store_memory(&NamespaceId::new("global"), global)
+            .await
+            .expect("seed global");
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/search")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "exact winning phrase",
+                            "limit": 5,
+                            "scope": "visible"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let hits = body["memories"].as_array().unwrap();
+        assert_eq!(hits.len(), 1, "deduped to one hit: {body}");
+
+        let rows = ledger_rows(&store).await;
+        let evs: Vec<_> = rows
+            .iter()
+            .filter(|r| r["memory_id"] == "mem_wall_dup")
+            .collect();
+        assert_eq!(evs.len(), 1, "one Search event: {rows:?}");
+        assert_eq!(
+            evs[0]["namespace"], "ns_elliott_private",
+            "attribution follows the WINNING occurrence: {rows:?}"
+        );
     }
 
     #[tokio::test]

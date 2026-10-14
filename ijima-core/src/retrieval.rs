@@ -27,6 +27,22 @@ pub enum RetrievalKind {
     Browse,
 }
 
+impl RetrievalKind {
+    /// Stable short name (serialized form). Also used in ledger
+    /// record keys, where it disambiguates the same memory id
+    /// served at the same rank from different lists (personal vs
+    /// doctrine — review round 1, P1-1).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            RetrievalKind::WakeupRecent => "WakeupRecent",
+            RetrievalKind::WakeupLexicographic => "WakeupLexicographic",
+            RetrievalKind::WakeupDoctrine => "WakeupDoctrine",
+            RetrievalKind::Search => "Search",
+            RetrievalKind::Browse => "Browse",
+        }
+    }
+}
+
 /// One served memory. `rank` is the 0-based position in the response
 /// list it was served in; `similarity` is set for `Search` events only
 /// (cosine similarity, 0.0–1.0) and absent otherwise.
