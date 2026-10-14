@@ -31,8 +31,8 @@ use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, DoctrineVersion, Embedding, Entity, EntityId,
     EntityRecord, IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId,
     NamespaceCount, NamespaceId, NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction,
-    RepoDirectory, Result, Room, SearchHit, Session, SessionId, SessionTurn, Store, StoreStats,
-    TokenRevocation, Triple, Tunnel, TunnelTraversal,
+    RepoDirectory, Result, RetrievalEvent, Room, SearchHit, Session, SessionId, SessionTurn, Store,
+    StoreStats, TokenRevocation, Triple, Tunnel, TunnelTraversal,
     embeddings::Embedder,
     harness::Harness,
     memory::{Citation, EvidenceGrade, MemorySource},
@@ -60,10 +60,12 @@ const TRIPLES_TABLE: &str = "triples";
 const REPO_TABLE: &str = "repo_directory";
 /// Archived doctrine revisions (direction B, v0.4.0).
 const DOCTRINE_VERSIONS_TABLE: &str = "doctrine_versions";
+/// Append-only retrieval ledger (v0.4.2 observability).
+const RETRIEVAL_LEDGER_TABLE: &str = "retrieval_ledger";
 
 /// A SurrealDB-backed [`Store`].
 pub struct SurrealStore {
-    db: Surreal<Db>,
+    pub(crate) db: Surreal<Db>,
     /// When present, memories are embedded at write time and
     /// [`Store::search_memories`] is available. When absent, search
     /// returns [`IjimaError::Store`].
@@ -287,6 +289,10 @@ impl SurrealStore {
         DEFINE INDEX IF NOT EXISTS trip_subj     ON TABLE triples         FIELDS subject;
         DEFINE INDEX IF NOT EXISTS trip_obj      ON TABLE triples         FIELDS object;
         DEFINE INDEX IF NOT EXISTS dv_ns_doc     ON TABLE doctrine_versions FIELDS namespace, doc_id;
+        DEFINE TABLE IF NOT EXISTS retrieval_ledger SCHEMALESS;
+        DEFINE INDEX IF NOT EXISTS rl_ns_ts  ON TABLE retrieval_ledger FIELDS namespace, ts_unix;
+        DEFINE INDEX IF NOT EXISTS rl_mid    ON TABLE retrieval_ledger FIELDS memory_id;
+        DEFINE INDEX IF NOT EXISTS rl_rid    ON TABLE retrieval_ledger FIELDS retrieval_id;
     "#;
 
     /// Fetches all `(project, topic)` cells in `ns` with their memory counts.
@@ -1077,6 +1083,19 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         take_memories(&mut result)
+    }
+
+    async fn append_retrieval_events(&self, events: &[RetrievalEvent]) -> Result<()> {
+        for e in events {
+            let key = format!("{}_{}_{}", e.retrieval_id, e.memory_id, e.rank);
+            let _: Option<surrealdb::types::SerdeWrapper<RetrievalEvent>> = self
+                .db
+                .create((RETRIEVAL_LEDGER_TABLE, key))
+                .content(surrealdb::types::SerdeWrapper(e.clone()))
+                .await
+                .map_err(store_err)?;
+        }
+        Ok(())
     }
 
     async fn export_memories(
@@ -2200,7 +2219,7 @@ impl KnowledgeGraph for SurrealStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ijima_core::{NamespaceId, TurnRole};
+    use ijima_core::{NamespaceId, RetrievalKind, TurnRole};
 
     async fn fresh() -> SurrealStore {
         SurrealStore::open_embedded()
@@ -3537,6 +3556,41 @@ mod tests {
         // embedding; a no-embedding legacy row simply never matches.
         // The projection's null-tolerance is covered by the unit test
         // above plus the three paths already exercised here.
+    }
+
+    #[tokio::test]
+    async fn retrieval_events_append_and_round_trip() {
+        let store = fresh().await;
+        let mk = |rid: &str, mid: &str, rank: u32, kind: RetrievalKind| RetrievalEvent {
+            retrieval_id: rid.into(),
+            kind,
+            namespace: "ns_ledger".into(),
+            memory_id: mid.into(),
+            principal: "elliott".into(),
+            rank,
+            similarity: (kind == RetrievalKind::Search).then_some(0.5),
+            ts_unix: 42,
+        };
+        store
+            .append_retrieval_events(&[
+                mk("r1", "m1", 0, RetrievalKind::WakeupRecent),
+                mk("r1", "m2", 1, RetrievalKind::WakeupLexicographic),
+                mk("r1", "m3", 2, RetrievalKind::WakeupDoctrine),
+            ])
+            .await
+            .expect("append");
+        let mut res = store
+            .db
+            .query("SELECT count() AS n, type::string(kind) AS k FROM type::table($t) GROUP BY k")
+            .bind(("t", RETRIEVAL_LEDGER_TABLE))
+            .await
+            .expect("readback");
+        let rows: Vec<serde_json::Value> = res.take(0).expect("rows");
+        assert_eq!(rows.len(), 3, "one row per kind: {rows:?}");
+        for row in &rows {
+            let n = row["n"].as_u64().expect("count");
+            assert_eq!(n, 1, "{row:?}");
+        }
     }
 }
 

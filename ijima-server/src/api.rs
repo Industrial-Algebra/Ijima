@@ -185,6 +185,27 @@ fn internal(e: ijima_core::IjimaError) -> ApiError {
     }
 }
 
+/// Unique-per-process retrieval ids: nanos + a monotonic counter —
+/// no new dependency, collision-free within and across restarts
+/// (nanos differ across restarts by wall clock).
+fn new_retrieval_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let seq = N.fetch_add(1, Ordering::SeqCst);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("rl_{nanos:x}_{seq:x}")
+}
+
+fn retrieval_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Query params carrying an optional namespace override + limit.
 #[derive(Deserialize, Default)]
 struct NsQuery {
@@ -570,6 +591,8 @@ async fn search_memories(
     // by similarity across all of them (pi-mempalace parity; the "empty
     // brain" incident: the pre-WS2 definition only merged private +
     // global, so freshly-imported corpora were invisible).
+    let mut wall_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut resolved_ns: Option<NamespaceId> = None;
     let hits = if req.scope.as_deref() == Some("visible") {
         let own_ns = principal.0.personal_namespace();
         let mut namespaces = vec![own_ns.clone(), NamespaceId::new("global")];
@@ -594,16 +617,45 @@ async fn search_memories(
                 .search_memories(&ns, &query, limit)
                 .await
                 .map_err(internal)?;
+            for h in &hits {
+                wall_of
+                    .entry(h.memory.id.0.clone())
+                    .or_insert_with(|| ns.as_str().to_string());
+            }
             merged = merge_search_hits(merged, hits, limit);
         }
         merged
     } else {
         let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+        resolved_ns = Some(ns.clone());
         store
             .search_memories(&ns, &query, limit)
             .await
             .map_err(internal)?
     };
+    let rid = new_retrieval_id();
+    let ts = retrieval_ts();
+    let ledger: Vec<ijima_core::RetrievalEvent> = hits
+        .iter()
+        .enumerate()
+        .map(|(rank, h)| ijima_core::RetrievalEvent {
+            retrieval_id: rid.clone(),
+            kind: ijima_core::RetrievalKind::Search,
+            namespace: wall_of
+                .get(&h.memory.id.0)
+                .cloned()
+                .or_else(|| resolved_ns.as_ref().map(|n| n.as_str().to_string()))
+                .unwrap_or_default(),
+            memory_id: h.memory.id.0.clone(),
+            principal: principal.0.principal.as_str().to_string(),
+            rank: rank as u32,
+            similarity: Some(h.similarity),
+            ts_unix: ts,
+        })
+        .collect();
+    if let Err(e) = store.append_retrieval_events(&ledger).await {
+        tracing::warn!(error = %e, "retrieval ledger append failed (search)");
+    }
     Ok(Json(SearchResponse { memories: hits }))
 }
 
@@ -984,22 +1036,70 @@ async fn wakeup(
     // returns 8 freshest + 12 highest-importance. Dedup by id.
     let mut seen = std::collections::HashSet::new();
     let mut personal_essentials = Vec::with_capacity(WAKEUP_PERSONAL_LIMIT);
+    // Stratum tags ride the composition (v0.4.2 ledger): the recency
+    // stratum is admitted first, the lexicographic fill second; the
+    // tag is what the ledger records per served memory.
+    let mut stratum_of: std::collections::HashMap<String, ijima_core::RetrievalKind> =
+        std::collections::HashMap::new();
     for m in recent.map_err(internal)? {
         if seen.insert(m.id.0.clone()) {
+            stratum_of.insert(m.id.0.clone(), ijima_core::RetrievalKind::WakeupRecent);
             personal_essentials.push(m);
         }
     }
     for m in top.map_err(internal)? {
         if seen.insert(m.id.0.clone()) {
+            stratum_of.insert(
+                m.id.0.clone(),
+                ijima_core::RetrievalKind::WakeupLexicographic,
+            );
             personal_essentials.push(m);
         }
     }
     personal_essentials.truncate(WAKEUP_PERSONAL_LIMIT);
 
+    let doctrine = doctrine.map_err(internal)?;
+    // The ledger (v0.4.2): fire-and-logged — an append failure warns
+    // and the wake-up still succeeds. Observability must not become a
+    // new failure mode for reads.
+    let rid = new_retrieval_id();
+    let ts = retrieval_ts();
+    let mut ledger: Vec<ijima_core::RetrievalEvent> =
+        Vec::with_capacity(personal_essentials.len() + doctrine.len());
+    for (rank, m) in personal_essentials.iter().enumerate() {
+        ledger.push(ijima_core::RetrievalEvent {
+            retrieval_id: rid.clone(),
+            kind: *stratum_of
+                .get(m.id.0.as_str())
+                .unwrap_or(&ijima_core::RetrievalKind::WakeupLexicographic),
+            namespace: essentials_ns.as_str().to_string(),
+            memory_id: m.id.0.clone(),
+            principal: principal.0.principal.as_str().to_string(),
+            rank: rank as u32,
+            similarity: None,
+            ts_unix: ts,
+        });
+    }
+    for (rank, m) in doctrine.iter().enumerate() {
+        ledger.push(ijima_core::RetrievalEvent {
+            retrieval_id: rid.clone(),
+            kind: ijima_core::RetrievalKind::WakeupDoctrine,
+            namespace: doctrine_ns.as_str().to_string(),
+            memory_id: m.id.0.clone(),
+            principal: principal.0.principal.as_str().to_string(),
+            rank: rank as u32,
+            similarity: None,
+            ts_unix: ts,
+        });
+    }
+    if let Err(e) = store.append_retrieval_events(&ledger).await {
+        tracing::warn!(error = %e, "retrieval ledger append failed (wakeup)");
+    }
+
     Ok(Json(WakeupResponse {
         identity: serde_json::json!({ "principal": principal.0.principal.as_str() }),
         personal_essentials,
-        doctrine: doctrine.map_err(internal)?,
+        doctrine,
     }))
 }
 
@@ -1639,12 +1739,30 @@ async fn browse_memories(
     }
     let ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).min(500);
-    Ok(Json(
-        store
-            .list_memories_filtered(&ns, q.project.as_deref(), q.topic.as_deref(), limit)
-            .await
-            .map_err(internal)?,
-    ))
+    let memories = store
+        .list_memories_filtered(&ns, q.project.as_deref(), q.topic.as_deref(), limit)
+        .await
+        .map_err(internal)?;
+    let rid = new_retrieval_id();
+    let ts = retrieval_ts();
+    let ledger: Vec<ijima_core::RetrievalEvent> = memories
+        .iter()
+        .enumerate()
+        .map(|(rank, m)| ijima_core::RetrievalEvent {
+            retrieval_id: rid.clone(),
+            kind: ijima_core::RetrievalKind::Browse,
+            namespace: ns.as_str().to_string(),
+            memory_id: m.id.0.clone(),
+            principal: principal.0.principal.as_str().to_string(),
+            rank: rank as u32,
+            similarity: None,
+            ts_unix: ts,
+        })
+        .collect();
+    if let Err(e) = store.append_retrieval_events(&ledger).await {
+        tracing::warn!(error = %e, "retrieval ledger append failed (browse)");
+    }
+    Ok(Json(memories))
 }
 
 #[derive(Serialize)]
@@ -3562,6 +3680,46 @@ mod tests {
         (app, auth, store)
     }
 
+    /// Like [`app_with_store_handle`] but returns the concrete
+    /// [`crate::SurrealStore`] so a test can read the raw ledger table.
+    /// An optional embedder enables the search path.
+    async fn app_with_concrete_store(
+        embedder: Option<Arc<dyn ijima_core::Embedder>>,
+    ) -> (Router, Arc<IjimaAuth>, Arc<crate::SurrealStore>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(match &embedder {
+            Some(e) => crate::SurrealStore::open_embedded_with(e.clone())
+                .await
+                .expect("open"),
+            None => crate::SurrealStore::open_embedded().await.expect("open"),
+        });
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner.clone();
+        let app = app(
+            auth.clone(),
+            store,
+            kg,
+            embedder,
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+        );
+        (app, auth, store_inner)
+    }
+
+    /// Raw read of the retrieval-ledger table (the ledger is write-only
+    /// until U2 adds query routes).
+    async fn ledger_rows(store: &Arc<crate::SurrealStore>) -> Vec<serde_json::Value> {
+        let mut res = store
+            .db
+            .query("SELECT * FROM retrieval_ledger")
+            .await
+            .expect("ledger query");
+        res.take::<Vec<serde_json::Value>>(0).expect("ledger rows")
+    }
+
     /// A minimal explicitly-saved memory for stratified wake-up seeds.
     fn seed_mem(id: &str, importance: f32, created_at: &str) -> Memory {
         Memory {
@@ -3794,6 +3952,250 @@ mod tests {
         for id in &seeded {
             assert!(ids.contains(id), "row {id} must be present");
         }
+    }
+
+    #[tokio::test]
+    async fn wakeup_ledger_records_strata_kinds_and_shared_retrieval_id() {
+        let (app, auth, store) = app_with_concrete_store(None).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let admin = bearer(&auth, "ci", "admin");
+        let ns = NamespaceId::new("ns_elliott_private");
+
+        // High-importance, older rows — the lexicographic candidates.
+        for i in 0..10 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(&format!("mem_lex_{i:02}"), 0.9, &format!("{:04}", 1000 + i)),
+                )
+                .await
+                .expect("seed lex");
+        }
+        // Recent, low-importance rows. Ten old rows exceed the recency
+        // stratum (8), so the stratum cannot swallow the whole wall and
+        // the lexicographic fill still contributes its own events.
+        for i in 0..3 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(&format!("mem_fresh_{i}"), 0.1, &format!("{:04}", 3000 + i)),
+                )
+                .await
+                .expect("seed fresh");
+        }
+
+        // Doctrine via the real ingest path used by wake-up tests.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "id": "doc_ledger",
+                            "content": "doctrine ledger baseline",
+                            "project": "ijima",
+                            "topic": "arch",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let body = wakeup_body(app, &read).await;
+        assert!(!body["personal_essentials"].as_array().unwrap().is_empty());
+
+        let rows = ledger_rows(&store).await;
+        assert!(!rows.is_empty(), "wakeup appends ledger events");
+        let kinds: Vec<&str> = rows.iter().map(|r| r["kind"].as_str().unwrap()).collect();
+        assert!(
+            kinds.contains(&"WakeupRecent"),
+            "recency stratum recorded: {rows:?}"
+        );
+        assert!(
+            kinds.contains(&"WakeupLexicographic"),
+            "lexicographic fill recorded: {rows:?}"
+        );
+        assert!(
+            kinds.contains(&"WakeupDoctrine"),
+            "doctrine recorded: {rows:?}"
+        );
+
+        let doctrine_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+        assert!(
+            rows.iter()
+                .any(|r| r["kind"] == "WakeupDoctrine" && r["namespace"] == doctrine_ns),
+            "doctrine event carries the doctrine namespace: {rows:?}"
+        );
+
+        let ids: std::collections::HashSet<&str> = rows
+            .iter()
+            .map(|r| r["retrieval_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "one request, one retrieval_id: {ids:?}");
+
+        for kind in ["WakeupRecent", "WakeupLexicographic", "WakeupDoctrine"] {
+            let ranks: Vec<u64> = rows
+                .iter()
+                .filter(|r| r["kind"] == kind)
+                .map(|r| r["rank"].as_u64().unwrap())
+                .collect();
+            let distinct: std::collections::HashSet<u64> = ranks.iter().copied().collect();
+            assert_eq!(
+                distinct.len(),
+                ranks.len(),
+                "ranks distinct within {kind}: {ranks:?}"
+            );
+            assert!(
+                ranks.iter().all(|r| *r < rows.len() as u64),
+                "ranks are 0..n within {kind}: {ranks:?}"
+            );
+        }
+
+        for r in &rows {
+            assert!(
+                r.get("similarity").is_none(),
+                "wakeup events carry no similarity: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_ledger_records_served_set_with_wall_attribution() {
+        use ijima_core::HashEmbedder;
+        let embedder: Arc<dyn ijima_core::Embedder> = Arc::new(HashEmbedder::default());
+        let (app, auth, store) = app_with_concrete_store(Some(embedder)).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        let mut private = seed_mem("mem_search_priv", 0.5, "0");
+        private.content = "searchable ledger row".into();
+        store
+            .store_memory(&NamespaceId::new("ns_elliott_private"), private)
+            .await
+            .expect("seed private");
+        let mut global = seed_mem("mem_search_global", 0.5, "0");
+        global.content = "searchable ledger row global".into();
+        store
+            .store_memory(&NamespaceId::new("global"), global)
+            .await
+            .expect("seed global");
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/search")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "searchable ledger row",
+                            "limit": 5,
+                            "scope": "visible"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let hits = body["memories"].as_array().unwrap().clone();
+        assert!(!hits.is_empty(), "search served at least one hit: {body}");
+
+        let rows = ledger_rows(&store).await;
+        let mut events: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["kind"] == "Search").collect();
+        assert_eq!(events.len(), hits.len(), "one event per hit: {rows:?}");
+        events.sort_by_key(|r| r["rank"].as_u64().unwrap());
+
+        for (i, hit) in hits.iter().enumerate() {
+            let ev = events[i];
+            assert_eq!(
+                ev["rank"].as_u64().unwrap(),
+                i as u64,
+                "event rank matches response order: {rows:?}"
+            );
+            assert_eq!(
+                ev["memory_id"].as_str().unwrap(),
+                hit["memory"]["id"].as_str().unwrap(),
+                "event id matches hit id"
+            );
+            let ev_sim = ev["similarity"]
+                .as_f64()
+                .expect("search event has similarity");
+            let hit_sim = hit["similarity"].as_f64().expect("hit similarity");
+            assert!(
+                (ev_sim - hit_sim).abs() < 1e-5,
+                "similarity matches: {ev_sim} vs {hit_sim}"
+            );
+        }
+
+        let walls: std::collections::HashSet<&str> = events
+            .iter()
+            .map(|r| r["namespace"].as_str().unwrap())
+            .collect();
+        assert!(
+            walls.len() >= 2,
+            "wall attribution spans at least two walls: {walls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn browse_ledger_records_ranked_events() {
+        let (app, auth, store) = app_with_concrete_store(None).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let ns = NamespaceId::new("ns_elliott_private");
+        for i in 0..3 {
+            store
+                .store_memory(
+                    &ns,
+                    seed_mem(&format!("mem_browse_{i}"), 0.5, &format!("{:04}", 1000 + i)),
+                )
+                .await
+                .expect("seed browse");
+        }
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories?namespace=ns_elliott_private")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        assert_eq!(body.as_array().unwrap().len(), 3);
+
+        let rows = ledger_rows(&store).await;
+        let mut browse: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["kind"] == "Browse").collect();
+        assert_eq!(browse.len(), 3, "three browse events: {rows:?}");
+        browse.sort_by_key(|r| r["rank"].as_u64().unwrap());
+        let ranks: Vec<u64> = browse.iter().map(|r| r["rank"].as_u64().unwrap()).collect();
+        assert_eq!(ranks, vec![0, 1, 2], "ranks 0,1,2");
+        for ev in &browse {
+            assert_eq!(ev["namespace"], "ns_elliott_private");
+            assert!(
+                ev.get("similarity").is_none(),
+                "browse carries no similarity: {ev:?}"
+            );
+        }
+        let ids: std::collections::HashSet<&str> = browse
+            .iter()
+            .map(|r| r["retrieval_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 1, "one shared retrieval_id: {ids:?}");
     }
 
     #[cfg(feature = "rate-limit")]

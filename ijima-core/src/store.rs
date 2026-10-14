@@ -15,6 +15,7 @@ use crate::{
     harness::Harness,
     namespace::NamespaceMembership,
     palace::{PalaceGraph, ProjectTaxon, Room, TunnelTraversal},
+    retrieval::RetrievalEvent,
 };
 
 /// A scored semantic-search hit: the matched [`Memory`] plus its cosine
@@ -120,6 +121,12 @@ pub trait Store: Send + Sync {
     /// recency stratum guarantees fresh entries reach wake-up even when
     /// the lexicographic top is saturated by high-importance rows.
     async fn recent_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
+    /// Appends retrieval-ledger events (v0.4.2 observability). Read
+    /// handlers call this fire-and-logged: an append failure is
+    /// warned about, never propagated — the ledger must not become a
+    /// new failure mode for reads.
+    async fn append_retrieval_events(&self, events: &[RetrievalEvent]) -> Result<()>;
 
     /// Lists memories in `ns`, optionally filtered to `project`/`topic`.
     /// Powers `GET /memories` (the `memory_recall` browse path — distinct
