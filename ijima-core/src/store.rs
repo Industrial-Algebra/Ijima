@@ -9,6 +9,7 @@
 
 use async_trait::async_trait;
 
+use crate::retrieval::RetrievalEvent;
 use crate::{
     AcceptedExtraction, DiaryEntry, Embedding, IjimaError, Memory, MemoryId, NamespaceId,
     QueuedExtraction, RepoDirectory, Result, Session, SessionId, SessionTurn, TokenRevocation,
@@ -120,6 +121,34 @@ pub trait Store: Send + Sync {
     /// recency stratum guarantees fresh entries reach wake-up even when
     /// the lexicographic top is saturated by high-importance rows.
     async fn recent_memories(&self, ns: &NamespaceId, limit: usize) -> Result<Vec<Memory>>;
+
+    /// Appends retrieval-ledger events (v0.4.2 observability). Read
+    /// handlers call this fire-and-logged: an append failure is
+    /// warned about, never propagated — the ledger must not become a
+    /// new failure mode for reads.
+    async fn append_retrieval_events(&self, events: &[RetrievalEvent]) -> Result<()>;
+
+    /// Lists ledger events, newest first. `namespace` of `None` spans
+    /// every wall; `since_unix` filters `ts_unix >= since_unix`;
+    /// `limit` caps the rows (hard ceiling 10_000 applies at the
+    /// route, the store trusts the caller).
+    async fn list_retrieval_events(
+        &self,
+        namespace: Option<&str>,
+        since_unix: u64,
+        limit: usize,
+    ) -> Result<Vec<crate::retrieval::RetrievalEvent>>;
+
+    /// Aggregated ledger counts for one wall (`namespace` of `None`
+    /// spans every wall).
+    async fn retrieval_ledger_stats(
+        &self,
+        namespace: Option<&str>,
+    ) -> Result<crate::retrieval::RetrievalStats>;
+
+    /// Deletes ledger events with `ts_unix < before_unix`. Returns
+    /// the number deleted.
+    async fn prune_retrieval_events(&self, before_unix: u64) -> Result<usize>;
 
     /// Lists memories in `ns`, optionally filtered to `project`/`topic`.
     /// Powers `GET /memories` (the `memory_recall` browse path — distinct

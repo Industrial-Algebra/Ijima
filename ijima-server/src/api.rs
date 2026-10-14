@@ -84,6 +84,11 @@ pub fn app(
         .route("/memories/check", post(check_duplicate))
         .route("/memories/search", post(search_memories))
         .route("/memories/stats", get(memory_stats))
+        .route(
+            "/retrieval/ledger",
+            get(retrieval_ledger_list).delete(retrieval_ledger_prune),
+        )
+        .route("/retrieval/ledger/stats", get(retrieval_ledger_stats))
         .route("/memories/{id}", get(recall_memory).delete(delete_memory))
         .route("/memories/{id}/promote", post(promote_memory))
         .route("/rooms", get(list_rooms))
@@ -1682,6 +1687,84 @@ async fn memory_stats(
         .map(|(project, count)| ProjectCount { project, count })
         .collect();
     Ok(Json(NamespaceStats { total, projects }))
+}
+
+// ---------- retrieval ledger (v0.4.2 read side) ----------
+
+#[derive(Serialize)]
+struct RetrievalLedgerResponse {
+    events: Vec<ijima_core::RetrievalEvent>,
+}
+
+#[derive(Serialize)]
+struct RetrievalStatsResponse {
+    stats: ijima_core::RetrievalStats,
+}
+
+#[derive(Serialize)]
+struct RetrievalPruneResponse {
+    deleted: usize,
+}
+
+#[derive(Deserialize)]
+struct RetrievalListQuery {
+    namespace: Option<String>,
+    since_unix: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RetrievalPruneQuery {
+    before_unix: u64,
+}
+
+async fn retrieval_ledger_list(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<RetrievalListQuery>,
+) -> Result<Json<RetrievalLedgerResponse>, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let events = store
+        .list_retrieval_events(
+            q.namespace.as_deref(),
+            q.since_unix.unwrap_or(0),
+            q.limit.unwrap_or(500).min(10_000),
+        )
+        .await
+        .map_err(internal)?;
+    Ok(Json(RetrievalLedgerResponse { events }))
+}
+
+async fn retrieval_ledger_stats(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<RetrievalListQuery>,
+) -> Result<Json<RetrievalStatsResponse>, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let stats = store
+        .retrieval_ledger_stats(q.namespace.as_deref())
+        .await
+        .map_err(internal)?;
+    Ok(Json(RetrievalStatsResponse { stats }))
+}
+
+async fn retrieval_ledger_prune(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Query(q): Query<RetrievalPruneQuery>,
+) -> Result<Json<RetrievalPruneResponse>, ApiError> {
+    if !principal.0.may(ijima_core::capabilities::ADMIN) {
+        return Err(ApiError::Forbidden);
+    }
+    let deleted = store
+        .prune_retrieval_events(q.before_unix)
+        .await
+        .map_err(internal)?;
+    Ok(Json(RetrievalPruneResponse { deleted }))
 }
 
 // ===== Repo directory (global registry — Context Mapper) =====
@@ -6108,5 +6191,155 @@ mod tests {
         let a_row = recall_doctrine(&app, &admin, "rh-a").await;
         assert!(a_row.superseded_by.is_none());
         assert_eq!(a_row.content, "A");
+    }
+
+    #[tokio::test]
+    async fn retrieval_routes_require_admin() {
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/retrieval/ledger")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn retrieval_routes_list_and_prune_roundtrip() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let admin = bearer(&auth, "root", "admin");
+        // The write side (U1) records one Browse event per served memory.
+        // This tree implements the read side only (the sibling's handler
+        // hooks are merged on top later), so seed the equivalent ledger
+        // rows directly through the store that the browse route would.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mk = |rid: &str, mid: &str, rank: u32| ijima_core::RetrievalEvent {
+            retrieval_id: rid.into(),
+            kind: ijima_core::RetrievalKind::Browse,
+            namespace: "ns_elliott_private".into(),
+            memory_id: mid.into(),
+            principal: "elliott".into(),
+            rank,
+            similarity: None,
+            ts_unix: now,
+        };
+        store
+            .append_retrieval_events(&[
+                mk("rl_api_1", "mem_ledger_1", 0),
+                mk("rl_api_1", "mem_ledger_2", 1),
+            ])
+            .await
+            .expect("seed ledger");
+
+        // List: 200, non-empty, at least one Browse, all wire fields set.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/retrieval/ledger?limit=50")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let events = body["events"].as_array().expect("events array");
+        assert!(!events.is_empty(), "events go non-empty: {body}");
+        assert!(
+            events.iter().any(|e| e["kind"] == "Browse"),
+            "at least one Browse event: {body}"
+        );
+        for e in events {
+            for field in [
+                "retrieval_id",
+                "kind",
+                "namespace",
+                "memory_id",
+                "principal",
+                "rank",
+                "ts_unix",
+            ] {
+                assert!(
+                    e.get(field).is_some() && !e[field].is_null(),
+                    "field {field} present in {e}"
+                );
+            }
+        }
+        let earlier = events.len();
+
+        // Stats: total reflects the seeded rows and breaks down by kind.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/retrieval/ledger/stats")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let stats = body_json(res).await;
+        assert!(
+            stats["stats"]["total"].as_u64().unwrap() >= 1,
+            "stats.total >= 1: {stats}"
+        );
+        assert!(
+            stats["stats"]["by_kind"]["Browse"].as_u64().unwrap() >= 1,
+            "stats.by_kind carries Browse: {stats}"
+        );
+
+        // Prune everything newer than now+10 (i.e. all seeded rows).
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/retrieval/ledger?before_unix={}", now + 10))
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let pruned = body_json(res).await;
+        assert_eq!(
+            pruned["deleted"].as_u64().unwrap(),
+            earlier as u64,
+            "deleted equals the earlier count: {pruned}"
+        );
+
+        // Follow-up list: empty.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/retrieval/ledger?limit=50")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let after = body_json(res).await;
+        assert_eq!(
+            after["events"].as_array().unwrap().len(),
+            0,
+            "pruned to empty: {after}"
+        );
     }
 }

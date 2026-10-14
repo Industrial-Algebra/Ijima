@@ -9,6 +9,7 @@
 - [Namespaces & Multi-Tenancy](./concepts/multi-tenancy.md)
 - [Provenance & Trust Tiers](./concepts/provenance.md)
 - [Corrections: Supersede](./concepts/corrections.md)
+- [The retrieval ledger](concepts/retrieval-ledger.md)
 - [Capabilities & GrantTokens](./concepts/capabilities.md)
 - [Sessions & the Miner](./concepts/mining.md)
 
