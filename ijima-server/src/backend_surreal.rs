@@ -31,8 +31,8 @@ use ijima_core::{
     AcceptedExtraction, AuthorityScope, DiaryEntry, DoctrineVersion, Embedding, Entity, EntityId,
     EntityRecord, IjimaError, InstanceId, KgStats, KnowledgeGraph, Memory, MemoryId,
     NamespaceCount, NamespaceId, NamespaceMembership, PalaceGraph, ProjectTaxon, QueuedExtraction,
-    RepoDirectory, Result, Room, SearchHit, Session, SessionId, SessionTurn, Store, StoreStats,
-    TokenRevocation, Triple, Tunnel, TunnelTraversal,
+    RepoDirectory, Result, RetrievalEvent, RetrievalStats, Room, SearchHit, Session, SessionId,
+    SessionTurn, Store, StoreStats, TokenRevocation, Triple, Tunnel, TunnelTraversal,
     embeddings::Embedder,
     harness::Harness,
     memory::{Citation, EvidenceGrade, MemorySource},
@@ -60,10 +60,12 @@ const TRIPLES_TABLE: &str = "triples";
 const REPO_TABLE: &str = "repo_directory";
 /// Archived doctrine revisions (direction B, v0.4.0).
 const DOCTRINE_VERSIONS_TABLE: &str = "doctrine_versions";
+/// Append-only retrieval ledger (v0.4.2 observability).
+const RETRIEVAL_LEDGER_TABLE: &str = "retrieval_ledger";
 
 /// A SurrealDB-backed [`Store`].
 pub struct SurrealStore {
-    db: Surreal<Db>,
+    pub(crate) db: Surreal<Db>,
     /// When present, memories are embedded at write time and
     /// [`Store::search_memories`] is available. When absent, search
     /// returns [`IjimaError::Store`].
@@ -287,6 +289,10 @@ impl SurrealStore {
         DEFINE INDEX IF NOT EXISTS trip_subj     ON TABLE triples         FIELDS subject;
         DEFINE INDEX IF NOT EXISTS trip_obj      ON TABLE triples         FIELDS object;
         DEFINE INDEX IF NOT EXISTS dv_ns_doc     ON TABLE doctrine_versions FIELDS namespace, doc_id;
+        DEFINE TABLE IF NOT EXISTS retrieval_ledger SCHEMALESS;
+        DEFINE INDEX IF NOT EXISTS rl_ns_ts  ON TABLE retrieval_ledger FIELDS namespace, ts_unix;
+        DEFINE INDEX IF NOT EXISTS rl_mid    ON TABLE retrieval_ledger FIELDS memory_id;
+        DEFINE INDEX IF NOT EXISTS rl_rid    ON TABLE retrieval_ledger FIELDS retrieval_id;
     "#;
 
     /// Fetches all `(project, topic)` cells in `ns` with their memory counts.
@@ -1077,6 +1083,148 @@ impl Store for SurrealStore {
             .await
             .map_err(store_err)?;
         take_memories(&mut result)
+    }
+
+    async fn append_retrieval_events(&self, events: &[RetrievalEvent]) -> Result<()> {
+        // Keys carry kind + namespace: memory ids are wall-LOCAL, so
+        // rid+mid+rank alone collides when the same id serves at the
+        // same rank from two lists in one retrieval (personal rank 0
+        // and doctrine rank 0 — review round 1, P1-1). Kind separates
+        // the lists by construction (doctrine events are the only
+        // WakeupDoctrine; personal events are the only strata kinds).
+        // One bad event must not abort the batch — attempt every
+        // append, surface the FIRST error after the loop, so a
+        // partial write still records everything appendable.
+        let mut first_err = None;
+        for e in events {
+            let key = format!(
+                "{}_{}_{}_{}_{}",
+                e.retrieval_id,
+                e.kind.as_str(),
+                e.namespace,
+                e.memory_id,
+                e.rank
+            );
+            let res: std::result::Result<
+                Option<surrealdb::types::SerdeWrapper<RetrievalEvent>>,
+                _,
+            > = self
+                .db
+                .create((RETRIEVAL_LEDGER_TABLE, key))
+                .content(surrealdb::types::SerdeWrapper(e.clone()))
+                .await;
+            if let Err(e) = res
+                && first_err.is_none()
+            {
+                first_err = Some(store_err(e));
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    async fn list_retrieval_events(
+        &self,
+        namespace: Option<&str>,
+        since_unix: u64,
+        limit: usize,
+    ) -> Result<Vec<RetrievalEvent>> {
+        let sql = match namespace {
+            Some(_) => {
+                "SELECT * FROM type::table($t) WHERE namespace = $ns AND ts_unix >= $since ORDER BY ts_unix DESC, rank ASC LIMIT $limit"
+            }
+            None => {
+                "SELECT * FROM type::table($t) WHERE ts_unix >= $since ORDER BY ts_unix DESC, rank ASC LIMIT $limit"
+            }
+        };
+        let mut q = self
+            .db
+            .query(sql)
+            .bind(("t", RETRIEVAL_LEDGER_TABLE))
+            .bind(("since", since_unix))
+            .bind(("limit", limit as i64));
+        if let Some(ns) = namespace {
+            q = q.bind(("ns", ns.to_string()));
+        }
+        let mut res = q.await.map_err(|e| IjimaError::Store {
+            detail: format!("ledger list: {e}"),
+        })?;
+        take_vec::<RetrievalEvent>(&mut res)
+    }
+
+    async fn retrieval_ledger_stats(&self, namespace: Option<&str>) -> Result<RetrievalStats> {
+        let sql = match namespace {
+            Some(_) => {
+                "SELECT count() AS total, math::min(ts_unix) AS oldest, math::max(ts_unix) AS newest, array::group(kind) AS kinds, array::group(memory_id) AS mids, array::group(retrieval_id) AS rids FROM type::table($t) WHERE namespace = $ns GROUP ALL"
+            }
+            None => {
+                "SELECT count() AS total, math::min(ts_unix) AS oldest, math::max(ts_unix) AS newest, array::group(kind) AS kinds, array::group(memory_id) AS mids, array::group(retrieval_id) AS rids FROM type::table($t) GROUP ALL"
+            }
+        };
+        let mut q = self.db.query(sql).bind(("t", RETRIEVAL_LEDGER_TABLE));
+        if let Some(ns) = namespace {
+            q = q.bind(("ns", ns.to_string()));
+        }
+        let mut res = q.await.map_err(|e| IjimaError::Store {
+            detail: format!("ledger stats: {e}"),
+        })?;
+        let rows: Vec<serde_json::Value> = res.take(0).map_err(|e| IjimaError::Store {
+            detail: format!("ledger stats take: {e}"),
+        })?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(RetrievalStats::default());
+        };
+        let total = row["total"].as_u64().unwrap_or(0);
+        if total == 0 {
+            return Ok(RetrievalStats::default());
+        }
+        let mut by_kind: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        if let Some(kinds) = row["kinds"].as_array() {
+            for k in kinds {
+                if let Some(name) = k.as_str() {
+                    *by_kind.entry(name.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+        let distinct = |field: &str| -> u64 {
+            let Some(arr) = row[field].as_array() else {
+                return 0;
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    seen.insert(s.to_string());
+                }
+            }
+            seen.len() as u64
+        };
+        Ok(RetrievalStats {
+            total,
+            by_kind,
+            distinct_memories: distinct("mids"),
+            distinct_retrievals: distinct("rids"),
+            oldest_ts_unix: row["oldest"].as_u64().unwrap_or(0),
+            newest_ts_unix: row["newest"].as_u64().unwrap_or(0),
+        })
+    }
+
+    async fn prune_retrieval_events(&self, before_unix: u64) -> Result<usize> {
+        let mut res = self
+            .db
+            .query("DELETE FROM type::table($t) WHERE ts_unix < $before RETURN id")
+            .bind(("t", RETRIEVAL_LEDGER_TABLE))
+            .bind(("before", before_unix))
+            .await
+            .map_err(|e| IjimaError::Store {
+                detail: format!("ledger prune: {e}"),
+            })?;
+        let rows: Vec<serde_json::Value> = res.take(0).map_err(|e| IjimaError::Store {
+            detail: format!("ledger prune take: {e}"),
+        })?;
+        Ok(rows.len())
     }
 
     async fn export_memories(
@@ -2200,7 +2348,7 @@ impl KnowledgeGraph for SurrealStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ijima_core::{NamespaceId, TurnRole};
+    use ijima_core::{NamespaceId, RetrievalKind, TurnRole};
 
     async fn fresh() -> SurrealStore {
         SurrealStore::open_embedded()
@@ -3537,6 +3685,142 @@ mod tests {
         // embedding; a no-embedding legacy row simply never matches.
         // The projection's null-tolerance is covered by the unit test
         // above plus the three paths already exercised here.
+    }
+
+    #[tokio::test]
+    async fn retrieval_events_append_and_round_trip() {
+        let store = fresh().await;
+        let mk = |rid: &str, mid: &str, rank: u32, kind: RetrievalKind| RetrievalEvent {
+            retrieval_id: rid.into(),
+            kind,
+            namespace: "ns_ledger".into(),
+            memory_id: mid.into(),
+            principal: "elliott".into(),
+            rank,
+            similarity: (kind == RetrievalKind::Search).then_some(0.5),
+            ts_unix: 42,
+        };
+        store
+            .append_retrieval_events(&[
+                mk("r1", "m1", 0, RetrievalKind::WakeupRecent),
+                mk("r1", "m2", 1, RetrievalKind::WakeupLexicographic),
+                mk("r1", "m3", 2, RetrievalKind::WakeupDoctrine),
+            ])
+            .await
+            .expect("append");
+        let mut res = store
+            .db
+            .query("SELECT count() AS n, type::string(kind) AS k FROM type::table($t) GROUP BY k")
+            .bind(("t", RETRIEVAL_LEDGER_TABLE))
+            .await
+            .expect("readback");
+        let rows: Vec<serde_json::Value> = res.take(0).expect("rows");
+        assert_eq!(rows.len(), 3, "one row per kind: {rows:?}");
+        for row in &rows {
+            let n = row["n"].as_u64().expect("count");
+            assert_eq!(n, 1, "{row:?}");
+        }
+    }
+
+    fn ledger_event(
+        rid: &str,
+        mid: &str,
+        rank: u32,
+        kind: RetrievalKind,
+        ns: &str,
+        ts: u64,
+    ) -> RetrievalEvent {
+        RetrievalEvent {
+            retrieval_id: rid.into(),
+            kind,
+            namespace: ns.into(),
+            memory_id: mid.into(),
+            principal: "elliott".into(),
+            rank,
+            similarity: (kind == RetrievalKind::Search).then_some(0.5),
+            ts_unix: ts,
+        }
+    }
+
+    #[tokio::test]
+    async fn retrieval_stats_aggregate_by_kind_and_distinctness() {
+        let store = fresh().await;
+        store
+            .append_retrieval_events(&[
+                ledger_event("r1", "m1", 0, RetrievalKind::WakeupRecent, "ns_ledger", 10),
+                ledger_event("r1", "m2", 1, RetrievalKind::WakeupRecent, "ns_ledger", 11),
+                ledger_event("r2", "m1", 0, RetrievalKind::Search, "ns_ledger", 12),
+            ])
+            .await
+            .expect("append");
+        let stats = store
+            .retrieval_ledger_stats(Some("ns_ledger"))
+            .await
+            .expect("stats");
+        assert_eq!(stats.total, 3, "{stats:?}");
+        assert_eq!(stats.by_kind["WakeupRecent"], 2, "{stats:?}");
+        assert_eq!(stats.by_kind["Search"], 1, "{stats:?}");
+        assert_eq!(stats.distinct_memories, 2, "{stats:?}");
+        assert_eq!(stats.distinct_retrievals, 2, "{stats:?}");
+        assert_eq!(stats.oldest_ts_unix, 10, "{stats:?}");
+        assert_eq!(stats.newest_ts_unix, 12, "{stats:?}");
+        // Namespace filter: no events on an unrelated wall.
+        let other = store
+            .retrieval_ledger_stats(Some("other"))
+            .await
+            .expect("stats other");
+        assert_eq!(other.total, 0, "{other:?}");
+    }
+
+    #[tokio::test]
+    async fn retrieval_list_orders_newest_first_and_filters() {
+        let store = fresh().await;
+        store
+            .append_retrieval_events(&[
+                ledger_event("r1", "m100", 0, RetrievalKind::Browse, "ns_ledger", 100),
+                ledger_event("r1", "m200", 0, RetrievalKind::Browse, "ns_ledger", 200),
+                ledger_event("r2", "m300a", 2, RetrievalKind::Browse, "ns_ledger", 300),
+                ledger_event("r2", "m300b", 0, RetrievalKind::Browse, "ns_ledger", 300),
+            ])
+            .await
+            .expect("append");
+        let rows = store
+            .list_retrieval_events(None, 150, 10)
+            .await
+            .expect("list");
+        // Newest-first: the two ts-300 rows precede the ts-200 row; the
+        // ts-100 row is below the floor. Equal-ts rows break ties by
+        // rank ascending (rank 0 before rank 2).
+        let ts: Vec<u64> = rows.iter().map(|e| e.ts_unix).collect();
+        assert_eq!(ts, vec![300, 300, 200], "newest first: {ts:?}");
+        assert_eq!(rows[0].rank, 0, "rank 0 first within equal ts");
+        assert_eq!(rows[1].rank, 2, "rank 2 second within equal ts");
+        let limited = store
+            .list_retrieval_events(Some("ns_ledger"), 0, 1)
+            .await
+            .expect("list limited");
+        assert_eq!(limited.len(), 1, "limit caps the rows: {limited:?}");
+    }
+
+    #[tokio::test]
+    async fn retrieval_prune_deletes_only_older() {
+        let store = fresh().await;
+        store
+            .append_retrieval_events(&[
+                ledger_event("r1", "m10", 0, RetrievalKind::Browse, "ns_ledger", 10),
+                ledger_event("r2", "m20", 0, RetrievalKind::Browse, "ns_ledger", 20),
+                ledger_event("r3", "m30", 0, RetrievalKind::Browse, "ns_ledger", 30),
+            ])
+            .await
+            .expect("append");
+        let deleted = store.prune_retrieval_events(20).await.expect("prune");
+        assert_eq!(deleted, 1, "only the ts-10 event is older than 20");
+        let remaining = store
+            .list_retrieval_events(None, 0, 10)
+            .await
+            .expect("list");
+        let ts: Vec<u64> = remaining.iter().map(|e| e.ts_unix).collect();
+        assert_eq!(ts, vec![30, 20], "ts 20 and 30 survive: {ts:?}");
     }
 }
 
