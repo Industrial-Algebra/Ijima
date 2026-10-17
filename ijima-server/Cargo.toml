@@ -36,6 +36,11 @@ cli = ["dep:clap", "dep:reqwest", "dep:ijima-client", "dep:sha2"]
 # acceleration is a future opt-in (requires a CUDA toolchain).
 # When this is off, the store cannot embed new memories at write time.
 embeddings-candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:tokenizers", "dep:hf-hub", "ijima-core/serde"]
+# Katakuri-backed embedding backend: same candle forward pass as
+# `embeddings-candle`, but file acquisition + validation + tokenization
+# through Katakuri (S1–S4). Drops hf-hub and the HF tokenizers crate
+# from this path. Takes precedence when both embedding features are on.
+embeddings-katakuri = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:katakuri", "ijima-core/serde"]
 # Mining trigger orchestration: fetch session turns, run the extraction
 # engine, and ingest (Auto → palace, PendingReview → review queue).
 mining = ["dep:ijima-miner", "dep:proserpina-agent", "backend-surreal", "ijima-miner/llm", "proserpina-agent/backend-http"]
@@ -67,6 +72,11 @@ candle-nn = { version = "0.11", default-features = false, optional = true }
 candle-transformers = { version = "0.11", default-features = false, optional = true }
 tokenizers = { version = "0.21", optional = true }
 hf-hub = { version = "1.0", features = ["blocking"], optional = true }
+# Katakuri: the IA model-ecosystem layer (safetensors validation,
+# WordPiece tokenizer with golden-parity to tokenizers 0.21, BERT
+# specs, hub fetch + content-addressed cache). Versioned to the
+# published v0.1.0 (git-pin b7a3a3f superseded by crates.io 0.1.0).
+katakuri = { version = "0.1.0", features = ["hub-net"], optional = true }
 schubert = { version = "0.5", features = ["std", "crypto", "policy"], optional = true }
 base64 = { version = "0.23", optional = true }
 surrealdb = { version = "3", default-features = false, features = ["kv-mem", "kv-surrealkv"], optional = true }

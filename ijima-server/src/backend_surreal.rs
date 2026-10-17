@@ -18,7 +18,7 @@
 //!
 //! ## Namespace handling (v0)
 //!
-//! Ijima's [`NamespaceId`](ijima_core::NamespaceId) is stored as a record
+//! Ijima's [`NamespaceId`] is stored as a record
 //! field and every query filters by it, so isolation is enforced
 //! per-query under concurrent access. A future promotion maps each
 //! namespace onto a native SurrealDB `NS`/`DB` scope once the

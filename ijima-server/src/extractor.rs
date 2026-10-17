@@ -34,7 +34,7 @@ pub struct AuthPrincipal(pub AuthenticatedPrincipal);
 
 /// Error returned when authentication fails; maps to HTTP 401. When
 /// Schubert rate limiting is enabled and the principal's token bucket is
-/// exhausted, [`AuthRejection::RateLimited`] maps to HTTP 429.
+/// exhausted, `AuthRejection::RateLimited` maps to HTTP 429.
 #[derive(Debug)]
 pub enum AuthRejection {
     /// Authentication failed (missing/invalid token). Owned string so the
