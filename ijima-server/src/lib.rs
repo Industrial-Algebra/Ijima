@@ -15,8 +15,8 @@
 //!
 //! The transport-free type contract — including the [`ijima_core::Store`]
 //! trait this crate implements — lives in [`ijima_core`]; the extraction
-//! engine lives in [`ijima_miner`]; harness adapters live in
-//! [`ijima_client`].
+//! engine lives in `ijima-miner`; harness adapters live in
+//! `ijima-client`.
 //!
 //! ## Features
 //!
@@ -30,6 +30,10 @@
 //! - `embeddings-candle`: candle (Hugging Face Rust ML) embedding backend.
 //!   The IA-standard default, consistent with Quantizon. Builds candle
 //!   on CPU; GPU/CUDA acceleration is a future opt-in.
+//! - `embeddings-katakuri`: Katakuri-backed embedding backend — the same
+//!   candle forward pass, but file acquisition, validation, and
+//!   tokenization through Katakuri (no `hf-hub`, no HF `tokenizers`).
+//!   Takes precedence when both embedding features are enabled.
 //! - `server-auth`: Schubert proof-carrying capability tokens for both
 //!   authentication and authorization on Gr(4,8). Loads
 //!   [`policy/policy.toml`](https://github.com/Industrial-Algebra/Ijima).
@@ -56,6 +60,9 @@ pub mod migration;
 
 #[cfg(feature = "embeddings-candle")]
 pub mod embeddings_candle;
+
+#[cfg(feature = "embeddings-katakuri")]
+pub mod embeddings_katakuri;
 
 #[cfg(feature = "server-auth")]
 pub mod auth;

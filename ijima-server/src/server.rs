@@ -142,7 +142,22 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let seed = key_store::load_or_create(&key_path)?;
     let auth = Arc::new(IjimaAuth::from_embedded_policy_with_seed(seed)?);
 
-    #[cfg(feature = "embeddings-candle")]
+    #[cfg(feature = "embeddings-katakuri")]
+    let embedder: Option<Arc<dyn ijima_core::Embedder>> = {
+        // Model resolution: env IJIMA_EMBED_MODEL > config file > default.
+        let model = crate::config::resolve_str(
+            "IJIMA_EMBED_MODEL",
+            file_config.embedding_model.clone(),
+            crate::embeddings_katakuri::DEFAULT_MODEL,
+        );
+        let revision = std::env::var("IJIMA_EMBED_REVISION").unwrap_or_else(|_| "main".into());
+        let e: Arc<dyn ijima_core::Embedder> = Arc::new(
+            crate::embeddings_katakuri::KatakuriEmbedder::from_hub_model(&model, &revision)?,
+        );
+        tracing::info!(model = %e.model_id(), "embedder loaded");
+        Some(e)
+    };
+    #[cfg(all(feature = "embeddings-candle", not(feature = "embeddings-katakuri")))]
     let embedder: Option<Arc<dyn ijima_core::Embedder>> = {
         // Model resolution: env IJIMA_EMBED_MODEL > config file > default.
         let model = crate::config::resolve_str(
@@ -157,7 +172,7 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
         tracing::info!(model = %e.model_id(), "embedder loaded");
         Some(e)
     };
-    #[cfg(not(feature = "embeddings-candle"))]
+    #[cfg(not(any(feature = "embeddings-candle", feature = "embeddings-katakuri")))]
     let embedder: Option<Arc<dyn ijima_core::Embedder>> = None;
 
     // Persistent on disk by default (SurrealKv). Data dir resolution:
@@ -165,11 +180,11 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
     let data_dir = crate::config::resolve_data_dir()?;
     let db_path = data_dir.join("ijima.db");
 
-    #[cfg(feature = "embeddings-candle")]
+    #[cfg(any(feature = "embeddings-katakuri", feature = "embeddings-candle"))]
     let store_inner = Arc::new(
         crate::SurrealStore::open_persistent_with(&db_path, embedder.clone().unwrap()).await?,
     );
-    #[cfg(not(feature = "embeddings-candle"))]
+    #[cfg(not(any(feature = "embeddings-candle", feature = "embeddings-katakuri")))]
     let store_inner = Arc::new(crate::SurrealStore::open_persistent(&db_path).await?);
     let store: Arc<dyn Store> = store_inner.clone();
 
