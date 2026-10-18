@@ -8,11 +8,13 @@
 //! after the fact. Events carry ids and metadata only — never memory
 //! content and never query text.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// Which read path served the memory, and (for wake-up) from which
 /// stratum. Serialized PascalCase like the crate's other enums.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum RetrievalKind {
     /// Wake-up recency stratum (admitted first; the starvation fix).
     WakeupRecent,
@@ -46,7 +48,8 @@ impl RetrievalKind {
 /// One served memory. `rank` is the 0-based position in the response
 /// list it was served in; `similarity` is set for `Search` events only
 /// (cosine similarity, 0.0–1.0) and absent otherwise.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RetrievalEvent {
     /// Groups all events from one request.
     pub retrieval_id: String,
@@ -64,14 +67,15 @@ pub struct RetrievalEvent {
     /// Cosine similarity; present on `Search` events only. Skipped
     /// when `None` (a serialized null here would poison reads — the
     /// v0.4.1 lesson).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     pub similarity: Option<f32>,
     /// Unix seconds.
     pub ts_unix: u64,
 }
 
 /// Aggregated ledger counts (U2): what the read paths served, by kind.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RetrievalStats {
     /// Total events counted.
     pub total: u64,
