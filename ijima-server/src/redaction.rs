@@ -21,7 +21,7 @@
 //!
 //! Replaced with `[REDACTED:<category>]`. A richer detector (secret-
 //! scanning service, NER for PII) can swap in behind the same
-//! [`Redactor`] interface later.
+//! [`Redactor`](crate::redaction::Redactor) interface later.
 
 use serde::Serialize;
 

@@ -22,6 +22,9 @@ as deliberate, logged maintenance targets).
 | `POST` | `/memories/search` | `memory:read` |
 | `POST` | `/memories/:id/promote` | `trust:promote` |
 | `GET` | `/wakeup` | `memory:read` (top-N wake-up context) |
+| `GET` | `/retrieval/ledger` | `admin` (list events) |
+| `GET` | `/retrieval/ledger/stats` | `admin` (aggregate counts) |
+| `DELETE` | `/retrieval/ledger` | `admin` (prune older than `before_unix`) |
 | `GET` | `/rooms`, `/taxonomy`, `/palace/graph`, `/tunnel` | `memory:read` |
 | `POST` | `/kg/triples[?namespace=]` | `knowledge:write` |
 | `POST` | `/kg/triples/:id/invalidate?namespace=` | `knowledge:write` |

@@ -4,6 +4,39 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-10-17 — the retrieval ledger
+
+- **The retrieval ledger.** Every wake-up, search, and browse response
+  appends one event per served memory to an append-only ledger — ids
+  and metadata only, never content, never query text. Stratum kinds
+  (recent/lexicographic/doctrine) tag wake-up events; `scope=visible`
+  search attributes each hit to its contributing wall (duplicate ids
+  resolve to the winning occurrence). Fire-and-logged: an append
+  failure warns and the read still succeeds. Admin-gated read side:
+  `GET /retrieval/ledger` (list), `GET /retrieval/ledger/stats`
+  (counts by kind, distinct memories/retrievals, ts range), and
+  `DELETE /retrieval/ledger?before_unix=` (prune). Instrumentation
+  before policy: the 10-08 dive found zero telemetry on the read
+  paths; admission, starvation, and frequency questions are now
+  answerable after the fact. (PR #139; two review rounds — round 1
+  caught a ledger-key collision on wall-local memory ids and a
+  wrong-wall attribution, both fixed with named regressions.)
+- **Katakuri embeddings backend** (`embeddings-katakuri` feature,
+  non-default): the candle forward pass with model-ecosystem layers
+  routed through Katakuri 0.1.0 — digest-verified content-addressed
+  hub cache, spec-gated safetensors validation, WordPiece tokenizer —
+  replacing `hf-hub` and `tokenizers` on the new path, no `unsafe`
+  mmap. Bit-for-bit parity with the candle backend pinned by an
+  `#[ignore]`d parity test (`KATAKURI_TEST_PARITY=1`). The candle
+  feature is untouched (blast-radius containment); katakuri wins when
+  both are enabled. (PR #140.)
+- **Extension manifest**: typebox declared as a host-provided peer
+  dependency (`*` range) — resolves the pi loader's duplicate-module
+  warning on every pinned host. (PR #138.)
+- **CI**: the doctrine-ingest workflow's YAML was unparseable from
+  inception (one missing `#`) and failed with zero jobs on every push
+  to every branch; repaired — triggers now scope as intended.
+
 ## [0.4.1] — 2026-10-09 — legacy-row hotfix
 
 - **Wake-up/list/search no longer 500 on walls holding pre-0.4 rows.**

@@ -1,6 +1,6 @@
 # Doctrine Ingest
 
-On merge to `main` touching `doctrine/**`, this workflow ingests the
+# On merge to `main` touching `doctrine/**`, this workflow ingests the
 # seed-pack markdown into the running Ijima daemon.
 
 name: Ingest doctrine
