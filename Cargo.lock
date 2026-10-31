@@ -2502,7 +2502,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tokio",
  "tokio-retry",
@@ -2948,7 +2948,7 @@ dependencies = [
  "schubert",
  "serde",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.0",
  "surrealdb",
  "thiserror 2.0.21",
  "tokenizers 0.21.4",
@@ -3132,12 +3132,13 @@ dependencies = [
 
 [[package]]
 name = "katakuri"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d7eb5727621f1f050931ba213f2d21ee983ce2b2f334e2280f706b6ae94e6d"
+checksum = "a6e11cab87f3a9738b0049b1dd89e98aacdf653617b8142e76ef0a8455834d72"
 dependencies = [
+ "libc",
  "serde_json",
- "sha2 0.11.1",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "unicode-normalization",
  "unicode_categories",
@@ -5439,9 +5440,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
  "cfg-if 1.0.4",
  "cpufeatures 0.3.0",
