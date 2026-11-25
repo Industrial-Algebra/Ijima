@@ -48,7 +48,7 @@ wiring), with:
   duration via an ephemeral auth key).
 
 Re-runs are idempotent by construction: identical comment content
-hits the content-hash dedup (a `400 duplicate` is success to the
+hits the content-hash dedup (a `409 duplicate` is success to the
 workflow), and comment ids are stable across fetches.
 
 ## Boundaries (v1)
