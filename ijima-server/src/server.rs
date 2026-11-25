@@ -239,6 +239,13 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| ijima_core::namespace::DOCTRINE_NAMESPACE.to_string()),
         ),
+        // The registry's declared descriptions (v0.4.3 U2) — the
+        // production path from `[[namespaces]]` to `GET /namespaces`.
+        declared: file_config
+            .namespaces
+            .iter()
+            .map(|n| (n.slug.clone(), n.description.clone()))
+            .collect(),
     };
 
     let app = api::app_with_walls(

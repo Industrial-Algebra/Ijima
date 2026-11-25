@@ -39,6 +39,17 @@ use std::path::{Path, PathBuf};
 use ijima_core::{IjimaError, Result};
 use serde::Deserialize;
 
+/// A deployment-declared namespace description (v0.4.3 U2): static
+/// metadata for the wall registry. Walls exist without being
+/// declared — declarations only add descriptions.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct DeclaredNamespace {
+    /// The wall slug (e.g. `ns_ia_shared`).
+    pub slug: String,
+    /// Human-readable description for the registry listing.
+    pub description: String,
+}
+
 /// The file layer of Ijima configuration (`ijima.toml`). Every field is
 /// optional — absent fields fall through to env/defaults.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -69,6 +80,10 @@ pub struct IjimaToml {
     /// deployment whose doctrine lives on an org wall sets this
     /// (e.g. `ns_ia_doctrine`).
     pub doctrine_namespace: Option<String>,
+    /// Deployment-declared wall descriptions for the registry (U2).
+    /// Absent key = empty — walls exist without being declared.
+    #[serde(default)]
+    pub namespaces: Vec<DeclaredNamespace>,
 }
 
 /// Returns the config file path if one exists, per the discovery order.
