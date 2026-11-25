@@ -26,3 +26,33 @@ jobs:
         run: cargo test --all-features
       - name: Cargo doc
         run: cargo doc --no-deps --all-features
+
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: parity-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Cache model downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/katakuri/hub
+            ~/.cache/huggingface
+          key: parity-models-v1
+      - name: Run embedding parity acceptance
+        env:
+          KATAKURI_TEST_PARITY: "1"
+        run: |
+          cargo test -p ijima-server \
+            --features 'embeddings-candle embeddings-katakuri' \
+            --test embedding_parity -- --ignored 2>&1 | tail -20
