@@ -32,6 +32,14 @@ The unit runs with a dedicated user, `ProtectSystem=strict`,
 - Structured logs via `tracing` (`IJIMA_LOG` filter; `RUST_LOG` also
   respected by convention).
 
+## Configuration
+
+Keys accepted in `ijima.toml` (unknown keys are ignored):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `doctrine_namespace` | `ns_doctrine` | The wall wake-up's doctrine section reads (and the doctrine routes treat as the doctrine wall). Set when the deployment's doctrine lives on an org wall, e.g. `ns_ia_doctrine`. |
+
 ## Lifecycle (AutoCapture TTL)
 
 A daily background sweep deletes `source = AutoCapture` memories

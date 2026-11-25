@@ -27,3 +27,8 @@ rate_multiplier = 1.0
 # fetch. Changing this after memories are stored changes the embedding
 # space — re-embed or accept mixed-space search until re-mined.
 embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+
+# The wall wake-up's doctrine section reads. Default: "ns_doctrine".
+# Set when the deployment's doctrine lives on an org wall
+# (e.g. "ns_ia_doctrine").
+# doctrine_namespace = "ns_doctrine"

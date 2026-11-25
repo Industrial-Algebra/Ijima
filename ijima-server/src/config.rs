@@ -64,6 +64,11 @@ pub struct IjimaToml {
     /// swept daily; other tiers never age out (v0.3.0 U4).
     /// (env `IJIMA_AUTOCAPTURE_TTL_DAYS`, default `30`; `0` disables).
     pub autocapture_ttl_days: Option<u32>,
+    /// The wall wake-up's doctrine section reads (v0.4.3 fossil fix).
+    /// Default `ns_doctrine` — the public default is unchanged; a
+    /// deployment whose doctrine lives on an org wall sets this
+    /// (e.g. `ns_ia_doctrine`).
+    pub doctrine_namespace: Option<String>,
 }
 
 /// Returns the config file path if one exists, per the discovery order.

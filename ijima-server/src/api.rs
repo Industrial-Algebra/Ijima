@@ -63,6 +63,23 @@ use ijima_core::federation::{
     RoutedWriteReceipt,
 };
 
+/// Deployment-configured wall routing (v0.4.3 U1). Defaults keep the
+/// pre-0.4.3 behavior: doctrine reads `DOCTRINE_NAMESPACE`.
+#[derive(Clone)]
+pub struct WallConfig {
+    /// The wall wake-up's doctrine section and the doctrine routes
+    /// treat as the doctrine wall.
+    pub doctrine_namespace: NamespaceId,
+}
+
+impl Default for WallConfig {
+    fn default() -> Self {
+        Self {
+            doctrine_namespace: NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE),
+        }
+    }
+}
+
 /// Builds the Ijima HTTP application router.
 ///
 /// `auth` and `store` are shared via axum's [`Extension`] layer; the
@@ -75,6 +92,34 @@ pub fn app(
     redactor: Arc<Redactor>,
     #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
     #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
+) -> Router {
+    app_with_walls(
+        auth,
+        store,
+        kg,
+        embedder,
+        redactor,
+        #[cfg(feature = "rate-limit")]
+        rate_limiter,
+        #[cfg(feature = "federation")]
+        federation_config,
+        WallConfig::default(),
+    )
+}
+
+/// [`app`] with deployment-configured wall routing (v0.4.3 U1).
+// The parameter list is `app`'s plus `walls` by contract; the shared
+// Extension set is what makes it one argument too many.
+#[allow(clippy::too_many_arguments)]
+pub fn app_with_walls(
+    auth: Arc<crate::IjimaAuth>,
+    store: Arc<dyn Store>,
+    kg: Arc<dyn KnowledgeGraph>,
+    embedder: Option<Arc<dyn Embedder>>,
+    redactor: Arc<Redactor>,
+    #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
+    #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
+    walls: WallConfig,
 ) -> Router {
     let router = Router::new()
         .route("/export", get(export))
@@ -136,7 +181,8 @@ pub fn app(
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
-        .layer(Extension(redactor));
+        .layer(Extension(redactor))
+        .layer(Extension(Arc::new(walls)));
 
     #[cfg(feature = "federation")]
     let router = router.layer(Extension(federation_config));
@@ -844,15 +890,17 @@ struct DoctrineRollbackRequest {
     to: u32,
 }
 
-/// Resolves the namespace for a doctrine version read: the global wall
-/// (default, or explicit `ns_doctrine`) needs ADMIN or DOCTRINE_WRITE;
-/// any other wall needs MEMORY_READ and the usual `resolve_ns` rules.
+/// Resolves the namespace for a doctrine version read: the configured
+/// doctrine wall (default, or explicit `?namespace=<configured>`) needs
+/// ADMIN or DOCTRINE_WRITE; any other wall needs MEMORY_READ and the
+/// usual `resolve_ns` rules.
 async fn resolve_doctrine_read_ns(
     principal: &AuthPrincipal,
     store: &dyn Store,
     requested: Option<&str>,
+    doctrine_ns: &NamespaceId,
 ) -> Result<NamespaceId, ApiError> {
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let default_ns = doctrine_ns.as_str();
     if requested.is_none_or(|r| r == default_ns) {
         if !principal.0.may(ADMIN) && !principal.0.may(DOCTRINE_WRITE) {
             return Err(ApiError::Forbidden);
@@ -866,14 +914,15 @@ async fn resolve_doctrine_read_ns(
     }
 }
 
-/// Ingests a curated doctrine entry into the global `ns_doctrine`
-/// namespace. Admin-gated — doctrine is PR-reviewed in Git and never
-/// written by agents. Idempotent: re-ingesting identical content is a
-/// no-op; changed content archives the prior body as a version and bumps
-/// `revision`. No redaction (doctrine is pre-reviewed).
+/// Ingests a curated doctrine entry into the configured doctrine wall
+/// (default `ns_doctrine`). Admin-gated — doctrine is PR-reviewed in Git
+/// and never written by agents. Idempotent: re-ingesting identical
+/// content is a no-op; changed content archives the prior body as a
+/// version and bumps `revision`. No redaction (doctrine is pre-reviewed).
 async fn ingest_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
 ) -> Result<Json<DoctrineIngestResponse>, ApiError> {
@@ -883,12 +932,12 @@ async fn ingest_doctrine(
         return Err(ApiError::Forbidden);
     }
     // Targeting rules (v0.3.0 U1b):
-    //   - no `?namespace=` -> the global curated namespace, admin-only;
+    //   - no `?namespace=` -> the configured doctrine wall, admin-only;
     //   - admin may target anything `resolve_ns` allows (never private);
     //   - `doctrine:write` may target any non-private wall explicitly —
     //     the capability itself is the write authority, so membership is
     //     not consulted (the ingest timer is not a reader).
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let default_ns = walls.doctrine_namespace.as_str();
     let ns = if let Some(requested) = q.namespace.as_deref() {
         if principal.0.may(ijima_core::capabilities::ADMIN) {
             resolve_ns(&principal, store.as_ref(), Some(requested)).await?
@@ -964,9 +1013,16 @@ async fn ingest_doctrine(
 async fn list_doctrine_versions(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<DoctrineDocQuery>,
 ) -> Result<Json<Vec<DoctrineVersion>>, ApiError> {
-    let ns = resolve_doctrine_read_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+    let ns = resolve_doctrine_read_ns(
+        &principal,
+        store.as_ref(),
+        q.namespace.as_deref(),
+        &walls.doctrine_namespace,
+    )
+    .await?;
     let versions = store
         .list_doctrine_versions(&ns, &MemoryId(q.id))
         .await
@@ -979,17 +1035,18 @@ async fn list_doctrine_versions(
 async fn rollback_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRollbackRequest>,
 ) -> Result<Json<IdResponse>, ApiError> {
     if !principal.0.may(ADMIN) {
         return Err(ApiError::Forbidden);
     }
-    // Same `?namespace=` rules as ingest: default is the global wall;
-    // an explicit wall goes through `resolve_ns` (never private).
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    // Same `?namespace=` rules as ingest: default is the configured
+    // doctrine wall; an explicit wall goes through `resolve_ns` (never
+    // private).
     let ns = match q.namespace.as_deref() {
-        None => NamespaceId::new(default_ns),
+        None => walls.doctrine_namespace.clone(),
         Some(requested) => resolve_ns(&principal, store.as_ref(), Some(requested)).await?,
     };
     let id = store
@@ -1026,6 +1083,7 @@ struct WakeupResponse {
 async fn wakeup(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<WakeupResponse>, ApiError> {
     if !principal.0.may(MEMORY_READ) {
@@ -1036,7 +1094,7 @@ async fn wakeup(
     // (e.g. `ns_ia_shared`) when the client is configured with one.
     // Doctrine stays universal.
     let essentials_ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
-    let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
+    let doctrine_ns = walls.doctrine_namespace.clone();
 
     let (top, recent, doctrine) = tokio::join!(
         store.list_memories(&essentials_ns, WAKEUP_PERSONAL_LIMIT),
@@ -3770,6 +3828,30 @@ mod tests {
             None,
             #[cfg(feature = "federation")]
             Arc::new(InstanceFederationConfig::default()),
+        );
+        (app, auth, store)
+    }
+
+    /// Like [`app_with_store_handle`] but with deployment-configured wall
+    /// routing (v0.4.3 U1): `doctrine_ns` is the configured doctrine wall.
+    async fn app_with_walls_handle(doctrine_ns: &str) -> (Router, Arc<IjimaAuth>, Arc<dyn Store>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app_with_walls(
+            auth.clone(),
+            store.clone(),
+            kg,
+            None,
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+            WallConfig {
+                doctrine_namespace: NamespaceId::new(doctrine_ns),
+            },
         );
         (app, auth, store)
     }
@@ -6908,6 +6990,338 @@ mod tests {
             after["events"].as_array().unwrap().len(),
             0,
             "pruned to empty: {after}"
+        );
+    }
+
+    // ---------- v0.4.3 U1: configurable doctrine wall ----------
+
+    /// Seeds one memory into `ns` and returns nothing (setup helper).
+    async fn seed_into(store: &Arc<dyn Store>, ns: &str, id: &str) {
+        store
+            .store_memory(&NamespaceId::new(ns), seed_mem(id, 0.9, "0001"))
+            .await
+            .expect("seed memory");
+    }
+
+    #[tokio::test]
+    async fn wakeup_reads_configured_doctrine_wall() {
+        let (app, auth, store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        seed_into(&store, "ns_cfg_doctrine", "mem_cfg_doctrine").await;
+        seed_into(&store, "ns_doctrine", "mem_default_doctrine").await;
+
+        let body = wakeup_body(app, &read).await;
+        let ids: Vec<&str> = body["doctrine"]
+            .as_array()
+            .expect("doctrine array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["mem_cfg_doctrine"],
+            "doctrine section serves exactly the configured wall: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_app_unchanged_doctrine_wall() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        seed_into(&store, "ns_doctrine", "mem_default_doctrine").await;
+
+        let body = wakeup_body(app, &read).await;
+        let doctrine = body["doctrine"].as_array().expect("doctrine array");
+        assert_eq!(doctrine.len(), 1, "default doctrine wall served: {body:?}");
+        assert_eq!(doctrine[0]["id"], "mem_default_doctrine");
+    }
+
+    #[tokio::test]
+    async fn doctrine_routes_respect_configured_wall() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let admin = bearer(&auth, "ci", ADMIN);
+
+        let resp = post_doctrine(&app, &admin, "/doctrine", "doc_cfg", "configured body").await;
+        assert_eq!(resp["revision"].as_u64(), Some(1));
+
+        // The body lives on the configured wall …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_cfg_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "configured wall holds the doc"
+        );
+        let mem: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mem.content, "configured body");
+
+        // … and NOT on the default wall.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "default wall stays empty under configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_default_wall_becomes_ordinary_open_under_configuration() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        // No doctrine caps, no admin, no membership anywhere.
+        let read = bearer(&auth, "outsider", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/doctrine/versions?namespace=ns_doctrine&id=missing")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "ordinary open-wall path, not the doctrine gate: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let versions: Vec<ijima_core::DoctrineVersion> =
+            serde_json::from_slice(&bytes).expect("versions array");
+        assert!(
+            versions.is_empty(),
+            "an unwritten wall reads as an empty list: {versions:?}"
+        );
+
+        // Control: the same request under the default configuration hits
+        // the doctrine authz gate on the default wall.
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "outsider", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/doctrine/versions?namespace=ns_doctrine&id=missing")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "default config gates the doctrine wall"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_wall_keeps_doctrine_ingest_prohibition() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let ingest = bearer(&auth, "research-ingest", DOCTRINE_WRITE);
+        let admin = bearer(&auth, "root", ADMIN);
+
+        let post = |token: String, uri: String| {
+            let app = app.clone();
+            async move {
+                let body = serde_json::json!({
+                    "id": "d_prohibited",
+                    "content": "should not land on the doctrine wall",
+                    "project": "p",
+                    "topic": "t",
+                })
+                .to_string();
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", &token)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Explicit configured-wall ingest hits the doctrine prohibition.
+        let res = post(
+            ingest.clone(),
+            "/doctrine?namespace=ns_cfg_doctrine".to_string(),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "the explicit configured-wall ingest is prohibited"
+        );
+
+        // Distinguisher: a non-private, non-configured org wall the
+        // principal is a member of accepts the same body as ordinary
+        // content — the 403 above is the doctrine prohibition, not a
+        // generic rejection.
+        let grant = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/grant")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "namespace": "ns_team_shared",
+                            "principal": "research-ingest"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.status(), StatusCode::OK, "membership grant");
+
+        let res = post(ingest, "/doctrine?namespace=ns_team_shared".to_string()).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "an ordinary org wall the token may write succeeds"
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d_prohibited?namespace=ns_team_shared")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "row landed on the org wall");
+    }
+
+    #[tokio::test]
+    async fn rollback_targets_configured_wall() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let admin = bearer(&auth, "ci", ADMIN);
+
+        post_doctrine(&app, &admin, "/doctrine", "doc_cfg", "body A").await;
+        post_doctrine(&app, &admin, "/doctrine", "doc_cfg", "body B").await;
+
+        // Unqualified rollback (no `?namespace=`) targets the configured
+        // wall.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "doc_cfg", "to": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "rollback succeeded");
+
+        // The active body lives on the configured wall.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_cfg_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "configured wall holds the doc"
+        );
+        let mem: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mem.content, "body A");
+        assert_eq!(mem.revision, Some(1));
+
+        // The archived (outgoing) revision lives there too.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/doctrine/versions?namespace=ns_cfg_doctrine&id=doc_cfg")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions: Vec<ijima_core::DoctrineVersion> = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == 2 && v.content == "body B"),
+            "archived revision on the configured wall: {versions:?}"
+        );
+
+        // The old default wall stays empty.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "the old wall stays empty"
         );
     }
 }
