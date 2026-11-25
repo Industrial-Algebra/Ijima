@@ -76,7 +76,7 @@ hf-hub = { version = "1.0", features = ["blocking"], optional = true }
 # WordPiece tokenizer with golden-parity to tokenizers 0.21, BERT
 # specs, hub fetch + content-addressed cache). Versioned to the
 # published v0.1.0 (git-pin b7a3a3f superseded by crates.io 0.1.0).
-katakuri = { version = "0.1.0", features = ["hub-net"], optional = true }
+katakuri = { version = "0.2.0", features = ["hub-net"], optional = true }
 schubert = { version = "0.5", features = ["std", "crypto", "policy"], optional = true }
 base64 = { version = "0.23", optional = true }
 surrealdb = { version = "3", default-features = false, features = ["kv-mem", "kv-surrealkv"], optional = true }
