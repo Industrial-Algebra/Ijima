@@ -53,6 +53,7 @@ jobs:
         env:
           KATAKURI_TEST_PARITY: "1"
         run: |
+          set -o pipefail
           cargo test -p ijima-server \
             --features 'embeddings-candle embeddings-katakuri' \
             --test embedding_parity -- --ignored 2>&1 | tail -20
