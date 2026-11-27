@@ -2899,7 +2899,7 @@ dependencies = [
 
 [[package]]
 name = "ijima-client"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "ijima-core",
  "reqwest 0.13.5",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "ijima-core"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "serde",
@@ -2923,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "ijima-miner"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "ijima-core",
  "proserpina-agent",
@@ -2934,7 +2934,7 @@ dependencies = [
 
 [[package]]
 name = "ijima-pi"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "ijima-core",
  "serde",
@@ -2944,7 +2944,7 @@ dependencies = [
 
 [[package]]
 name = "ijima-server"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "async-trait",
  "axum",
