@@ -45,9 +45,22 @@ rustPlatform.buildRustPackage rec {
   nativeBuildInputs = [
     pkg-config
     patchelf
+    cmake
   ];
   buildInputs = [ openssl ];
 
+  # nixpkgs' cargo-setup-hook unconditionally forces system-library
+  # mode on a set of -sys crates (AWS_LC_SYS_USE_SYSTEM=1,
+  # LIBSQLITE3_SYS_USE_PKG_CONFIG=1, ...). Two of those bite this
+  # package: no system AWS-LC exists (the katakuri path pulls
+  # rustls-aws-lc into the closure — aws-lc-sys panics in system
+  # mode), and sqlite3 is meant to compile bundled (rusqlite
+  # "bundled"). Unset both in preBuild (setup hooks have already run;
+  # cargoBuildHook has not) and give aws-lc-sys its cmake.
+  # Found in the 0.4.3 laniakea switch (Holmberg override, PR #122).
+  preBuild = ''
+    unset AWS_LC_SYS_USE_SYSTEM LIBSQLITE3_SYS_USE_PKG_CONFIG
+  '';
   # The stable-rustc LLVM mis-selection (see file header) also fires under
   # LTO; disabling it avoids the codegen path entirely. Perf delta for a
   # memory daemon is noise.
