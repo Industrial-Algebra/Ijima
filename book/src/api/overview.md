@@ -38,6 +38,7 @@ as deliberate, logged maintenance targets).
 | `POST` | `/tokens/revoke` | `admin` |
 | `GET` | `/tokens/revocations` | `admin` |
 | `POST` | `/namespaces/grant`, `/namespaces/revoke` | `admin` |
+| `GET` | `/namespaces[?all=true]` | `memory:read` (wall registry; `admin` for `?all=true`) |
 | `GET` | `/namespaces/members?namespace=` | `admin` |
 | `POST` | `/doctrine[?namespace=]` | `admin` (global) or `doctrine:write` (wall-scoped) |
 | `GET` | `/doctrine/versions[?namespace=&id=]` | `memory:read` (wall) / `admin` or `doctrine:write` (global) — list archived revisions |

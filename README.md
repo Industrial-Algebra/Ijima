@@ -28,7 +28,7 @@ re-implement memory logic.
 
 ## Status
 
-**v0.4.2 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
+**v0.4.3 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
 the pi extension on npm ([`@industrialalgebra/ijima-pi`](https://www.npmjs.com/package/@industrialalgebra/ijima-pi)).
 In production as a fleet's central memory service since August 2026
 (six-week soak reviewed 2026-09-21: error-free since 08-21, hourly mirror,
@@ -96,7 +96,7 @@ identities, and one-command admin rollback.
 
 ```bash
 # Build the daemon + CLI (full feature set)
-cargo build --features "http,server-auth,backend-surreal,embeddings-candle,cli,mining" --bin ijima
+cargo build --features "http,server-auth,backend-surreal,embeddings-katakuri,cli,mining" --bin ijima
 
 # Issue an admin token (creates the issuer key on first run)
 export IJIMA_DIR=~/.ijima
@@ -137,7 +137,7 @@ curl http://127.0.0.1:7373/mining/queue -H "authorization: Bearer <review-token>
 | `http` (default) | axum HTTP daemon + routes |
 | `server-auth` | Schubert proof-carrying capability auth |
 | `backend-surreal` | SurrealDB store (SurrealKv persistence + Mem for tests) |
-| `embeddings-candle` | local candle embeddings (`all-MiniLM-L6-v2`, 384-dim) |
+| `embeddings-katakuri` | local embeddings via Katakuri (weights, tokenizer, digest-verified hub) + candle forward pass (`all-MiniLM-L6-v2`, 384-dim) — the shipped path since 0.4.3 (the pre-Katakuri `embeddings-candle` feature is deprecated as of 0.4.3) |
 | `mining` | session-mining pipeline (rules + Proserpina llm + review queue) |
 | `rate-limit` | Schubert rate limiting (capacity scales with capability codim) |
 | `tls` | optional HTTPS (`IJIMA_TLS_CERT` / `IJIMA_TLS_KEY`) |
