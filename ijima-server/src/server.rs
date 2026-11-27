@@ -232,7 +232,23 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
             Some(crate::rate_limit::make_rate_limiter(base, mult))
         };
 
-    let app = api::app(
+    let walls = api::WallConfig {
+        doctrine_namespace: ijima_core::NamespaceId::new(
+            file_config
+                .doctrine_namespace
+                .clone()
+                .unwrap_or_else(|| ijima_core::namespace::DOCTRINE_NAMESPACE.to_string()),
+        ),
+        // The registry's declared descriptions (v0.4.3 U2) — the
+        // production path from `[[namespaces]]` to `GET /namespaces`.
+        declared: file_config
+            .namespaces
+            .iter()
+            .map(|n| (n.slug.clone(), n.description.clone()))
+            .collect(),
+    };
+
+    let app = api::app_with_walls(
         auth,
         store,
         kg,
@@ -242,6 +258,7 @@ pub async fn serve(config: &DaemonConfig) -> Result<()> {
         rate_limiter,
         #[cfg(feature = "federation")]
         std::sync::Arc::new(federation_config_from_env()),
+        walls,
     );
 
     let addr = format!("{}:{}", config.host, config.port);

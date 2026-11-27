@@ -61,7 +61,7 @@ rustPlatform.buildRustPackage rec {
     "backend-sqlite"
     "server-auth"
     "rate-limit"
-    "embeddings-candle"
+    "embeddings-katakuri"
     "mining"
     "tls"
   ];

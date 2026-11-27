@@ -18,6 +18,7 @@
 //! | GET | `/memories/:id` | `memory:read` | `recall_memory` |
 //! | DELETE | `/memories/:id` | `memory:write` | `delete_memory` |
 //! | POST | `/memories/search` | `memory:read` | `search_memories` |
+//! | GET | `/namespaces[?all=true]` | `memory:read` (admin for `?all=true`) | `store_stats` (wall registry) |
 //! | POST | `/sessions/:session_id/turns` | `session:ingest` | `ingest_turn` |
 //! | GET | `/sessions/:session_id/turns` | `memory:read` | `session_turns` |
 //! | POST | `/sessions` | `session:ingest` | `create_session` |
@@ -63,6 +64,27 @@ use ijima_core::federation::{
     RoutedWriteReceipt,
 };
 
+/// Deployment-configured wall routing (v0.4.3 U1). Defaults keep the
+/// pre-0.4.3 behavior: doctrine reads `DOCTRINE_NAMESPACE`.
+#[derive(Clone)]
+pub struct WallConfig {
+    /// The wall wake-up's doctrine section and the doctrine routes
+    /// treat as the doctrine wall.
+    pub doctrine_namespace: NamespaceId,
+    /// Deployment-declared wall descriptions (v0.4.3 U2), keyed by slug
+    /// — the registry's `description` source. Empty when undeclared.
+    pub declared: std::collections::HashMap<String, String>,
+}
+
+impl Default for WallConfig {
+    fn default() -> Self {
+        Self {
+            doctrine_namespace: NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE),
+            declared: std::collections::HashMap::new(),
+        }
+    }
+}
+
 /// Builds the Ijima HTTP application router.
 ///
 /// `auth` and `store` are shared via axum's [`Extension`] layer; the
@@ -76,6 +98,34 @@ pub fn app(
     #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
     #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
 ) -> Router {
+    app_with_walls(
+        auth,
+        store,
+        kg,
+        embedder,
+        redactor,
+        #[cfg(feature = "rate-limit")]
+        rate_limiter,
+        #[cfg(feature = "federation")]
+        federation_config,
+        WallConfig::default(),
+    )
+}
+
+/// [`app`] with deployment-configured wall routing (v0.4.3 U1).
+// The parameter list is `app`'s plus `walls` by contract; the shared
+// Extension set is what makes it one argument too many.
+#[allow(clippy::too_many_arguments)]
+pub fn app_with_walls(
+    auth: Arc<crate::IjimaAuth>,
+    store: Arc<dyn Store>,
+    kg: Arc<dyn KnowledgeGraph>,
+    embedder: Option<Arc<dyn Embedder>>,
+    redactor: Arc<Redactor>,
+    #[cfg(feature = "rate-limit")] rate_limiter: Option<crate::rate_limit::RateLimitState>,
+    #[cfg(feature = "federation")] federation_config: Arc<InstanceFederationConfig>,
+    walls: WallConfig,
+) -> Router {
     let router = Router::new()
         .route("/export", get(export))
         .route("/health", get(health))
@@ -84,6 +134,7 @@ pub fn app(
         .route("/memories/check", post(check_duplicate))
         .route("/memories/search", post(search_memories))
         .route("/memories/stats", get(memory_stats))
+        .route("/namespaces", get(list_namespaces))
         .route(
             "/retrieval/ledger",
             get(retrieval_ledger_list).delete(retrieval_ledger_prune),
@@ -136,7 +187,8 @@ pub fn app(
         .layer(Extension(store))
         .layer(Extension(kg))
         .layer(Extension(embedder))
-        .layer(Extension(redactor));
+        .layer(Extension(redactor))
+        .layer(Extension(Arc::new(walls)));
 
     #[cfg(feature = "federation")]
     let router = router.layer(Extension(federation_config));
@@ -575,6 +627,35 @@ struct SearchResponse {
     memories: Vec<SearchHit>,
 }
 
+/// The walls a principal's `scope=visible` search spans (U2: also
+/// powers `GET /namespaces` — the listing and the search must never
+/// disagree about what "visible" means). Own private namespace + the
+/// `global` commons + open `ns_import_*` staging + every org wall they
+/// hold membership in, sorted and deduped.
+async fn visible_walls(
+    principal: &AuthPrincipal,
+    store: &dyn Store,
+) -> Result<Vec<NamespaceId>, ApiError> {
+    let own_ns = principal.0.personal_namespace();
+    let mut namespaces = vec![own_ns, NamespaceId::new("global")];
+    for ns in store
+        .list_namespaces_for_principal(principal.0.principal.as_str())
+        .await
+        .map_err(internal)?
+    {
+        namespaces.push(ns);
+    }
+    let stats = store.store_stats().await.map_err(internal)?;
+    for ns_count in &stats.namespaces {
+        if ns_count.namespace.starts_with("ns_import_") {
+            namespaces.push(NamespaceId::new(ns_count.namespace.clone()));
+        }
+    }
+    namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    namespaces.dedup_by(|a, b| a.as_str() == b.as_str());
+    Ok(namespaces)
+}
+
 async fn search_memories(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
@@ -598,23 +679,7 @@ async fn search_memories(
     // global, so freshly-imported corpora were invisible).
 
     let hits = if req.scope.as_deref() == Some("visible") {
-        let own_ns = principal.0.personal_namespace();
-        let mut namespaces = vec![own_ns.clone(), NamespaceId::new("global")];
-        for ns in store
-            .list_namespaces_for_principal(principal.0.principal.as_str())
-            .await
-            .map_err(internal)?
-        {
-            namespaces.push(ns);
-        }
-        let stats = store.store_stats().await.map_err(internal)?;
-        for ns_count in &stats.namespaces {
-            if ns_count.namespace.starts_with("ns_import_") {
-                namespaces.push(NamespaceId::new(ns_count.namespace.clone()));
-            }
-        }
-        namespaces.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        namespaces.dedup_by(|a, b| a.as_str() == b.as_str());
+        let namespaces = visible_walls(&principal, store.as_ref()).await?;
         let mut merged: Vec<(SearchHit, String)> = Vec::new();
         for ns in namespaces {
             let hits = store
@@ -844,15 +909,17 @@ struct DoctrineRollbackRequest {
     to: u32,
 }
 
-/// Resolves the namespace for a doctrine version read: the global wall
-/// (default, or explicit `ns_doctrine`) needs ADMIN or DOCTRINE_WRITE;
-/// any other wall needs MEMORY_READ and the usual `resolve_ns` rules.
+/// Resolves the namespace for a doctrine version read: the configured
+/// doctrine wall (default, or explicit `?namespace=<configured>`) needs
+/// ADMIN or DOCTRINE_WRITE; any other wall needs MEMORY_READ and the
+/// usual `resolve_ns` rules.
 async fn resolve_doctrine_read_ns(
     principal: &AuthPrincipal,
     store: &dyn Store,
     requested: Option<&str>,
+    doctrine_ns: &NamespaceId,
 ) -> Result<NamespaceId, ApiError> {
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let default_ns = doctrine_ns.as_str();
     if requested.is_none_or(|r| r == default_ns) {
         if !principal.0.may(ADMIN) && !principal.0.may(DOCTRINE_WRITE) {
             return Err(ApiError::Forbidden);
@@ -866,14 +933,15 @@ async fn resolve_doctrine_read_ns(
     }
 }
 
-/// Ingests a curated doctrine entry into the global `ns_doctrine`
-/// namespace. Admin-gated — doctrine is PR-reviewed in Git and never
-/// written by agents. Idempotent: re-ingesting identical content is a
-/// no-op; changed content archives the prior body as a version and bumps
-/// `revision`. No redaction (doctrine is pre-reviewed).
+/// Ingests a curated doctrine entry into the configured doctrine wall
+/// (default `ns_doctrine`). Admin-gated — doctrine is PR-reviewed in Git
+/// and never written by agents. Idempotent: re-ingesting identical
+/// content is a no-op; changed content archives the prior body as a
+/// version and bumps `revision`. No redaction (doctrine is pre-reviewed).
 async fn ingest_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRequest>,
 ) -> Result<Json<DoctrineIngestResponse>, ApiError> {
@@ -883,12 +951,12 @@ async fn ingest_doctrine(
         return Err(ApiError::Forbidden);
     }
     // Targeting rules (v0.3.0 U1b):
-    //   - no `?namespace=` -> the global curated namespace, admin-only;
+    //   - no `?namespace=` -> the configured doctrine wall, admin-only;
     //   - admin may target anything `resolve_ns` allows (never private);
     //   - `doctrine:write` may target any non-private wall explicitly —
     //     the capability itself is the write authority, so membership is
     //     not consulted (the ingest timer is not a reader).
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    let default_ns = walls.doctrine_namespace.as_str();
     let ns = if let Some(requested) = q.namespace.as_deref() {
         if principal.0.may(ijima_core::capabilities::ADMIN) {
             resolve_ns(&principal, store.as_ref(), Some(requested)).await?
@@ -964,9 +1032,16 @@ async fn ingest_doctrine(
 async fn list_doctrine_versions(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<DoctrineDocQuery>,
 ) -> Result<Json<Vec<DoctrineVersion>>, ApiError> {
-    let ns = resolve_doctrine_read_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
+    let ns = resolve_doctrine_read_ns(
+        &principal,
+        store.as_ref(),
+        q.namespace.as_deref(),
+        &walls.doctrine_namespace,
+    )
+    .await?;
     let versions = store
         .list_doctrine_versions(&ns, &MemoryId(q.id))
         .await
@@ -979,17 +1054,18 @@ async fn list_doctrine_versions(
 async fn rollback_doctrine(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<NsQuery>,
     Json(req): Json<DoctrineRollbackRequest>,
 ) -> Result<Json<IdResponse>, ApiError> {
     if !principal.0.may(ADMIN) {
         return Err(ApiError::Forbidden);
     }
-    // Same `?namespace=` rules as ingest: default is the global wall;
-    // an explicit wall goes through `resolve_ns` (never private).
-    let default_ns = ijima_core::namespace::DOCTRINE_NAMESPACE;
+    // Same `?namespace=` rules as ingest: default is the configured
+    // doctrine wall; an explicit wall goes through `resolve_ns` (never
+    // private).
     let ns = match q.namespace.as_deref() {
-        None => NamespaceId::new(default_ns),
+        None => walls.doctrine_namespace.clone(),
         Some(requested) => resolve_ns(&principal, store.as_ref(), Some(requested)).await?,
     };
     let id = store
@@ -1026,6 +1102,7 @@ struct WakeupResponse {
 async fn wakeup(
     principal: AuthPrincipal,
     Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls): Extension<Arc<WallConfig>>,
     Query(q): Query<NsQuery>,
 ) -> Result<Json<WakeupResponse>, ApiError> {
     if !principal.0.may(MEMORY_READ) {
@@ -1036,7 +1113,7 @@ async fn wakeup(
     // (e.g. `ns_ia_shared`) when the client is configured with one.
     // Doctrine stays universal.
     let essentials_ns = resolve_ns(&principal, store.as_ref(), q.namespace.as_deref()).await?;
-    let doctrine_ns = ijima_core::NamespaceId::new(ijima_core::namespace::DOCTRINE_NAMESPACE);
+    let doctrine_ns = walls.doctrine_namespace.clone();
 
     let (top, recent, doctrine) = tokio::join!(
         store.list_memories(&essentials_ns, WAKEUP_PERSONAL_LIMIT),
@@ -1816,6 +1893,102 @@ async fn memory_stats(
         .map(|(project, count)| ProjectCount { project, count })
         .collect();
     Ok(Json(NamespaceStats { total, projects }))
+}
+
+// ---------- the wall registry (v0.4.3 U2) ----------
+
+/// `GET /namespaces` query: `?all=true` spans every wall in the store
+/// (admin-only); the default lists the caller's visible set.
+#[derive(Deserialize)]
+struct NamespaceListQuery {
+    all: Option<bool>,
+}
+
+/// One wall in the registry listing.
+#[derive(Serialize)]
+struct NamespaceEntry {
+    namespace: String,
+    /// `private` | `shared` | `global` | `import` — inferred from the
+    /// slug pattern (see [`kind_of`]), never stored.
+    kind: &'static str,
+    memories: usize,
+    /// From the deployment's `[[namespaces]]` declarations, when present.
+    description: Option<String>,
+}
+
+/// Classifies a wall slug for the registry (v0.4.3 U2). Derived from the
+/// slug convention, never stored: the personal-wall shape is
+/// `ns_<principal>_private` for ANY principal (not only pi hosts), so
+/// the test is the `_private` suffix, not a prefix pattern.
+fn kind_of(slug: &str) -> &'static str {
+    if slug == "global" {
+        "global"
+    } else if slug.ends_with("_private") {
+        "private"
+    } else if slug.starts_with("ns_import_") {
+        "import"
+    } else {
+        "shared"
+    }
+}
+
+/// Lists the walls the caller's `scope=visible` search spans — the
+/// registry that makes the wall census queryable (v0.4.3 U2). The
+/// default listing is exactly [`visible_walls`]; `?all=true` (admin)
+/// spans every wall in the store. No wall is added unconditionally — the
+/// listing and the search-set invariant is the route's reason to exist.
+async fn list_namespaces(
+    principal: AuthPrincipal,
+    Extension(store): Extension<Arc<dyn Store>>,
+    Extension(walls_cfg): Extension<Arc<WallConfig>>,
+    Query(q): Query<NamespaceListQuery>,
+) -> Result<Json<Vec<NamespaceEntry>>, ApiError> {
+    if !principal.0.may(MEMORY_READ) {
+        return Err(ApiError::Forbidden);
+    }
+    // Counts come from the store census (a second cheap call is fine:
+    // `visible_walls` already calls it internally to discover imports).
+    let stats = store.store_stats().await.map_err(internal)?;
+    let walls: Vec<String> = if q.all == Some(true) {
+        // The census is the operator's view: every wall in the store.
+        if !principal.0.may(ADMIN) {
+            return Err(ApiError::Forbidden);
+        }
+        let mut all: Vec<String> = stats
+            .namespaces
+            .iter()
+            .map(|ns_count| ns_count.namespace.clone())
+            .collect();
+        all.sort();
+        all.dedup();
+        all
+    } else {
+        // The default is the caller's visible set — the same enumeration
+        // `scope=visible` searches.
+        visible_walls(&principal, store.as_ref())
+            .await?
+            .into_iter()
+            .map(|ns| ns.as_str().to_string())
+            .collect()
+    };
+    let counts: std::collections::HashMap<String, usize> = stats
+        .namespaces
+        .iter()
+        .map(|ns_count| (ns_count.namespace.clone(), ns_count.memories))
+        .collect();
+    let entries = walls
+        .into_iter()
+        .map(|slug| {
+            let kind = kind_of(&slug);
+            NamespaceEntry {
+                memories: counts.get(&slug).copied().unwrap_or(0),
+                description: walls_cfg.declared.get(&slug).cloned(),
+                namespace: slug,
+                kind,
+            }
+        })
+        .collect();
+    Ok(Json(entries))
 }
 
 // ---------- retrieval ledger (v0.4.2 read side) ----------
@@ -3669,6 +3842,284 @@ mod tests {
         );
     }
 
+    // ---------- the wall registry (v0.4.3 U2) ----------
+
+    /// An app whose router carries deployment-declared wall descriptions
+    /// (the `WallConfig.declared` path) and an embedder — the search side
+    /// of the registry invariant needs one — plus the store handle for
+    /// direct seeding (the tests seed walls the caller cannot write).
+    #[cfg(feature = "backend-surreal")]
+    async fn app_with_declared_walls(
+        declared: &[(&str, &str)],
+    ) -> (Router, Arc<IjimaAuth>, Arc<dyn Store>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let embedder: Arc<dyn ijima_core::Embedder> = Arc::new(ijima_core::HashEmbedder::default());
+        let store_inner = Arc::new(
+            crate::SurrealStore::open_embedded_with(embedder.clone())
+                .await
+                .expect("open"),
+        );
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app_with_walls(
+            auth.clone(),
+            store.clone(),
+            kg,
+            Some(embedder),
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+            WallConfig {
+                doctrine_namespace: NamespaceId::new("ns_doctrine"),
+                declared: declared
+                    .iter()
+                    .map(|(slug, description)| (slug.to_string(), description.to_string()))
+                    .collect(),
+            },
+        );
+        (app, auth, store)
+    }
+
+    /// Seeds one memory directly into `ns`, bypassing the API's wall
+    /// checks (registry tests populate foreign walls on purpose).
+    #[cfg(feature = "backend-surreal")]
+    async fn seed_wall(store: &Arc<dyn Store>, ns: &str, id: &str) {
+        store
+            .store_memory(&NamespaceId::new(ns), seed_mem(id, 0.5, "0"))
+            .await
+            .expect("seed");
+    }
+
+    /// Grants `principal` membership in `ns`.
+    #[cfg(feature = "backend-surreal")]
+    async fn join_wall(store: &Arc<dyn Store>, ns: &str, principal: &str) {
+        store
+            .grant_namespace_membership(ijima_core::NamespaceMembership {
+                namespace: ns.into(),
+                principal: principal.into(),
+                granted_at_unix: 0,
+                granted_by: "root".into(),
+            })
+            .await
+            .expect("grant");
+    }
+
+    /// GET `/namespaces` with a bearer, asserting 200.
+    #[cfg(feature = "backend-surreal")]
+    async fn get_namespaces(app: &Router, token: &str, query: &str) -> serde_json::Value {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/namespaces{query}"))
+                    .header("authorization", token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "namespaces listing");
+        body_json(res).await
+    }
+
+    #[cfg(feature = "backend-surreal")]
+    #[tokio::test]
+    async fn namespaces_route_lists_callers_visible_walls() {
+        let (app, auth, store) = app_with_declared_walls(&[]).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // Two in the caller's private wall, one per other class; a wall
+        // the caller is not a member of must stay absent.
+        seed_wall(&store, "ns_elliott_private", "mem_ns_own_1").await;
+        seed_wall(&store, "ns_elliott_private", "mem_ns_own_2").await;
+        seed_wall(&store, "global", "mem_ns_global").await;
+        seed_wall(&store, "ns_wall_member", "mem_ns_member").await;
+        seed_wall(&store, "ns_import_x", "mem_ns_import").await;
+        seed_wall(&store, "ns_wall_other", "mem_ns_other").await;
+        join_wall(&store, "ns_wall_member", "elliott").await;
+
+        let listing = get_namespaces(&app, &read, "").await;
+        let entries = listing.as_array().expect("array");
+        let by_slug = |slug: &str| entries.iter().find(|e| e["namespace"] == slug);
+
+        let own = by_slug("ns_elliott_private").expect("own private wall listed");
+        assert_eq!(own["memories"].as_u64(), Some(2));
+        assert_eq!(own["kind"], "private");
+
+        let global = by_slug("global").expect("global listed");
+        assert_eq!(global["memories"].as_u64(), Some(1));
+        assert_eq!(global["kind"], "global");
+
+        let member = by_slug("ns_wall_member").expect("member wall listed");
+        assert_eq!(member["memories"].as_u64(), Some(1));
+        assert_eq!(member["kind"], "shared");
+
+        let import = by_slug("ns_import_x").expect("import wall listed");
+        assert_eq!(import["memories"].as_u64(), Some(1));
+        assert_eq!(import["kind"], "import");
+
+        assert!(
+            by_slug("ns_wall_other").is_none(),
+            "a non-member wall must stay absent: {listing}"
+        );
+    }
+
+    #[cfg(feature = "backend-surreal")]
+    #[tokio::test]
+    async fn namespaces_route_attaches_declared_description() {
+        let (app, auth, store) =
+            app_with_declared_walls(&[("ns_wall_member", "IA shared wall")]).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        seed_wall(&store, "ns_wall_member", "mem_desc_member").await;
+        seed_wall(&store, "global", "mem_desc_global").await;
+        join_wall(&store, "ns_wall_member", "elliott").await;
+
+        let listing = get_namespaces(&app, &read, "").await;
+        let entries = listing.as_array().expect("array");
+
+        let member = entries
+            .iter()
+            .find(|e| e["namespace"] == "ns_wall_member")
+            .expect("member wall listed");
+        assert_eq!(member["description"], "IA shared wall");
+
+        let global = entries
+            .iter()
+            .find(|e| e["namespace"] == "global")
+            .expect("global listed");
+        assert!(
+            global["description"].is_null(),
+            "undeclared walls carry null: {listing}"
+        );
+    }
+
+    #[cfg(feature = "backend-surreal")]
+    #[tokio::test]
+    async fn namespaces_all_requires_admin_and_spans_everything() {
+        let (app, auth, store) = app_with_declared_walls(&[]).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        let admin = bearer(&auth, "root", ADMIN);
+        seed_wall(&store, "ns_wall_other", "mem_all_other").await;
+
+        // `?all=true` is the operator's census: memory:read alone is not
+        // enough.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/namespaces?all=true")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN, "census requires admin");
+
+        let listing = get_namespaces(&app, &admin, "?all=true").await;
+        let entries = listing.as_array().expect("array");
+        assert!(
+            entries.iter().any(|e| e["namespace"] == "ns_wall_other"),
+            "the admin census lists the non-member wall: {listing}"
+        );
+    }
+
+    #[cfg(feature = "backend-surreal")]
+    #[tokio::test]
+    async fn visible_search_and_namespaces_agree() {
+        use std::collections::BTreeSet;
+        let (app, auth, store) = app_with_declared_walls(&[]).await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+
+        // One DISTINCT id per expected wall, plus a foreign wall the
+        // caller must not see — both directions are exercised.
+        seed_wall(&store, "ns_elliott_private", "mem_agree_own").await;
+        seed_wall(&store, "global", "mem_agree_global").await;
+        seed_wall(&store, "ns_import_probe", "mem_agree_import").await;
+        seed_wall(&store, "ns_wall_member", "mem_agree_member").await;
+        seed_wall(&store, "ns_wall_other", "mem_agree_other").await;
+        join_wall(&store, "ns_wall_member", "elliott").await;
+
+        let expected_walls: BTreeSet<&str> = [
+            "ns_elliott_private",
+            "global",
+            "ns_import_probe",
+            "ns_wall_member",
+        ]
+        .into_iter()
+        .collect();
+        let expected_ids: BTreeSet<&str> = [
+            "mem_agree_own",
+            "mem_agree_global",
+            "mem_agree_import",
+            "mem_agree_member",
+        ]
+        .into_iter()
+        .collect();
+
+        // The search's hit-id set EQUALS the expected set ...
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/memories/search")
+                    .header("authorization", &read)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "text": "stratified wake-up seed",
+                            "limit": 50,
+                            "scope": "visible"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = body_json(res).await;
+        let hit_ids: BTreeSet<&str> = body["memories"]
+            .as_array()
+            .expect("hits")
+            .iter()
+            .map(|h| h["memory"]["id"].as_str().expect("hit id"))
+            .collect();
+        assert_eq!(hit_ids, expected_ids, "visible search hit set");
+
+        // ... and the listing's wall set EQUALS the expected wall set.
+        let listing = get_namespaces(&app, &read, "").await;
+        let listed: BTreeSet<&str> = listing
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|e| e["namespace"].as_str().expect("slug"))
+            .collect();
+        assert_eq!(listed, expected_walls, "registry wall set");
+    }
+
+    #[cfg(feature = "backend-surreal")]
+    #[tokio::test]
+    async fn namespaces_kind_of_classifies_non_pi_private_walls() {
+        let (app, auth, store) = app_with_declared_walls(&[]).await;
+        let admin = bearer(&auth, "root", ADMIN);
+        // Any principal's private wall — not the caller's own, and not
+        // pi-prefixed: the `_private` SUFFIX is the convention.
+        seed_wall(&store, "ns_elliott_private", "mem_kind_private").await;
+
+        let listing = get_namespaces(&app, &admin, "?all=true").await;
+        let entry = listing
+            .as_array()
+            .expect("array")
+            .iter()
+            .find(|e| e["namespace"] == "ns_elliott_private")
+            .expect("private wall listed");
+        assert_eq!(entry["kind"], "private");
+    }
+
     #[tokio::test]
     async fn wakeup_composes_personal_and_doctrine() {
         let (app, auth) = app_with_store().await;
@@ -3770,6 +4221,31 @@ mod tests {
             None,
             #[cfg(feature = "federation")]
             Arc::new(InstanceFederationConfig::default()),
+        );
+        (app, auth, store)
+    }
+
+    /// Like [`app_with_store_handle`] but with deployment-configured wall
+    /// routing (v0.4.3 U1): `doctrine_ns` is the configured doctrine wall.
+    async fn app_with_walls_handle(doctrine_ns: &str) -> (Router, Arc<IjimaAuth>, Arc<dyn Store>) {
+        let auth = Arc::new(IjimaAuth::from_embedded_policy().expect("policy"));
+        let store_inner = Arc::new(crate::SurrealStore::open_embedded().await.expect("open"));
+        let store: Arc<dyn Store> = store_inner.clone();
+        let kg: Arc<dyn KnowledgeGraph> = store_inner;
+        let app = app_with_walls(
+            auth.clone(),
+            store.clone(),
+            kg,
+            None,
+            Arc::new(crate::redaction::Redactor::new()),
+            #[cfg(feature = "rate-limit")]
+            None,
+            #[cfg(feature = "federation")]
+            Arc::new(InstanceFederationConfig::default()),
+            WallConfig {
+                doctrine_namespace: NamespaceId::new(doctrine_ns),
+                declared: std::collections::HashMap::new(),
+            },
         );
         (app, auth, store)
     }
@@ -6908,6 +7384,338 @@ mod tests {
             after["events"].as_array().unwrap().len(),
             0,
             "pruned to empty: {after}"
+        );
+    }
+
+    // ---------- v0.4.3 U1: configurable doctrine wall ----------
+
+    /// Seeds one memory into `ns` and returns nothing (setup helper).
+    async fn seed_into(store: &Arc<dyn Store>, ns: &str, id: &str) {
+        store
+            .store_memory(&NamespaceId::new(ns), seed_mem(id, 0.9, "0001"))
+            .await
+            .expect("seed memory");
+    }
+
+    #[tokio::test]
+    async fn wakeup_reads_configured_doctrine_wall() {
+        let (app, auth, store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        seed_into(&store, "ns_cfg_doctrine", "mem_cfg_doctrine").await;
+        seed_into(&store, "ns_doctrine", "mem_default_doctrine").await;
+
+        let body = wakeup_body(app, &read).await;
+        let ids: Vec<&str> = body["doctrine"]
+            .as_array()
+            .expect("doctrine array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["mem_cfg_doctrine"],
+            "doctrine section serves exactly the configured wall: {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_app_unchanged_doctrine_wall() {
+        let (app, auth, store) = app_with_store_handle().await;
+        let read = bearer(&auth, "elliott", MEMORY_READ);
+        seed_into(&store, "ns_doctrine", "mem_default_doctrine").await;
+
+        let body = wakeup_body(app, &read).await;
+        let doctrine = body["doctrine"].as_array().expect("doctrine array");
+        assert_eq!(doctrine.len(), 1, "default doctrine wall served: {body:?}");
+        assert_eq!(doctrine[0]["id"], "mem_default_doctrine");
+    }
+
+    #[tokio::test]
+    async fn doctrine_routes_respect_configured_wall() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let admin = bearer(&auth, "ci", ADMIN);
+
+        let resp = post_doctrine(&app, &admin, "/doctrine", "doc_cfg", "configured body").await;
+        assert_eq!(resp["revision"].as_u64(), Some(1));
+
+        // The body lives on the configured wall …
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_cfg_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "configured wall holds the doc"
+        );
+        let mem: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mem.content, "configured body");
+
+        // … and NOT on the default wall.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "default wall stays empty under configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn old_default_wall_becomes_ordinary_open_under_configuration() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        // No doctrine caps, no admin, no membership anywhere.
+        let read = bearer(&auth, "outsider", MEMORY_READ);
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/doctrine/versions?namespace=ns_doctrine&id=missing")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "ordinary open-wall path, not the doctrine gate: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let versions: Vec<ijima_core::DoctrineVersion> =
+            serde_json::from_slice(&bytes).expect("versions array");
+        assert!(
+            versions.is_empty(),
+            "an unwritten wall reads as an empty list: {versions:?}"
+        );
+
+        // Control: the same request under the default configuration hits
+        // the doctrine authz gate on the default wall.
+        let (app, auth) = app_with_store().await;
+        let read = bearer(&auth, "outsider", MEMORY_READ);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/doctrine/versions?namespace=ns_doctrine&id=missing")
+                    .header("authorization", &read)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "default config gates the doctrine wall"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_wall_keeps_doctrine_ingest_prohibition() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let ingest = bearer(&auth, "research-ingest", DOCTRINE_WRITE);
+        let admin = bearer(&auth, "root", ADMIN);
+
+        let post = |token: String, uri: String| {
+            let app = app.clone();
+            async move {
+                let body = serde_json::json!({
+                    "id": "d_prohibited",
+                    "content": "should not land on the doctrine wall",
+                    "project": "p",
+                    "topic": "t",
+                })
+                .to_string();
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("authorization", &token)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // Explicit configured-wall ingest hits the doctrine prohibition.
+        let res = post(
+            ingest.clone(),
+            "/doctrine?namespace=ns_cfg_doctrine".to_string(),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::FORBIDDEN,
+            "the explicit configured-wall ingest is prohibited"
+        );
+
+        // Distinguisher: a non-private, non-configured org wall the
+        // principal is a member of accepts the same body as ordinary
+        // content — the 403 above is the doctrine prohibition, not a
+        // generic rejection.
+        let grant = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/namespaces/grant")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "namespace": "ns_team_shared",
+                            "principal": "research-ingest"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(grant.status(), StatusCode::OK, "membership grant");
+
+        let res = post(ingest, "/doctrine?namespace=ns_team_shared".to_string()).await;
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "an ordinary org wall the token may write succeeds"
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/d_prohibited?namespace=ns_team_shared")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "row landed on the org wall");
+    }
+
+    #[tokio::test]
+    async fn rollback_targets_configured_wall() {
+        let (app, auth, _store) = app_with_walls_handle("ns_cfg_doctrine").await;
+        let admin = bearer(&auth, "ci", ADMIN);
+
+        post_doctrine(&app, &admin, "/doctrine", "doc_cfg", "body A").await;
+        post_doctrine(&app, &admin, "/doctrine", "doc_cfg", "body B").await;
+
+        // Unqualified rollback (no `?namespace=`) targets the configured
+        // wall.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/doctrine/rollback")
+                    .header("authorization", &admin)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"id": "doc_cfg", "to": 1}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "rollback succeeded");
+
+        // The active body lives on the configured wall.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_cfg_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "configured wall holds the doc"
+        );
+        let mem: Memory = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(mem.content, "body A");
+        assert_eq!(mem.revision, Some(1));
+
+        // The archived (outgoing) revision lives there too.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/doctrine/versions?namespace=ns_cfg_doctrine&id=doc_cfg")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let versions: Vec<ijima_core::DoctrineVersion> = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            versions
+                .iter()
+                .any(|v| v.version == 2 && v.content == "body B"),
+            "archived revision on the configured wall: {versions:?}"
+        );
+
+        // The old default wall stays empty.
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/memories/doc_cfg?namespace=ns_doctrine")
+                    .header("authorization", &admin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_FOUND,
+            "the old wall stays empty"
         );
     }
 }

@@ -12,7 +12,8 @@ need. The daemon crate's matrix:
 | `backend-sqlite` | **Migration-only** SQLite readers for pi-mempalace / ZeroClaw imports |
 | `rate-limit` | Schubert intersection-number token buckets |
 | `cli` | The `ijima` binary (clap + reqwest + ijima-client) |
-| `embeddings-candle` | Local embeddings (all-MiniLM-L6-v2 via candle/HF) |
+| `embeddings-katakuri` | Local embeddings via Katakuri (weights, tokenizer, digest-verified hub) + candle forward pass — the shipped path since 0.4.3 |
+| `embeddings-candle` | *Deprecated* (removal candidate 0.5.0): the pre-Katakuri path via `hf-hub`/`tokenizers`. Bit-for-bit parity is pinned by the CI parity job; production moved off it in 0.4.3. |
 | `mining` | Extraction pipeline (ijima-miner + proserpina-agent HTTP LLM tier) |
 | `tls` | axum-server/rustls HTTPS (`IJIMA_TLS_CERT`/`IJIMA_TLS_KEY`) |
 | `federation` | `/federation/*` control-API scaffold + instance identity |
@@ -26,7 +27,7 @@ transport) and `std`; `ijima-core`'s `serde` and `federation`.
 
 ## Choosing
 
-- **Server**: default + `cli` + `embeddings-candle` (+ `mining`, `tls`,
+- **Server**: default + `cli` + `embeddings-katakuri` (+ `mining`, `tls`,
   `backend-sqlite` during migration).
 - **Embedded library use** (tests, in-process): `backend-surreal`
   without `http`/`server-auth` — an unauthenticated in-process store.

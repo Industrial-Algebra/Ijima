@@ -86,6 +86,30 @@ view by design.
 Membership still gates: a wall the principal is absent from never
   appears in `visible` results.
 
+## Querying your walls
+
+`GET /namespaces` makes the walls queryable objects instead of implicit
+string prefixes: it lists every namespace the caller's `visible` search
+spans — the same set, by construction, so the census and the search can
+never disagree — with a memory count and a `kind` (`private`, `shared`,
+`global`, `import`). A wall with no rows appears with a count of zero:
+the census is a map of the deployment, not only of the populated parts.
+
+Operators add `?all=true` (admin only) to span every wall in the store,
+including walls they hold no membership in — the deployment-wide census.
+
+Descriptions are deployment-declared, never stored. A `ijima.toml` can
+annotate any wall:
+
+```toml
+[[namespaces]]
+slug = "ns_ia_shared"
+description = "IA engineering knowledge — shared across the org"
+```
+
+Walls exist without being declared; declarations only add the
+`description` field to the listing (undeclared walls report `null`).
+
 ## Agent homes
 
 Personal-by-default is right for private notes — and exactly wrong for

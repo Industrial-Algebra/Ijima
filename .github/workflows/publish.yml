@@ -47,7 +47,9 @@ jobs:
           rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: |
+          set -o pipefail
+          curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - uses: actions/setup-node@v6
         with:

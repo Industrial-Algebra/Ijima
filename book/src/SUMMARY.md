@@ -21,6 +21,7 @@
 - [Importing Legacy Corpora](./guide/import.md)
 - [The Mining Pipeline](./guide/mining.md)
 - [pi Thin-Client Integration](./guide/pi.md)
+- [Ingesting review threads](./guide/reviews.md)
 - [Deploying on a Server](./guide/deploy.md)
 - [NixOS](./guide/nix.md)
 - [Feature Flags](./guide/feature-flags.md)
