@@ -28,7 +28,7 @@ re-implement memory logic.
 
 ## Status
 
-**v0.4.2 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
+**v0.4.3 shipped** — all four crates on [crates.io](https://crates.io/crates/ijima-server),
 the pi extension on npm ([`@industrialalgebra/ijima-pi`](https://www.npmjs.com/package/@industrialalgebra/ijima-pi)).
 In production as a fleet's central memory service since August 2026
 (six-week soak reviewed 2026-09-21: error-free since 08-21, hourly mirror,

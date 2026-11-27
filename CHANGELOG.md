@@ -4,7 +4,65 @@ All notable changes to Ijima are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] — 2026-11-27 — the addressable walls
+
+- **Configurable doctrine namespace** (the fossil fix): the daemon's
+  doctrine wall — the wake-up stratum's source, doctrine reads and
+  ingest, and rollback — follows a `doctrine_namespace` key in
+  `ijima.toml`; the shipped default stays `ns_doctrine`. The change
+  follows a reviewed keep/convert enumeration: doctrine-route
+  *identity* moves with configuration; the old wall's public-read
+  design (the open-whitelist and promotion open-target entries) is
+  preserved untouched — an override demotes the old wall to an
+  ordinary open wall, never revoking its access. Found in
+  production by the retrieval ledger on day one of the soak: the
+  wake-up doctrine section read a constant with zero rows while the
+  live doctrine lived 830 rows away. (PR #157; the plan contracts
+  survived a four-round review before dispatch — the enumerated
+  conversion and three review-probed regressions encode its
+  findings, including the 200+[] shape of an unwritten wall and the
+  POST /doctrine prohibition route.)
+- **Namespaces registry — `GET /namespaces`**: walls become
+  addressable objects. Every principal can list the walls their
+  `scope=visible` search spans, with counts, kind (global / private
+  by `_private` suffix convention / import / shared), and
+  deployment-declared descriptions (`[[namespaces]]` in `ijima.toml`
+  — no new tables, no admin CRUD). `?all=true` (admin) spans every
+  stored wall. The listing and the search share one extraction
+  (`visible_walls`): they cannot disagree about what visible means —
+  pinned by a bidirectional agreement test. (PR #157.)
+- **PR review-thread ingestion** — the pilot wiring: closing a PR
+  lands its inline review comments on the org wall as memory
+  (permalink `Url` citations, `Interpreted` evidence — findings are
+  claims until dispositioned; content-hash dedup makes re-runs
+  idempotent, 200 store / 409 duplicate). The reusable workflow
+  lives in IA-home (org infrastructure, callable from every repo);
+  callers forward all three secrets — reusable workflows inherit
+  nothing. The runner joins the tailnet per-job via an ephemeral
+  reusable auth key; the daemon URL rides a secret, never a literal.
+  v1 boundaries: `MemorySource` stays `Explicit` (a new enum variant
+  would poison rolled-back daemons — the version-skew lesson);
+  finding/disposition linkage deferred. No server changes — the API
+  as shipped suffices. (PR #157; U3 plan.)
+- **The Katakuri switch**: the shipped build now compiles
+  `embeddings-katakuri` — Katakuri never computes (the README is
+  law); candle remains the forward-pass engine, and bit-for-bit
+  parity is enforced in CI (a `parity` job with model caches runs
+  the previously `#[ignore]`d test on every push). The
+  `embeddings-candle` path is deprecated as of this release; removal
+  candidate for 0.5.0, soak-gated. (PR #157; nix one-line feature
+  swap, `nix/package.nix`.)
+- **CI hardening (review finds, folded into the train)**: the parity
+  job's output pipeline now carries `set -o pipefail` — GitHub
+  Actions runs `bash -e` without pipefail, and `cargo test | tail`
+  masked failures (exit 101 through the pipe exits 0); the
+  publish.yml wasm-pack installer gained the same one line.
+- **Dependencies**: dependabot fold (#141–#156 — tokio 1.54.1,
+  katakuri 0.2.0, candle-core 0.11.1, surrealdb 3.3.5, axum-server
+  0.9.2, rusqlite 0.43.0, and the rest).
+
 ## [0.4.2] — 2026-10-17 — the retrieval ledger
+
 
 - **The retrieval ledger.** Every wake-up, search, and browse response
   appends one event per served memory to an append-only ledger — ids
