@@ -19,6 +19,7 @@
   openssl,
   pkg-config,
   patchelf,
+  cmake,
   fenix,
   src,
 }:
