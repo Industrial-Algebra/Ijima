@@ -8,6 +8,12 @@ name: Review ingest
 on:
   pull_request:
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to ingest (re-run ingestion on demand — closed-PR runs cannot be re-run once the merge ref is gone)'
+        required: true
+        type: number
 
 jobs:
   ingest:
@@ -15,7 +21,7 @@ jobs:
     with:
       repo_name: Ijima
       wall: ns_ia_shared
-      pr_number: ${{ github.event.pull_request.number }}
+      pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
     secrets:
       IJIMA_REVIEW_INGEST_TOKEN: ${{ secrets.IJIMA_REVIEW_INGEST_TOKEN }}
       IJIMA_INGEST_URL: ${{ secrets.IJIMA_INGEST_URL }}
