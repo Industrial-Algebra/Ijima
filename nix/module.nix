@@ -93,9 +93,14 @@ in
         IJIMA_HOST = cfg.bindAddress;
         IJIMA_PORT = toString cfg.port;
         IJIMA_LOG = "ijima=info";
-        # Persist the candle model cache inside the data dir (survives
-        # restarts; downloaded once).
+        # Persist the model caches inside the data dir (survive
+        # restarts; downloaded once). HF_HOME serves the (deprecated)
+        # candle path; KATAKURI_HUB_DIR serves the shipped katakuri
+        # path, whose hub cache otherwise defaults to ~/.cache/katakuri
+        # — read-only under this unit's hardening (crash loop; found in
+        # the 0.4.3 laniakea switch, 2026-11-27).
         HF_HOME = "${cfg.dataDir}/hf";
+        KATAKURI_HUB_DIR = "${cfg.dataDir}/hf/katakuri";
       };
 
       # The data dir may live on a root-owned mount (e.g. a ZFS dataset);
